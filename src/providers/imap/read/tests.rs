@@ -245,12 +245,14 @@ async fn original_query_controls_are_rejected_before_connecting() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     for suffix in ["\r", "\n", "\r\n", "\0", "\t", "\x7f"] {
-        let mut p = params(port);
-        p["query"] = json!(format!("folder:INBOX UNSEEN{suffix}"));
-        assert_eq!(
-            super::super::call("imap.list", &p).await,
-            Err("invalid_params")
-        );
+        for query in ["folder:INBOX UNSEEN", "search:TEXT \"1Password\""] {
+            let mut p = params(port);
+            p["query"] = json!(format!("{query}{suffix}"));
+            assert_eq!(
+                super::super::call("imap.list", &p).await,
+                Err("invalid_params")
+            );
+        }
     }
     assert!(
         tokio::time::timeout(Duration::from_millis(20), listener.accept())
