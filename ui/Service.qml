@@ -110,6 +110,13 @@ Item {
   readonly property bool backendCanSuggestEvents: backend.ready && backend.apiVersion >= 2
   readonly property bool backendCanCheckMicrosoftConnection: backend.ready && backend.apiVersion >= 5
   readonly property bool backendCanDiscoverCalendars: backend.ready && backend.apiVersion >= 5
+  readonly property bool backendCanGoogleCalendars: backend.ready && backend.apiVersion >= 6
+  readonly property bool calendarRemindersEnabled: !settings || settings.calendarRemindersEnabled !== false
+  readonly property int calendarSnoozeMinutes: Math.max(1, Math.min(1440,
+    Math.floor(Number(settings && settings.calendarSnoozeMinutes) || 5)))
+  readonly property string calendarReminderError: calendarReminderLoader.item
+    ? calendarReminderLoader.item.lastError || calendarReminderLoader.item.inbox.lastError : ""
+  readonly property var calendarReminderInbox: calendarReminderLoader.item ? calendarReminderLoader.item.inbox : null
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "omamail"
@@ -138,6 +145,8 @@ Item {
     oauthPort: 9481,
     undoSendSeconds: 10,
     unifiedCalendarView: false,
+    calendarRemindersEnabled: true,
+    calendarSnoozeMinutes: 5,
     showBarIcon: true,
     unifiedMailboxes: false,
     suggestEvents: false
@@ -1932,6 +1941,8 @@ Item {
   readonly property string selectedResponse: reading ? reading.selectedResponse : ""
   readonly property bool canRespondToInvite: !!reading && reading.canRespondToInvite
   readonly property bool rsvpSending: !!reading && reading.rsvpSending
+  readonly property bool rsvpFallbackAvailable: !!reading && reading.rsvpFallbackAvailable === true
+  readonly property string rsvpCalendarUrl: reading ? Provider.calendarAttendanceUrl(reading.providerId, reading.accountId) : ""
   // Empty when this message offers no way off a list, which is the answer for
   // everything that is not a newsletter.
   readonly property string unsubscribeLabel: reading ? reading.unsubscribeLabel : ""
@@ -2087,6 +2098,7 @@ Item {
     if (typeof callback === "function") callback("")
   }
   function rsvp(response) { if (reading) reading.rsvp(response) }
+  function rsvpMailOnly(response) { if (reading) reading.rsvpMailOnly(response) }
   function unsubscribe() { if (reading) reading.unsubscribe() }
   function cursorOffset(cursorId, delta) {
     if (unified) return Unified.cursorOffset(unifiedMessages, cursorId, delta)
@@ -2553,6 +2565,19 @@ Item {
     pluginDir: root.pluginDir
     cacheName: "calendar-bar"
     Component.onCompleted: Qt.callLater(root.refreshCalendarPreview)
+  }
+
+  Loader {
+    id: calendarReminderLoader
+    active: root.backendCanGoogleCalendars && root.calendarRemindersEnabled
+    sourceComponent: Component {
+      CalendarReminders {
+        service: root
+        pluginDir: root.pluginDir
+        notificationForeground: Color.foreground
+        notificationAccent: Color.accent
+      }
+    }
   }
 
   Timer {
