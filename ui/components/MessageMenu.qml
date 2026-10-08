@@ -28,7 +28,7 @@ Item {
   property real anchorX: 0
   property real anchorY: 0
   property int cursorIndex: -1
-  readonly property var menuRows: [replyRow, replyAllRow, forwardRow, archiveRow,
+  readonly property var menuRows: [continueRow, replyRow, replyAllRow, forwardRow, archiveRow,
     unarchiveRow, moveRow,
     trashRow, spamRow, readRow, starRow, browserRow, aiRow]
   // Whether this message is archived — out of the inbox and not somewhere
@@ -167,9 +167,16 @@ Item {
         }
       }
 
-      MenuRow { id: replyRow; text: "Reply"; onActivated: root.compose("reply") }
-      MenuRow { id: replyAllRow; text: "Reply all"; onActivated: root.compose("replyAll") }
-      MenuRow { id: forwardRow; text: "Forward"; onActivated: root.compose("forward") }
+      MenuRow {
+        id: continueRow
+        objectName: "message-menu-continue-draft"
+        visible: !!root.summary && root.summary.isDraft === true && !root.memberOnly
+        text: "Continue editing"
+        onActivated: root.compose("draft")
+      }
+      MenuRow { id: replyRow; visible: !root.summary || !root.summary.isDraft; text: "Reply"; onActivated: root.compose("reply") }
+      MenuRow { id: replyAllRow; visible: !root.summary || !root.summary.isDraft; text: "Reply all"; onActivated: root.compose("replyAll") }
+      MenuRow { id: forwardRow; visible: !root.summary || !root.summary.isDraft; text: "Forward"; onActivated: root.compose("forward") }
 
       MenuSeparatorLine {
         width: menu.width - menu.leftPadding - menu.rightPadding
@@ -243,6 +250,8 @@ Item {
       MenuRow {
         id: aiRow
         objectName: "message-menu-ai"
+        enabled: !!root.service && root.service.agentAvailable !== false
+        visible: !!root.service && root.service.hasAgent !== false
         text: "Ask AI..."
         onActivated: {
           var id = root.messageId

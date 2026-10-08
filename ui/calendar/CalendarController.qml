@@ -11,6 +11,8 @@ Item {
   required property var service
   required property string pluginDir
   property string cacheName: "calendar"
+  property bool reminderMode: false
+  function sourceIncluded(source) { return !!source && (reminderMode ? Sources.nativeCalendarFeatures(source) && source.remindersEnabled === true : source.enabled !== false) }
   property string accountId: ""
   property var sourceList: Sources.emptyList()
   property bool sourcesLoaded: false
@@ -18,6 +20,7 @@ Item {
   property bool loading: false
   property string lastError: ""
   property string lastErrorKind: ""
+  property var undoChange: null
   property double rangeStart: 0
   property double rangeEnd: 0
   property double pendingRangeStart: 0
@@ -43,6 +46,14 @@ Item {
   property string sourceSecret: ""
   property var sourceBeingSaved: null
   property bool savingSource: false
+  property bool discoveringCalendars: false
+  property string discoveringAccountId: ""
+  property string discoveryError: ""
+  property int discoverySerial: 0
+  property bool discoverySaving: false
+  property int discoveryPendingCount: 0
+  property var discoveryChoices: null
+  property string discoveryChoiceAccount: ""
   property bool clockRunning: false
   property double nowMs: Date.now()
   property bool refreshAfterSourceWrite: false
@@ -95,6 +106,16 @@ Item {
   // the two inputs separately got both of those wrong in opposite directions.
   onCalendarScopeChanged: reloadVisibleRange()
 
+  // The calendars the scope would ask, as one string. Google and Microsoft
+  // calendars arrive with their account's sign-in, after a view that was
+  // already open asked for its range; and an account poll rebuilds the
+  // summaries twice a cycle with no calendar having come or gone, which a
+  // string compares away where the array would not.
+  readonly property string enabledSourceKey: contextSources.sources.filter(function(source) {
+    return root.sourceIncluded(source)
+  }).map(function(source) { return String(source.id || "") }).join("\n")
+  onEnabledSourceKeyChanged: reloadVisibleRange()
+
   // No `eventCache.loaded` guard, and it is not missing. `refresh` refuses on
   // an unloaded cache and `eventCache.onRestored` runs one as soon as it is
   // there, so the only thing the guard changed was whether an empty list was
@@ -102,12 +123,13 @@ Item {
   // have been fetched before the cache loaded, because fetching needs it too.
   function reloadVisibleRange() {
     if (!rangeStart || !rangeEnd) return
-    events = cachedEventsFor(calendarScope, rangeStart, rangeEnd)
+    setEvents(cachedEventsFor(calendarScope, rangeStart, rangeEnd))
     refresh(rangeStart, rangeEnd)
   }
 
   signal passwordSaved(bool ok, string error)
   signal calendarSaved(bool ok, string error)
+  signal discoveryFinished(bool ok, string error, int count)
   signal eventCreated(bool ok, string error)
   // Somebody wants the composer open with these fields — the reader's
   // suggested event, say. The composer listens; the controller only relays.
@@ -121,8 +143,18 @@ Item {
   signal eventDeleted(bool ok, string error)
 
   readonly property string configPath: {
-    var home = Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")
-    return home + "/omamail/calendars.json"
+    return service && typeof service.configPath === "function"
+      ? service.configPath("calendars.json") : ""
+  }
+
+  function openExternal(value) {
+    return service && typeof service.openExternal === "function"
+      ? service.openExternal(value) : false
+  }
+
+  function copyText(value) {
+    return service && typeof service.copyText === "function"
+      ? service.copyText(value) : false
   }
 
   function refresh(startMs, endMs) {
@@ -144,11 +176,11 @@ Item {
     refreshScope = calendarScope
     var effectiveSources = sourcesForAccount(refreshAccountId)
     queue = effectiveSources.sources.filter(function(source) {
-      return source && source.enabled
+      return root.sourceIncluded(source)
     })
     var sourceIds = queue.map(function(source) { return String(source.id || "") })
-    events = eventCache.get(refreshScope, rangeStart, rangeEnd, sourceIds)
     loading = true
+    setEvents(eventCache.get(refreshScope, rangeStart, rangeEnd, sourceIds))
     processNext()
   }
 
@@ -158,18 +190,138 @@ Item {
     return unifiedCalendarView ? available : Sources.forAccount(available, wantedAccountId)
   }
 
+  function discoverableAccount(accountId) {
+    var accounts = service && Array.isArray(service.accountSummaries)
+      ? service.accountSummaries : []
+    for (var i = 0; i < accounts.length; i++) {
+      var account = accounts[i] || {}
+      if (String(account.id || "") !== String(accountId || "")) continue
+      return account.signedIn === true
+        && (account.calendarProvider === "microsoft" || account.calendarProvider === "icloud"
+          || (account.calendarProvider === "google" && service.backendCanGoogleCalendars === true))
+    }
+    return false
+  }
+
+  function discoveredCount(accountId) {
+    var values = availableSources && Array.isArray(availableSources.sources)
+      ? availableSources.sources : []
+    var count = 0
+    for (var i = 0; i < values.length; i++) {
+      var source = values[i] || {}
+      if (String(source.accountId || "") === String(accountId || "")
+          && source.discovered === true) count++
+    }
+    return count
+  }
+
+  function discoveryFailure(error) {
+    // JSON-RPC codes are numeric; the backend's stable reason is its message.
+    // Match only known reasons and never display the raw diagnostic.
+    var code = String(error && error.message || error || "")
+    if (code === "auth_signed_out" || code === "calendar_auth_refused")
+      return "Sign in to this mailbox again"
+    if (code === "calendar_provider_unsupported")
+      return "This mailbox does not support calendar discovery"
+    if (code === "calendar_timeout") return "Calendar discovery timed out"
+    return "Calendars could not be discovered"
+  }
+
+  function discoverAccountCalendars(accountId) {
+    var wanted = String(accountId || "")
+    if (discoveringCalendars || savingSource || !discoverableAccount(wanted)) return false
+    if (!service || !service.backend || !service.backend.ready) {
+      discoveryError = "Calendar backend is unavailable"
+      discoveryFinished(false, discoveryError, 0)
+      return false
+    }
+    if (service.backendCanDiscoverCalendars !== true) {
+      discoveryError = "Update the backend to discover account calendars"
+      discoveryFinished(false, discoveryError, 0)
+      return false
+    }
+    var serial = ++discoverySerial
+    discoveringCalendars = true
+    discoveringAccountId = wanted
+    discoveryError = ""
+    service.backend.call("calendar.discover", { accountId: wanted }, function(result, error) {
+      if (serial !== root.discoverySerial || root.discoveringAccountId !== wanted) return
+      root.discoveringCalendars = false
+      root.discoveringAccountId = ""
+      if (error || !result || String(result.accountId || "") !== wanted
+          || !Array.isArray(result.calendars) || !root.discoverableAccount(wanted)) {
+        root.discoveryError = root.discoveryFailure(error)
+        root.discoveryFinished(false, root.discoveryError, 0)
+        return
+      }
+      var next = Sources.applyDiscovery(root.sourceList, result)
+      if (result.provider === "google") {
+        root.discoveryChoiceAccount = wanted
+        root.discoveryChoices = next
+        root.discoveryPendingCount = result.calendars.length
+        return
+      }
+      root.discoveryPendingCount = result.calendars.length
+      root.discoverySaving = true
+      root.sourceBeingSaved = null
+      root.sourceSecret = ""
+      root.sourceWritePayload = Sources.serialize(next)
+      root.refreshAfterSourceWrite = true
+      root.savingSource = true
+      root.writeSources()
+    })
+    return true
+  }
+
+  function chooseDiscovered(id, enabled) {
+    if (!discoveryChoices) return
+    var next = Sources.setEnabled(discoveryChoices, id, enabled)
+    var existing = sourceList.sources.some(function(source) { return source.id === id && source.discovered })
+    if (!existing) next.sources = next.sources.map(function(source) {
+      if (source.id !== id) return source
+      var value = Sources.makeSource(source)
+      value.remindersEnabled = enabled === true
+      return value
+    })
+    discoveryChoices = next
+  }
+
+  function confirmDiscovery() {
+    if (!discoveryChoices || savingSource) return
+    if (!discoverableAccount(discoveryChoiceAccount)) { discoveryChoices = null; return }
+    var chosen = Sources.copyList(sourceList)
+    chosen.sources = chosen.sources.filter(function(source) {
+      return source.kind !== "google" || source.accountId !== root.discoveryChoiceAccount
+    })
+    discoveryChoices.sources.forEach(function(source) {
+      if (source.kind === "google" && source.accountId === root.discoveryChoiceAccount) chosen = Sources.add(chosen, source)
+    })
+    sourceWritePayload = Sources.serialize(chosen)
+    discoveryChoices = null
+    discoverySaving = true
+    sourceBeingSaved = null
+    sourceSecret = ""
+    refreshAfterSourceWrite = true
+    savingSource = true
+    writeSources()
+  }
+
   // `scope` rather than an account id: in the unified view every mailbox reads
   // the same entry, and asking for it by account would find nothing.
   function cachedEventsFor(scope, startMs, endMs) {
     var values = sourcesForAccount(accountId).sources.filter(function(source) {
-      return source && source.enabled
+      return root.sourceIncluded(source)
     })
     return eventCache.get(scope, startMs, endMs,
       values.map(function(source) { return String(source.id || "") }))
   }
 
   function findSource(sourceId) {
-    var values = contextSources.sources
+    return sourceById(contextSources, sourceId)
+  }
+
+  function sourceById(list, sourceId) {
+    var values = list.sources
     for (var i = 0; i < values.length; i++) {
       if (values[i] && values[i].id === String(sourceId)) return values[i]
     }
@@ -186,6 +338,16 @@ Item {
     if (refusal !== "") { eventCreated(false, refusal); return false }
     var built = Calendar.createEvent(fields, Date.now())
     if (!built.ok) { eventCreated(false, built.error); return false }
+    if (source.kind === "google") {
+      var refusedOptions = googleOptionsRefusal(fields)
+      if (refusedOptions !== "") { eventCreated(false, refusedOptions); return false }
+    }
+    if (source.kind === "google" && service.backendCanGoogleCalendars === true) {
+      var options = Calendar.googleOptions(built.google, fields, source, null)
+      if (!options.ok) { eventCreated(false, options.error); return false }
+      built.google = options.body
+      built.sendUpdates = fields.sendUpdates === "none" ? "none" : "all"
+    }
     eventSource = source
     eventDraft = built
     creatingEvent = true
@@ -210,16 +372,61 @@ Item {
     if (ok && rangeStart && rangeEnd) refresh(rangeStart, rangeEnd)
   }
 
+  // Guests, Meet and a changed repeat rule reach Google only through the API 6
+  // backend, which also carries sendUpdates and If-Match. An older backend
+  // would save the event without them and report success, so they are
+  // refused rather than dropped.
+  function googleOptionsRefusal(fields) {
+    if (service.backendCanGoogleCalendars === true) return ""
+    if (fields.createMeet === true || fields.changeRecurrence === true
+        || String(fields.guestEmails || "").trim() !== "")
+      return "Update the backend to add guests, Meet or repetition changes"
+    return ""
+  }
+
+  // Dragging writes without opening the editor, so it needs the revision
+  // check only the API 6 backend sends.
+  function rescheduleRefusal(event) {
+    var refusal = Calendar.writeRefusal(findSource(event && event.sourceId), event, "reschedule")
+    if (refusal === "" && service.backendCanGoogleCalendars !== true)
+      refusal = "Update the backend to move events by dragging"
+    return refusal
+  }
+
   function updateEvent(sourceId, event, fields) {
     if (creatingEvent || eventWriting) {
       eventUpdated(false, "Another event change is still in progress")
       return false
     }
     var source = findSource(sourceId)
+    if (source && source.kind === "google" && service.backendCanGoogleCalendars === true && !event.etag) {
+      eventUpdated(false, "Refresh this event before editing it")
+      return false
+    }
     var refusal = Calendar.writeRefusal(source, event)
     if (refusal !== "") { eventUpdated(false, refusal); return false }
     var built = Calendar.updateEvent(fields, event, Date.now())
     if (!built.ok) { eventUpdated(false, built.error); return false }
+    var destination = fields.destinationSourceId && fields.destinationSourceId !== sourceId
+      ? findSource(fields.destinationSourceId) : null
+    if (fields.destinationSourceId && fields.destinationSourceId !== sourceId) {
+      var transferError = Calendar.transferRefusal(source, destination, event)
+      if (transferError !== "") { eventUpdated(false, transferError); return false }
+      if (service.backendCanGoogleCalendars !== true) {
+        eventUpdated(false, "Update the backend to transfer events"); return false
+      }
+      built.destination = destination
+    }
+    if (source.kind === "google") {
+      var refusedChange = googleOptionsRefusal(fields)
+      if (refusedChange !== "") { eventUpdated(false, refusedChange); return false }
+    }
+    if (source.kind === "google" && service.backendCanGoogleCalendars === true) {
+      var options = Calendar.googleOptions(built.google, fields, source, event)
+      if (!options.ok) { eventUpdated(false, options.error); return false }
+      built.google = options.body
+      built.sendUpdates = fields.sendUpdates === "none" ? "none" : "all"
+    }
     writeOp = "update"
     writeSource = source
     writeEvent = event
@@ -231,13 +438,50 @@ Item {
     return true
   }
 
+  // What the delete confirmation asks: named, with a button per consequence.
+  function deleteRequest(sourceId, event) {
+    var request = Calendar.deleteRequest(event, findSource(String(sourceId || "")),
+      service.backendCanGoogleCalendars === true)
+    request.sourceId = String(sourceId || "")
+    request.event = event
+    return request
+  }
+
+  // The answer: the series, or this event with or without telling guests.
+  function confirmDelete(request) {
+    if (!request || !request.event) return false
+    if (request.choice === "series") return deleteSeries(request.sourceId, request.event)
+    var event = {}
+    for (var key in request.event) event[key] = request.event[key]
+    event.deleteSendUpdates = request.choice === "none" ? "none" : "all"
+    return deleteEvent(request.sourceId, event)
+  }
+
+  // A series is deleted by its own identity: an occurrence carries only the
+  // parent's id, so the parent is read first and deleted as itself.
+  function deleteSeries(sourceId, occurrence) {
+    var owner = findSource(sourceId)
+    if (!owner || !occurrence || !occurrence.recurringEventId) return false
+    if (service.backendCanGoogleCalendars !== true) { lastError = "Update the backend to delete a series"; return false }
+    nativeRequest(owner, "get", { eventId: occurrence.recurringEventId }, function(result, error) {
+      if (error) { root.lastError = error; return }
+      var parent
+      try { parent = JSON.parse(result.body) } catch (e) { root.lastError = "Could not read the series"; return }
+      var events = Calendar.eventsFromGoogle({ items: [parent] }, owner.id)
+      if (events.length !== 1) { root.lastError = "Could not read the series"; return }
+      events[0].deleteSendUpdates = occurrence.deleteSendUpdates === "none" ? "none" : "all"
+      root.deleteEvent(owner.id, events[0])
+    })
+    return true
+  }
+
   function deleteEvent(sourceId, event) {
     if (creatingEvent || eventWriting) {
       eventDeleted(false, "Another event change is still in progress")
       return false
     }
     var source = findSource(sourceId)
-    var refusal = Calendar.writeRefusal(source, event)
+    var refusal = Calendar.writeRefusal(source, event, "delete")
     if (refusal !== "") { eventDeleted(false, refusal); return false }
     writeOp = "delete"
     writeSource = source
@@ -247,6 +491,29 @@ Item {
     if (source.kind === "google") startGoogleWrite()
     else if (source.kind === "microsoft") startGraphWrite()
     else startCaldavWrite()
+    return true
+  }
+
+  function transferEvent(sourceId, destinationId, event, callback) {
+    var source = findSource(sourceId), destination = findSource(destinationId)
+    var refusal = Calendar.transferRefusal(source, destination, event)
+    if (creatingEvent || eventWriting) refusal = "Another event change is still in progress"
+    else if (service.backendCanGoogleCalendars !== true) refusal = "Update the backend to transfer events"
+    else if (!event || !event.etag) refusal = "Refresh this event before moving it"
+    if (refusal) { callback(null, refusal); return false }
+    eventWriting = true
+    nativeRequest(source, "move", {eventId:event.googleId, destination:destination.calendarId || "primary",
+      ifMatch:event.etag, sendUpdates:"none"}, function(result, error) {
+      root.eventWriting = false
+      if (error) { callback(null, error); return }
+      root.undoChange = null
+      var resource = null
+      try { resource = JSON.parse(result.body) } catch (e) {}
+      var moved = resource ? Calendar.eventsFromGoogle({items:[resource]}, destination.id) : []
+      callback(moved.length === 1 ? moved[0] : null,
+        moved.length === 1 ? "" : "The calendar changed, but its updated details could not be read. Reopen the event before editing further.", true)
+      if (root.rangeStart && root.rangeEnd) root.refresh(root.rangeStart, root.rangeEnd)
+    })
     return true
   }
 
@@ -279,20 +546,45 @@ Item {
 
   function createGoogleEvent() { createNativeEvent() }
 
+  // The account's primary Microsoft calendar, which is the one calendar a
+  // backend from before discovery reaches: it ignores the identity and asks
+  // for /me/calendarView, and that is this calendar. Discovery stores its
+  // real Graph id under the same source id, so the id is what says which
+  // source may go on without one rather than being refused.
+  function isDefaultMicrosoftCalendar(source) {
+    return !!source && source.kind === "microsoft"
+      && String(source.id || "") === "microsoft:" + String(source.accountId || "")
+  }
+
   function nativeRequest(source, operation, fields, callback) {
     if (!service || !service.backend) { callback(null, "Calendar backend is unavailable"); return }
+    if (source && source.kind === "google"
+        && (source.calendarId || ["get", "lookup", "instances", "move"].indexOf(operation) >= 0
+          || fields && (fields.ifMatch || fields.sendUpdates !== undefined))
+        && service.backendCanGoogleCalendars !== true) {
+      callback(null, "Update the backend to access Google calendars")
+      return
+    }
+    if (source && service.backendCanDiscoverCalendars !== true) {
+      if (source.kind === "microsoft" && String(source.calendarId || "") !== ""
+          && isDefaultMicrosoftCalendar(source)) {
+        var degraded = Sources.makeSource(source)
+        degraded.calendarId = ""
+        source = degraded
+      } else if (source.kind === "icloud"
+          || (source.kind === "microsoft" && String(source.calendarId || "") !== "")) {
+        callback(null, "Update the backend to access this calendar")
+        return
+      }
+    }
     var params = fields || {}
     params.source = source
     params.operation = operation
     service.backend.call("calendar.request", params, function(result, error) {
       var reason = ""
       if (error) {
-        var code = String(error.code || error)
-        if (code === "calendar_auth_required" || code === "calendar_auth_refused")
-          reason = "Sign in again to access this calendar"
-        else if (code === "calendar_password_missing") reason = "Set this calendar's password in Settings"
-        else if (code === "calendar_origin_refused") reason = "The event's address is outside this calendar's server"
-        else reason = "The calendar request failed"
+        reason = error.message === "calendar_conflict" ? "This event changed elsewhere. Refresh and try again."
+          : Calendar.nativeRequestError(String(source && source.kind || ""))
       }
       callback(result, reason)
     })
@@ -300,7 +592,9 @@ Item {
 
   function createNativeEvent() {
     var fields = {}
-    if (eventSource.kind === "caldav") {
+    if (eventSource.kind === "google" && service.backendCanGoogleCalendars === true)
+      fields.sendUpdates = eventDraft.sendUpdates
+    if (eventSource.kind === "caldav" || eventSource.kind === "icloud") {
       var base = String(eventSource.url || "")
       if (base.charAt(base.length - 1) !== "/") base += "/"
       fields.href = base + encodeURIComponent(eventDraft.uid) + ".ics"
@@ -311,18 +605,82 @@ Item {
 
   function startNativeWrite() {
     var fields = {}
-    if (writeSource.kind === "caldav") {
+    // Undo belongs to the calendar the change was made in: a write that lands
+    // after the view moved to another account offers nothing to undo there.
+    var scope = calendarScope
+    if (writeSource.kind === "caldav" || writeSource.kind === "icloud") {
       fields.href = String(writeEvent.href || Calendar.caldavEventUrl(writeSource.url, writeEvent))
       if (!fields.href) { finishWrite(false, "The event's address is outside this calendar's server"); return }
       if (writeDraft) fields.body = writeDraft.ics
     } else {
       fields.eventId = String(writeSource.kind === "google" ? writeEvent.googleId : writeEvent.graphId)
+      if (writeSource.kind === "google" && writeEvent.etag && service.backendCanGoogleCalendars === true)
+        fields.ifMatch = writeEvent.etag
+      if (writeSource.kind === "google" && writeDraft && service.backendCanGoogleCalendars === true)
+        fields.sendUpdates = writeDraft.sendUpdates
+      if (writeSource.kind === "google" && writeOp === "delete" && service.backendCanGoogleCalendars === true)
+        fields.sendUpdates = writeEvent.deleteSendUpdates === "none" ? "none" : "all"
       if (writeDraft) fields.body = JSON.stringify(writeSource.kind === "google" ? writeDraft.google : writeDraft.graph)
     }
-    nativeRequest(writeSource, writeOp, fields, function(result, error) { root.finishWrite(!error, error) })
+    nativeRequest(writeSource, writeOp, fields, function(result, error) {
+      if (!error) root.undoChange = null
+      if (!error && root.writeOp === "update" && root.writeSource.kind === "google"
+          && root.service.backendCanGoogleCalendars === true
+          && root.writeEvent.start && root.writeEvent.end
+          && !root.writeDraft.destination && !(root.writeEvent.attendees || []).some(function(a) { return a.self !== true })
+          && !(root.writeDraft.google.attendees || []).some(function(a) { return a.self !== true })) {
+        var saved = null
+        try { saved = JSON.parse(result.body) } catch (e) {}
+        if (saved && saved.etag) {
+          var previous = root.writeEvent
+          var inverse = Calendar.googleEventPatch({ title: previous.summary, description: previous.description,
+            location: previous.location, start: previous.start.ms, end: previous.end.ms }, previous.start.allDay)
+          if (root.writeDraft.google.conferenceData) inverse.conferenceData = previous.conferenceData || null
+          if (root.writeDraft.google.recurrence !== undefined) inverse.recurrence = previous.recurrenceLines || []
+          var preserved = ["reminders", "transparency", "visibility", "attendees"]
+          var completeUndo = true
+          for (var p = 0; p < preserved.length; p++) {
+            var field = preserved[p]
+            if (root.writeDraft.google[field] !== undefined && previous[field] !== undefined)
+              inverse[field] = previous[field]
+            else if (root.writeDraft.google[field] !== undefined) completeUndo = false
+          }
+          if (!previous.start.allDay && previous.timeZone) {
+            inverse.start.timeZone = previous.timeZone
+            inverse.end.timeZone = previous.timeZone
+          }
+          if (completeUndo && scope === root.calendarScope)
+            root.undoChange = { source: root.writeSource, eventId: fields.eventId, ifMatch: saved.etag,
+              body: JSON.stringify(inverse), sendUpdates: "none", scope: scope }
+        }
+      }
+      if (error || !root.writeDraft || !root.writeDraft.destination) { root.finishWrite(!error, error); return }
+      var move = { eventId: fields.eventId, destination: root.writeDraft.destination.calendarId || "primary",
+        sendUpdates: root.writeDraft.sendUpdates }
+      root.nativeRequest(root.writeSource, "move", move, function(moved, moveError) {
+        root.finishWrite(!moveError, moveError ? "Changes were saved, but the calendar transfer failed. Refresh before trying again." : "")
+        if (moveError && root.rangeStart && root.rangeEnd) root.refresh(root.rangeStart, root.rangeEnd)
+      })
+    })
+  }
+
+  function undoLastChange() {
+    if (!undoChange || creatingEvent || eventWriting) return
+    if (undoChange.scope !== calendarScope) { undoChange = null; return }
+    if (service.backendCanGoogleCalendars !== true) { lastError = "Update the backend to undo calendar changes"; return }
+    var change = undoChange
+    undoChange = null
+    eventWriting = true
+    nativeRequest(change.source, "update", { eventId: change.eventId, ifMatch: change.ifMatch,
+      body: change.body, sendUpdates: change.sendUpdates }, function(result, error) {
+      root.eventWriting = false
+      if (root.rangeStart && root.rangeEnd) root.refresh(root.rangeStart, root.rangeEnd)
+      if (error) root.lastError = error
+    })
   }
 
   function saveCalDavPassword(secret) {
+    if (discoveringCalendars) return
     var password = String(secret || "")
     if (password === "") { passwordSaved(false, "Enter the calendar password"); return }
     var values = sourceList && Array.isArray(sourceList.sources) ? sourceList.sources : []
@@ -339,7 +697,7 @@ Item {
   }
 
   function addCalDavCalendar(raw, secret) {
-    if (savingSource) return
+    if (savingSource || discoveringCalendars) return
     var candidate = raw || {}
     candidate.kind = "caldav"
     candidate.id = Sources.sourceId(candidate)
@@ -354,23 +712,21 @@ Item {
     sourceSecret = String(secret)
     sourceWritePayload = Sources.serialize(Sources.add(sourceList, checked.source))
     savingSource = true
-    sourceWriter.command = [pluginDir + "/scripts/config-store.sh", "calendars.json"]
-    sourceWriter.running = true
+    writeSources()
   }
 
   function removeCalendar(sourceId) {
-    if (savingSource) return
+    if (savingSource || discoveringCalendars) return
     sourceBeingSaved = null
     sourceSecret = ""
     sourceWritePayload = Sources.serialize(Sources.remove(sourceList, sourceId))
     refreshAfterSourceWrite = true
     savingSource = true
-    sourceWriter.command = [pluginDir + "/scripts/config-store.sh", "calendars.json"]
-    sourceWriter.running = true
+    writeSources()
   }
 
   function setSourceEnabled(sourceId, enabled) {
-    if (savingSource) return
+    if (savingSource || discoveringCalendars) return
     var values = availableSources && Array.isArray(availableSources.sources)
       ? availableSources.sources : []
     var source = null
@@ -385,8 +741,7 @@ Item {
     sourceWritePayload = Sources.serialize(next)
     refreshAfterSourceWrite = true
     savingSource = true
-    sourceWriter.command = [pluginDir + "/scripts/config-store.sh", "calendars.json"]
-    sourceWriter.running = true
+    writeSources()
   }
 
   function colorKeyFor(sourceId) {
@@ -398,8 +753,42 @@ Item {
     return Sources.defaultColorKey(sourceId)
   }
 
+  function setDefaultCalendar(sourceId) {
+    if (savingSource || discoveringCalendars) return
+    var chosen = sourceById(availableSources, sourceId)
+    if (!chosen || chosen.readOnly) return
+    var next = Sources.add(sourceList, chosen)
+    next.sources = next.sources.map(function(source) {
+      var value = Sources.makeSource(source)
+      if (value.accountId === chosen.accountId) value.preferred = value.id === chosen.id
+      return value
+    })
+    sourceBeingSaved = null
+    sourceSecret = ""
+    sourceWritePayload = Sources.serialize(next)
+    refreshAfterSourceWrite = false
+    savingSource = true
+    writeSources()
+  }
+
+  function setReminderPolicy(sourceId, enabled, minutes) {
+    if (savingSource || discoveringCalendars) return
+    var source = sourceById(availableSources, sourceId)
+    if (!Sources.nativeCalendarFeatures(source)) return
+    var value = Sources.makeSource(source)
+    value.remindersEnabled = enabled === true
+    value.reminderMinutes = Math.max(-1, Math.min(40320, Math.floor(Number(minutes))))
+    if (!isFinite(value.reminderMinutes)) return
+    sourceWritePayload = Sources.serialize(Sources.add(sourceList, value))
+    sourceBeingSaved = null
+    sourceSecret = ""
+    refreshAfterSourceWrite = false
+    savingSource = true
+    writeSources()
+  }
+
   function setSourceColor(sourceId, colorKey) {
-    if (savingSource) return
+    if (savingSource || discoveringCalendars) return
     var values = availableSources && Array.isArray(availableSources.sources)
       ? availableSources.sources : []
     var source = null
@@ -414,12 +803,11 @@ Item {
     sourceWritePayload = Sources.serialize(next)
     refreshAfterSourceWrite = false
     savingSource = true
-    sourceWriter.command = [pluginDir + "/scripts/config-store.sh", "calendars.json"]
-    sourceWriter.running = true
+    writeSources()
   }
 
   function updateCalendarPassword(source, secret) {
-    if (savingSource) return
+    if (savingSource || discoveringCalendars) return
     if (!source || source.kind !== "caldav") {
       calendarSaved(false, "Choose a CalDAV calendar")
       return
@@ -431,9 +819,7 @@ Item {
     sourceBeingSaved = source
     sourceSecret = String(secret)
     savingSource = true
-    sourcePasswordStore.command = [pluginDir + "/scripts/keyring-store.sh"]
-      .concat(Sources.keyringAttributes(source.id))
-    sourcePasswordStore.running = true
+    storeSourcePassword(true)
   }
 
   function storeNextPassword() {
@@ -447,9 +833,85 @@ Item {
     var pending = passwordSaveQueue.slice()
     var source = pending.shift()
     passwordSaveQueue = pending
-    var attributes = Sources.keyringAttributes(source.id)
-    passwordStore.command = [pluginDir + "/scripts/keyring-store.sh"].concat(attributes)
-    passwordStore.running = true
+    if (!service || typeof service.credentialPut !== "function") {
+      passwordToSave = ""
+      passwordSaveQueue = []
+      savingPassword = false
+      passwordSaved(false, "Credential storage is unavailable")
+      return
+    }
+    service.credentialPut("calendar-password", String(source.id || ""), "",
+      passwordToSave, function(ok, error) {
+        if (!ok) {
+          root.passwordToSave = ""
+          root.passwordSaveQueue = []
+          root.savingPassword = false
+          root.passwordSaved(false, String(error || "Could not save the password"))
+          return
+        }
+        root.storeNextPassword()
+      })
+  }
+
+  function sourceWriteFailed(error) {
+    savingSource = false
+    sourceSecret = ""
+    sourceBeingSaved = null
+    refreshAfterSourceWrite = false
+    calendarSaved(false, String(error || "Could not save the calendar"))
+    if (discoverySaving) {
+      discoverySaving = false
+      discoveryPendingCount = 0
+      discoveryError = "The discovered calendars could not be saved"
+      discoveryFinished(false, discoveryError, 0)
+    }
+  }
+
+  function writeSources() {
+    if (!service || typeof service.writeConfig !== "function") {
+      sourceWriteFailed("Settings storage is unavailable")
+      return
+    }
+    service.writeConfig("calendars.json", sourceWritePayload, function(ok, error) {
+      if (!ok) { root.sourceWriteFailed(error); return }
+      root.sourceList = Sources.load(root.sourceWritePayload)
+      if (!root.sourceBeingSaved) {
+        root.savingSource = false
+        root.calendarSaved(true, "")
+        if (root.discoverySaving) {
+          var count = root.discoveryPendingCount
+          root.discoverySaving = false
+          root.discoveryPendingCount = 0
+          root.discoveryFinished(true, "", count)
+        }
+        if (root.refreshAfterSourceWrite && root.rangeStart && root.rangeEnd)
+          root.refresh(root.rangeStart, root.rangeEnd)
+        root.refreshAfterSourceWrite = false
+        return
+      }
+      root.storeSourcePassword(true)
+    })
+  }
+
+  function storeSourcePassword(refreshAfter) {
+    if (!service || typeof service.credentialPut !== "function") {
+      sourceWriteFailed("Credential storage is unavailable")
+      return
+    }
+    var sourceId = sourceBeingSaved ? String(sourceBeingSaved.id || "") : ""
+    var secret = sourceSecret
+    service.credentialPut("calendar-password", sourceId, "", secret, function(ok, error) {
+      root.sourceSecret = ""
+      root.sourceBeingSaved = null
+      root.savingSource = false
+      if (!ok) {
+        root.calendarSaved(false, String(error || "Could not save the password"))
+        return
+      }
+      root.calendarSaved(true, "")
+      if (refreshAfter && root.rangeStart && root.rangeEnd)
+        root.refresh(root.rangeStart, root.rangeEnd)
+    })
   }
 
   function replaceActiveSourceEvents(values) {
@@ -465,12 +927,16 @@ Item {
       next.push(additions[i])
     }
     next.sort(Calendar.compareEvents)
-    events = next
+    setEvents(next)
+  }
+
+  function setEvents(next) {
+    if (!Calendar.sameEvents(events, next)) events = next
   }
 
   function failSource(reason, kind) {
     if (refreshScope !== calendarScope) { processNext(); return }
-    var name = activeSource ? activeSource.name || activeSource.id : "Calendar"
+    var name = Sources.errorLabel(activeSource, service ? service.accountSummaries : [])
     lastError = name + ": " + String(reason || "Could not load events")
     lastErrorKind = String(kind || "")
     processNext()
@@ -481,15 +947,16 @@ Item {
       activeSource = null
       loading = false
       var enabled = sourcesForAccount(refreshAccountId).sources.filter(function(source) {
-        return source && source.enabled
+        return root.sourceIncluded(source)
       }).map(function(source) { return String(source.id || "") })
       var allowed = {}
       for (var i = 0; i < enabled.length; i++) allowed[enabled[i]] = true
-      if (refreshScope === calendarScope) events = events.filter(function(event) {
+      if (refreshScope === calendarScope) setEvents(events.filter(function(event) {
         return allowed[String(event && event.sourceId || "")] === true
-      })
+      }))
       if (rangeStart && rangeEnd && refreshScope === calendarScope)
-        eventCache.put(refreshScope, rangeStart, rangeEnd, events)
+        eventCache.put(refreshScope, rangeStart, rangeEnd, events,
+          contextSources.sources.filter(function(source) { return root.sourceIncluded(source) }).map(function(source) { return String(source.id) }))
       var nextStart = pendingRangeStart
       var nextEnd = pendingRangeEnd
       pendingRangeStart = 0
@@ -503,7 +970,7 @@ Item {
     queue = pending
     if (activeSource.kind === "google") startGoogle()
     else if (activeSource.kind === "microsoft") startGraph()
-    else if (activeSource.kind === "caldav") startPasswordLookup()
+    else if (activeSource.kind === "caldav" || activeSource.kind === "icloud") startPasswordLookup()
     else failSource("The HEY CLI does not expose calendar events")
   }
 
@@ -511,12 +978,13 @@ Item {
 
   function startNativeList() {
     var fields = { start: new Date(rangeStart).toISOString(), end: new Date(rangeEnd).toISOString() }
-    if (activeSource.kind === "caldav") fields.body = Calendar.caldavReport(rangeStart, rangeEnd)
+    if (activeSource.kind === "caldav" || activeSource.kind === "icloud")
+      fields.body = Calendar.caldavReport(rangeStart, rangeEnd)
     nativeRequest(activeSource, "list", fields, function(result, error) {
       if (error) { root.failSource(error); return }
       var body = String(result && result.body || "")
       var values = []
-      if (root.activeSource.kind === "caldav")
+      if (root.activeSource.kind === "caldav" || root.activeSource.kind === "icloud")
         values = Calendar.eventsFromCaldav(body, root.activeSource.id, root.rangeStart, root.rangeEnd)
       else {
         var payload = null
@@ -539,89 +1007,25 @@ Item {
     path: root.configPath
     watchChanges: true
     printErrors: false
+    // No refresh here: a file that brings calendars changes
+    // `enabledSourceKey`, which reloads the range, and one that brings none
+    // leaves nothing to ask for.
     onLoaded: {
-      var firstLoad = !root.sourcesLoaded
       root.sourceList = Sources.load(text())
       root.sourcesLoaded = true
-      if (firstLoad && root.rangeStart && root.rangeEnd) root.refresh(root.rangeStart, root.rangeEnd)
     }
     onFileChanged: reload()
+    // Hearing again that the file is absent is not a change. The file's
+    // directory is touched whenever the backend reads its registry, which a
+    // calendar refresh does, and announcing a fresh empty list started the
+    // next refresh.
     onLoadFailed: {
-      root.sourceList = Sources.emptyList()
+      if (!root.sourceList || !Array.isArray(root.sourceList.sources)
+          || root.sourceList.sources.length > 0)
+        root.sourceList = Sources.emptyList()
       root.sourcesLoaded = true
     }
   }
-
-
-  Process {
-    id: passwordStore
-    stdinEnabled: true
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { id: passwordStoreError; waitForEnd: true }
-    onStarted: write(root.passwordToSave + "\n")
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        root.passwordToSave = ""
-        root.passwordSaveQueue = []
-        root.savingPassword = false
-        root.passwordSaved(false, String(passwordStoreError.text || "Could not save the password"))
-        return
-      }
-      root.storeNextPassword()
-    }
-  }
-
-  Process {
-    id: sourceWriter
-    stdinEnabled: true
-    stderr: StdioCollector { id: sourceWriteError; waitForEnd: true }
-    onStarted: write(root.sourceWritePayload + "\n")
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        root.savingSource = false
-        root.sourceSecret = ""
-        root.refreshAfterSourceWrite = false
-        root.calendarSaved(false, String(sourceWriteError.text || "Could not save the calendar"))
-        return
-      }
-      root.sourceList = Sources.load(root.sourceWritePayload)
-      if (!root.sourceBeingSaved) {
-        root.savingSource = false
-        root.calendarSaved(true, "")
-        if (root.refreshAfterSourceWrite && root.rangeStart && root.rangeEnd)
-          root.refresh(root.rangeStart, root.rangeEnd)
-        root.refreshAfterSourceWrite = false
-        return
-      }
-      sourcePasswordStore.command = [root.pluginDir + "/scripts/keyring-store.sh"]
-        .concat(Sources.keyringAttributes(root.sourceBeingSaved.id))
-      sourcePasswordStore.running = true
-    }
-  }
-
-  Process {
-    id: sourcePasswordStore
-    stdinEnabled: true
-    stderr: StdioCollector { id: sourcePasswordError; waitForEnd: true }
-    onStarted: write(root.sourceSecret + "\n")
-    onExited: function(exitCode) {
-      root.sourceSecret = ""
-      root.sourceBeingSaved = null
-      root.savingSource = false
-      if (exitCode !== 0) {
-        root.calendarSaved(false, String(sourcePasswordError.text || "Could not save the password"))
-        return
-      }
-      root.calendarSaved(true, "")
-      if (root.rangeStart && root.rangeEnd) root.refresh(root.rangeStart, root.rangeEnd)
-    }
-  }
-
-
-
-
-
-
 
 
   CalendarCache {

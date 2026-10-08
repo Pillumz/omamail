@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtTest 1.3
 import qs.Commons
+import qs.Commons as Commons
 import "../../components" as Mail
 
 // The chevron folds; it does not also open. Two tap handlers sit one inside
@@ -25,10 +26,11 @@ Item {
     width: 220
     height: 600
     service: fake
-    textColor: Color.foreground
-    accentColor: Color.accent
-    dimColor: Color.foreground
+    textColor: Commons.Color.foreground
+    accentColor: Commons.Color.accent
+    dimColor: Commons.Color.foreground
     panelFontFamily: "monospace"
+    slots: [{ kind: "mailbox", key: "inbox" }]
   }
 
   SignalSpy { id: folded; target: sidebar; signalName: "folderToggled" }
@@ -56,7 +58,11 @@ Item {
       return null
     }
 
-    function init() { folded.clear(); opened.clear(); mailbox.clear() }
+    function init() {
+      folded.clear(); opened.clear(); mailbox.clear()
+      sidebar.numbersVisible = false
+      sidebar.collapsed = false
+    }
 
     function test_the_chevron_folds_without_opening() {
       var folds = named(sidebar, "fold", [])
@@ -85,6 +91,19 @@ Item {
       compare(opened.count, 1)
       compare(opened.signalArguments[0][0], "Work/2026", "opened by the server's id, not the leaf")
       compare(folded.count, 0)
+    }
+
+    function test_shortcut_number_is_an_informational_chip() {
+      sidebar.collapsed = true
+      sidebar.numbersVisible = true
+      var chip = named(sidebar, "mailbox-shortcut-chip", [])[0]
+      verify(chip, "the numbered mailbox draws its shortcut hint")
+      verify(chip.x >= chip.parent.width / 2, "hint stays in the right corner")
+      verify(chip.y < chip.parent.height / 4, "hint stays at the top")
+      verify(chip.height < chip.parent.height / 2, "hint is smaller than the row icon")
+      verify(named(sidebar, "mailbox-entry-icon", [])[0].visible, "modifier preserves mailbox icon")
+      verify(chip.color.a < Style.selectedFillFor(Commons.Color.foreground, Commons.Color.accent).a,
+        "a shortcut hint must not use the much heavier selected-state fill")
     }
   }
 }

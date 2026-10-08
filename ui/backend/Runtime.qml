@@ -5,6 +5,13 @@ import "Runtime.js" as Rules
 Item {
   id: root
   required property string pluginDir
+  // A standalone bundle already contains the exact backend it will run. Its
+  // path is supplied by the native host and never goes through the plugin's
+  // downloader or PATH probing.
+  property string bundledExecutable: ""
+  property string bundledVersion: ""
+  property int bundledApiVersion: 0
+  property bool bundledMode: false
   property string developmentExecutable: ""
   state: "checking"
   property string requiredVersion: ""
@@ -18,21 +25,42 @@ Item {
   property string error: ""
   property bool cliInstalled: false
   readonly property bool development: developmentExecutable !== ""
-  readonly property bool busy: operation.running
-  readonly property bool canInstall: Rules.canInstall(state, busy, development)
+  readonly property bool bundled: bundledMode
+  readonly property bool busy: !bundled && operation.running
+  readonly property bool canInstall: !bundled && Rules.canInstall(state, busy, development)
   property string action: ""
   property string response: ""
   property bool received: false
   property bool timedOut: false
   signal validated()
 
-  function refresh() { run("status") }
+  function refresh() {
+    if (bundled) {
+      requiredVersion = bundledVersion
+      requiredApiVersion = bundledApiVersion
+      // The same one step past the pin the plugin accepts. A release bundle
+      // carries the released backend; `make app-run` builds this checkout's,
+      // which answers with the unreleased step and was refused as incompatible.
+      // Features still gate on the API the connected binary reports.
+      latestApiVersion = bundledApiVersion > 0 ? bundledApiVersion + 1 : 0
+      unreleasedMethods = []
+      installedVersion = bundledVersion
+      executable = bundledExecutable
+      error = bundledExecutable !== "" && bundledVersion !== "" && bundledApiVersion > 0
+        ? "" : "Bundled backend is missing or invalid"
+      state = error === "" ? "ready" : "error"
+      cliInstalled = false
+      if (state === "ready") validated()
+      return
+    }
+    run("status")
+  }
   function install() { if (canInstall) run("install") }
   function enableCli() { if (!development && !cliInstalled && state === "ready") run("enable-cli") }
   function disableCli() { if (!development && cliInstalled) run("disable-cli") }
 
   function run(command) {
-    if (busy || pluginDir === "") return
+    if (bundled || busy || pluginDir === "") return
     action = command
     response = ""
     received = false
@@ -66,6 +94,8 @@ Item {
   }
 
   Component.onCompleted: refresh()
+
+  onBundledExecutableChanged: Qt.callLater(refresh)
 
   Timer {
     id: deadline

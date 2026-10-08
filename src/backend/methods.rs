@@ -2,11 +2,15 @@
 pub const ALL: &[&str] = &[
     "system.info",
     "system.quit",
+    "credentials.get",
+    "credentials.put",
+    "credentials.delete",
     "accounts.list",
     "account.identities",
     "account.conversation",
     "agent.context",
     "agent.jobsList",
+    "agent.providerStatus",
     "agent.jobsProjection",
     "agent.jobStart",
     "agent.jobShow",
@@ -88,6 +92,9 @@ pub const ALL: &[&str] = &[
     "public.image",
     "public.unsubscribe",
     "calendar.request",
+    "calendar.discover",
+    "calendar.attendance",
+    "calendar.reminders",
     "auth.form",
     "auth.begin",
     "auth.poll",
@@ -97,6 +104,7 @@ pub const ALL: &[&str] = &[
     "auth.store",
     "auth.clear",
     "outlook.graphSend",
+    "outlook.connectionCheck",
     "hey.probe",
     "hey.status",
     "hey.profile",
@@ -174,3 +182,10 @@ pub const ALL: &[&str] = &[
     "jmap.stream.poll",
     "jmap.stream.close",
 ];
+
+pub fn available() -> Vec<&'static str> {
+    ALL.iter()
+        .copied()
+        .filter(|method| !method.starts_with("agent.") || cfg!(all(feature = "agent", unix)))
+        .collect()
+}

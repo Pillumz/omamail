@@ -11,9 +11,10 @@ use crate::{account, message};
 pub struct Session {
     uploads: std::sync::Mutex<upload::Uploads>,
     reader: std::sync::Arc<std::sync::Mutex<reader::ReaderStore>>,
+    #[cfg(all(feature = "agent", unix))]
     agent_context: crate::agent::context::Contexts,
     upload_jobs: tokio::sync::Semaphore,
-    gmail: std::sync::Arc<crate::providers::gmail::Session>,
+    pub(crate) gmail: std::sync::Arc<crate::providers::gmail::Session>,
     mail: crate::sync::Sync,
     auth: crate::auth::Session,
     jmap: std::sync::Arc<crate::providers::jmap::Session>,
@@ -38,6 +39,7 @@ impl Default for Session {
         Self {
             uploads: Default::default(),
             reader: Default::default(),
+            #[cfg(all(feature = "agent", unix))]
             agent_context: Default::default(),
             upload_jobs: tokio::sync::Semaphore::new(2),
             mail: crate::sync::Sync::new(gmail.clone(), jmap.clone(), queries.clone()),
@@ -57,15 +59,23 @@ impl Session {
     // re-enter this dispatcher; embedding every provider future here overflowed
     // the worker stack in the real Quickshell large-request integration test.
     pub async fn dispatch(&self, method: &str, params: &Value) -> Result<Value, &'static str> {
+        #[cfg(not(all(feature = "agent", unix)))]
+        if method.starts_with("agent.") {
+            return Err("unknown_method");
+        }
         if matches!(method, "mail.list" | "mail.read" | "mail.act" | "mail.send") {
             return Box::pin(self.mail_call(method, params)).await;
         }
         if matches!(method, "system.info" | "system.quit" | "providers.list") {
             return dispatch(method, params);
         }
+        if method.starts_with("credentials.") {
+            return crate::credentials::rpc::call(method, params).await;
+        }
         if matches!(method, "reader.open" | "reader.render" | "reader.cancel") {
             return Box::pin(self.reader_call(method, params)).await;
         }
+        #[cfg(all(feature = "agent", unix))]
         if matches!(method, "agent.context" | "agent.contextCancel") {
             return Box::pin(self.agent_context.call(method, params, self)).await;
         }
@@ -91,9 +101,11 @@ impl Session {
             }
             return Ok(crate::providers::domain::snapshot());
         }
+        #[cfg(all(feature = "agent", unix))]
         if matches!(
             method,
             "agent.jobsList"
+                | "agent.providerStatus"
                 | "agent.jobsProjection"
                 | "agent.jobStart"
                 | "agent.jobShow"
@@ -201,6 +213,9 @@ impl Session {
         if method == "outlook.graphSend" {
             return Box::pin(self.auth.call(method, params)).await;
         }
+        if method == "outlook.connectionCheck" {
+            return Box::pin(crate::providers::outlook::connection_check(params)).await;
+        }
         if method == "attachment.read" {
             let params = params.clone();
             return tokio::task::spawn_blocking(move || crate::attachment::read(&params))
@@ -295,6 +310,7 @@ impl Session {
             return Box::pin(self.dispatch(target, &params)).await;
         }
         if method == "calendar.request" {
+            crate::calendar::validate(params)?;
             let token = match params["source"]["kind"].as_str() {
                 Some("google") => Some(
                     self.gmail
@@ -319,6 +335,53 @@ impl Session {
                 _ => None,
             };
             return Box::pin(crate::calendar::call(params, token.as_deref())).await;
+        }
+        if method == "calendar.attendance" {
+            crate::calendar::attendance::validate(params)?;
+            let token = self
+                .gmail
+                .access_token(params["accountId"].as_str().ok_or("invalid_params")?)
+                .await?;
+            let account = params["accountId"].as_str().ok_or("invalid_params")?;
+            let mut addresses = vec![account.to_owned()];
+            if let Ok(aliases) = self
+                .gmail
+                .call("gmail.sendAs", &json!({"accountId":account}))
+                .await
+            {
+                for alias in aliases.as_array().into_iter().flatten() {
+                    if let Some(email) = alias["email"].as_str().filter(|email| {
+                        !email.is_empty()
+                            && email.len() <= 1024
+                            && !email.chars().any(char::is_control)
+                    }) {
+                        addresses.push(email.to_owned());
+                    }
+                }
+            }
+            return crate::calendar::attendance::google(params, &token, &addresses).await;
+        }
+        if method == "calendar.reminders" {
+            let params = params.clone();
+            return tokio::task::spawn_blocking(move || crate::calendar::reminders::call(&params))
+                .await
+                .map_err(|_| "calendar_reminders_unavailable")?;
+        }
+        if method == "calendar.discover" {
+            if let Some(account) = params["accountId"]
+                .as_str()
+                .filter(|id| id.contains('@') && !id.contains(':'))
+            {
+                if params.as_object().is_none_or(|fields| fields.len() != 1)
+                    || account.len() > 1024
+                    || account.chars().any(|c| c.is_control() || c.is_whitespace())
+                {
+                    return Err("invalid_params");
+                }
+                let token = self.gmail.access_token(account).await?;
+                return crate::calendar::discover_google(account, &token).await;
+            }
+            return Box::pin(crate::calendar::discover(params)).await;
         }
         if method == "cache.bodyPutUpload" {
             let mut params = params.as_object().cloned().ok_or("invalid_params")?;
@@ -416,7 +479,8 @@ pub fn dispatch(method: &str, params: &Value) -> Result<Value, &'static str> {
     match method {
         "system.info" => Ok(json!({
             "name": "omamail", "version": env!("CARGO_PKG_VERSION"),
-            "protocol": 1, "apiVersion": 3, "methods": methods::ALL
+            "protocol": 1, "apiVersion": 6, "methods": methods::available(),
+            "capabilities": {"agent": cfg!(all(feature = "agent", unix))}
         })),
         "system.quit" => Ok(json!({"quitReady": true})),
         "accounts.list" => account::list(),
@@ -435,7 +499,16 @@ mod api_contract_tests {
         let info = dispatch("system.info", &json!({})).unwrap();
         assert_eq!(info["apiVersion"], contract["apiVersion"]);
         assert_eq!(info["protocol"], contract["protocolVersion"]);
-        assert_eq!(info["methods"], contract["methods"]);
+        let expected: Vec<_> = contract["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|method| {
+                cfg!(all(feature = "agent", unix))
+                    || !method.as_str().unwrap().starts_with("agent.")
+            })
+            .collect();
+        assert_eq!(info["methods"], json!(expected));
     }
 }
 
@@ -444,7 +517,7 @@ mod cache_lifecycle_tests {
     use super::*;
     #[tokio::test]
     async fn successful_clear_invalidates_only_its_account_and_refused_clear_preserves_cache() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "omamail-backend-cache-clear-{}",
             std::process::id()
         ));

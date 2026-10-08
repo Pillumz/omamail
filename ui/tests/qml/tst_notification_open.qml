@@ -1,7 +1,10 @@
 import QtQuick
 import QtTest
+import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import "../.." as Omamail
+import "../../account" as Account
 import "BackendFixture.js" as BackendFixture
 import "../../account/Accounts.js" as Accounts
 
@@ -12,7 +15,7 @@ Item {
   QtObject {
     id: host
     property QtObject bar: QtObject {
-      property color barForeground: Qt.rgba(0.9, 0.8, 0.7, 1)
+      property int barSize: 30
     }
     property int opens: 0
     function updateEntryInline(id, entry) {}
@@ -28,6 +31,29 @@ Item {
     manifest: ({ id: "omamail", __sourceDir: "/tmp/omamail-test" })
   }
   Omamail.App { id: app; service: service }
+
+  Component {
+    id: nativeNotificationFactory
+    Account.NewMailNotification {
+      pluginDir: "/tmp/omamail-test"
+      accountId: "imap:plain@example.org"
+      notificationForeground: "#112233"
+      notificationAccent: "#445566"
+      nativeNotifications: true
+    }
+  }
+
+  Component {
+    id: unavailableNotificationFactory
+    Account.NewMailNotification {
+      pluginDir: "/tmp/omamail-test"
+      accountId: "imap:plain@example.org"
+      notificationForeground: "#112233"
+      notificationAccent: "#445566"
+      nativeNotifications: false
+      pluginNotifications: false
+    }
+  }
 
   TestCase {
     name: "NotificationOpen"
@@ -47,6 +73,7 @@ Item {
       service.activeIndex = -1
       service.refreshCurrent()
       host.opens = 0
+      Quickshell.notifications = []
     }
 
     function notification(account, arrivals) {
@@ -97,17 +124,22 @@ Item {
       compare(host.opens, 2)
     }
 
-    function test_new_notifications_follow_bar_colors() {
+    function test_new_notifications_follow_theme_without_bar_foreground() {
       var account = service.findAccount(second)
       var firstNotice = notification(account, [{ id: "one" }])
-      compare(firstNotice.command[2], String(host.bar.barForeground))
-      compare(firstNotice.command[3], String(Color.accent))
-      host.bar.barForeground = Qt.rgba(0.1, 0.2, 0.3, 1)
-      var nextNotice = notification(account, [{ id: "two" }])
-      compare(nextNotice.command[2], String(host.bar.barForeground))
-      verify(firstNotice.command[2] !== nextNotice.command[2])
-      finish(firstNotice, "")
-      finish(nextNotice, "")
+      compare(firstNotice.command[2], String(Commons.Color.foreground))
+      compare(firstNotice.command[3], String(Commons.Color.accent))
+      var previous = Commons.Color.foreground
+      try {
+        Commons.Color.foreground = Qt.rgba(0.1, 0.2, 0.3, 1)
+        var nextNotice = notification(account, [{ id: "two" }])
+        compare(nextNotice.command[2], String(Commons.Color.foreground))
+        verify(firstNotice.command[2] !== nextNotice.command[2])
+        finish(firstNotice, "")
+        finish(nextNotice, "")
+      } finally {
+        Commons.Color.foreground = previous
+      }
     }
 
     function test_removed_account_is_ignored() {
@@ -134,10 +166,36 @@ Item {
       var separator = process.command.indexOf("--")
       verify(separator > 0)
       compare(process.command.length, separator + 3)
-      verify(process.command[separator + 1].indexOf("--urgency") < 0)
-      verify(process.command[separator + 2].indexOf("<img") < 0)
+      compare(process.command[separator + 1], "--urgency=critical")
+      verify(process.command[separator + 2].indexOf("<img") >= 0)
       finish(process, "unknown\n")
       compare(host.opens, 0)
+    }
+
+    function test_native_boundary_gets_canonical_text_once() {
+      var notifier = createTemporaryObject(nativeNotificationFactory, parent)
+      verify(notifier)
+      notifier.notify([{
+        id: "opaque;$(touch /tmp/never-notification)",
+        from: { display: "<img> & sender" },
+        subject: "A < B & C", snippet: "line > next"
+      }])
+      compare(Quickshell.notifications.length, 1)
+      compare(Quickshell.notifications[0].title, "<img> & sender")
+      compare(Quickshell.notifications[0].body, "A < B & C\nline > next")
+      compare(Quickshell.notifications[0].accountId, "imap:plain@example.org")
+      compare(Quickshell.notifications[0].messageId,
+        "opaque;$(touch /tmp/never-notification)")
+      compare(latestNotification(notifier), null,
+        "native delivery does not launch the plugin notification helper")
+    }
+
+    function test_standalone_without_native_notifications_runs_no_plugin_helper() {
+      var notifier = createTemporaryObject(unavailableNotificationFactory, parent)
+      verify(notifier)
+      notifier.notify([{id:"7",from:{display:"Sender"},subject:"Subject",snippet:"Body"}])
+      compare(Quickshell.notifications.length, 0)
+      compare(latestNotification(notifier), null)
     }
   }
 }

@@ -1,5 +1,7 @@
 QMLLINT := /usr/lib/qt6/bin/qmllint
+.DEFAULT_GOAL := test
 QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryController.qml \
+	ui/tests/compatibility/tst_published_agent.qml \
 	ui/backend/Backend.qml ui/backend/Runtime.qml ui/diagnostics/Diagnostics.qml \
 	ui/components/BackendSetup.qml ui/components/OmamailLogo.qml \
 	ui/account/MailAccount.qml ui/account/BackendSync.qml ui/account/SendQueue.qml ui/account/Intents.qml ui/account/BatchAction.qml ui/account/Rsvp.qml ui/account/LabelActions.qml ui/account/Unsubscribe.qml ui/account/NewMailNotification.qml \
@@ -54,29 +56,41 @@ QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryContr
 	ui/components/LabelMenu.qml \
 	ui/components/LabelMovePicker.qml \
 	ui/components/NamePrompt.qml \
-	ui/components/AddressMenu.qml \
+	ui/components/AddressMenu.qml ui/components/TextMenu.qml \
 	ui/components/ComposeAgent.qml \
 	ui/agent/AgentRunner.qml ui/agent/AgentContext.qml \
 	ui/agent/EventSuggester.qml ui/components/EventSuggestionCard.qml \
 	ui/components/AccountRemovalDialog.qml \
 	ui/components/ComposeExitDialog.qml \
 	ui/components/BackBar.qml \
-	ui/components/SettingsPage.qml \
+	ui/components/SettingsPage.qml ui/components/AiSettings.qml \
 	ui/components/SettingsSidebar.qml \
 	ui/components/CalendarSettings.qml \
 	ui/components/CalendarEventComposer.qml \
-	ui/components/CalendarEventDetail.qml \
+	ui/components/CalendarEventDetail.qml ui/components/CalendarReminderPanel.qml \
 	ui/components/CalendarPalette.qml \
 	ui/components/ConfirmDeleteDialog.qml \
 	ui/components/SetupPage.qml \
 	ui/components/ShortcutHelp.qml \
-	ui/calendar/CalendarController.qml ui/calendar/CalendarCache.qml \
+	ui/calendar/CalendarController.qml ui/calendar/CalendarCache.qml ui/calendar/CalendarReminders.qml ui/calendar/CalendarReminderInbox.qml \
 	ui/components/CalendarView.qml \
 	ui/components/WeekCalendarView.qml \
+	ui/components/WindowMoveArea.qml \
 	ui/bar/BarPreview.qml
+APP_QML_FILES := app/qml/Main.qml app/qml/StandaloneShell.qml app/qml/StandaloneManifest.qml
+APP_BUILD_DIR ?= app/build
+APP_EXEEXT := $(if $(filter Windows_NT,$(OS)),.exe,)
+APP_TARGET_DIR ?= $(CURDIR)/target/standalone
+APP_BACKEND := $(APP_TARGET_DIR)/debug/omamail$(APP_EXEEXT)
+APP_EXECUTABLE := $(CURDIR)/$(APP_BUILD_DIR)/omamail-app$(APP_EXEEXT)
 
 .PHONY: test test-js test-shell test-shell-portable test-shell-libcurl \
-	test-qml test-local test-backend-process qml-check validate bench install
+	test-qml test-app-qml test-local test-backend-process qml-check validate bench install \
+	app-build app-run help
+
+help:
+	@echo "make app-build  Build the standalone backend and Qt desktop host"
+	@echo "make app-run    Build and run the desktop host from source resources"
 
 test: test-rust test-js test-shell test-qml
 
@@ -86,12 +100,13 @@ test-local: test test-backend-process
 
 test-backend-process:
 	cargo build --locked --target-dir "$(CURDIR)/target" --bin omamail
+	node ui/tests/test_backend_queue.js target/debug/omamail
 	python3 tests/test_backend_process.py
 	python3 tests/test_agent_native_bridge.py
 
 .PHONY: test-rust backend
 test-rust:
-	cargo test --locked
+	cargo test --locked --features integration-test-credentials
 
 backend:
 	cargo build --locked --release --target-dir "$(CURDIR)/target" --bin omamail
@@ -99,7 +114,11 @@ backend:
 # The parsing, formatting, and decision rules live in plain JS precisely so
 # they can be tested without a compositor. These run anywhere node does.
 test-js:
+	node app/tests/test_theme.js
+	node app/tests/test_shell_theme.js
+	node ui/tests/test_bar_bridge.js
 	node ui/tests/test_backend_wire.js
+	node ui/tests/test_backend_queue.js
 	node ui/tests/test_backend_compatibility.js
 	node ui/tests/test_backend_runtime.js
 	node ui/tests/test_backend_chunks.js
@@ -108,6 +127,7 @@ test-js:
 	node tests/test_gmail_backend.js
 	node ui/tests/test_compose_recovery.js
 	node ui/tests/test_agent.js
+	node ui/tests/test_agent_options.js
 	node ui/tests/test_chat_text.js
 	node ui/tests/test_signature.js
 	node ui/tests/test_outbox.js
@@ -123,12 +143,14 @@ test-js:
 	node ui/tests/test_calendar_cache.js
 	node ui/tests/test_calendar_feed.js
 	node ui/tests/test_calendar_sources.js
+	node ui/tests/test_calendar_reminders.js
 	node ui/tests/test_calendar_palette.js
 	node ui/tests/test_bar_preview.js
 	node ui/tests/test_unsubscribe.js
 	node ui/tests/test_mailto.js
 	node ui/tests/test_html.js
 	node ui/tests/test_direction.js
+	node ui/tests/test_appearance.js
 	node ui/tests/test_cache.js
 	node ui/tests/test_render_cache.js
 	node ui/tests/test_model.js
@@ -153,6 +175,7 @@ test-shell: test-shell-portable test-shell-libcurl
 # Everything here drives one of our own scripts against a fake server and
 # asserts what the script did with the answer, so any libcurl can run it.
 test-shell-portable:
+	python3 tests/test_app_make.py
 	python3 tests/test_diagnostics.py
 	python3 tests/test_network_migration.py
 	python3 tests/test_plugin_workflow.py
@@ -162,6 +185,7 @@ test-shell-portable:
 	sh tests/test_dev.sh
 	python3 tests/test_attachment_common.py
 	python3 tests/test_notification.py
+	python3 tests/test_calendar_notifications.py
 	python3 tests/test_curl_config.py
 	python3 tests/test_public_http.py
 	python3 tests/test_contacts.py
@@ -173,6 +197,7 @@ test-shell-portable:
 	bash tests/test_agent_job.sh
 	bash tests/test_link_plugin.sh
 	bash tests/test_mailto.sh
+	bash tests/test_default_mail.sh
 	bash tests/test_transport.sh
 	bash tests/test_jmap_transport.sh
 	python3 tests/test_jmap_stream.py
@@ -210,6 +235,12 @@ QMLTESTRUNNER := $(shell command -v qmltestrunner6 2>/dev/null \
 	|| ls /usr/lib/qt6/bin/qmltestrunner 2>/dev/null \
 	|| command -v qmltestrunner 2>/dev/null)
 
+# Use the verified release download, not a build from this checkout.
+.PHONY: test-agent-published
+test-agent-published:
+	@test -n "$(PUBLISHED_BACKEND)" || { echo "Set PUBLISHED_BACKEND to the verified pinned executable" >&2; exit 1; }
+	python3 tests/test_agent_published_qml.py --binary "$(PUBLISHED_BACKEND)" --runner "$(QMLTESTRUNNER)"
+
 test-qml:
 	@test -n "$(QMLTESTRUNNER)" || { \
 		echo "qmltestrunner not found: install Qt 6 QML test tooling" >&2; \
@@ -222,6 +253,24 @@ test-qml:
 	python3 tests/test_sidebar_text.py "$(QMLTESTRUNNER)"
 	QMLTESTRUNNER="$(QMLTESTRUNNER)" cargo test --locked --lib message::html::tests::native_output_cannot_trigger_qt_resource_requests -- --ignored
 
+test-app-qml:
+	@test -n "$(QMLTESTRUNNER)" || { \
+		echo "qmltestrunner not found: install Qt 6 QML test tooling" >&2; \
+		exit 1; \
+	}
+	cmake -S app -B "$(APP_BUILD_DIR)" -DOMAMAIL_BACKEND="$(APP_BACKEND)" -DQMLTESTRUNNER_EXECUTABLE="$(QMLTESTRUNNER)"
+	cmake --build "$(APP_BUILD_DIR)" --parallel
+	python3 app/tests/test_qml_inventory.py
+	QT_QPA_PLATFORM=offscreen ctest --test-dir "$(APP_BUILD_DIR)" --output-on-failure --no-tests=error -R 'tst_standalone_composition'
+
+app-build:
+	cargo build --locked --no-default-features --features standalone --target-dir "$(APP_TARGET_DIR)" --bin omamail
+	cmake -S app -B "$(APP_BUILD_DIR)" -DOMAMAIL_BACKEND="$(APP_BACKEND)"
+	cmake --build "$(APP_BUILD_DIR)" --parallel
+
+app-run: app-build
+	OMAMAIL_DEVELOPMENT_RESOURCES=1 OMAMAIL_BIN="$(APP_BACKEND)" "$(APP_EXECUTABLE)"
+
 # Both engines on the same fixtures. The QML column is the one that decides
 # anything — the shell runs that engine, not node's — so run it on the machine
 # the shell runs on. Not part of `test`: it takes a few seconds and measures
@@ -232,8 +281,9 @@ bench:
 # Needs the Omarchy shell's qs.Commons / qs.Ui on the import path.
 qml-check:
 	$(QMLLINT) -I /usr/share/omarchy/shell $(QML_FILES)
+	$(QMLLINT) -I app/qml/imports -I app/build/qml $(APP_QML_FILES)
 
-validate: test qml-check
+validate: test test-app-qml qml-check
 	omarchy plugin validate .
 	git diff --check
 

@@ -586,8 +586,6 @@ function applyLabelChange(summary, action, sourceLabelId, thread) {
   if (!summary) return summary
   var change = labelChangesFor(action, sourceLabelId)
   if (!change) return summary
-  var next = {}
-  for (var key in summary) next[key] = summary[key]
   var labels = Array.isArray(summary.labelIds) ? summary.labelIds.slice() : []
   for (var i = 0; i < change.remove.length; i++) {
     var at = labels.indexOf(change.remove[i])
@@ -596,18 +594,25 @@ function applyLabelChange(summary, action, sourceLabelId, thread) {
   for (var j = 0; j < change.add.length; j++) {
     if (labels.indexOf(change.add[j]) < 0) labels.push(change.add[j])
   }
+  return rowWithThread(withLabels(summary, labels), thread)
+}
+
+// The summary carrying these labels, and every flag that mirrors one of them
+// — rather than the three that used to be the only ones read. `spam` moves a
+// row between two of these, and a menu asking a stale `inSpam` offers "Move
+// to Inbox" on a message just reported as spam — which would add INBOX and
+// keep SPAM. Unread and starred are the conversation's as well as the
+// labels', which is `rowWithThread`'s rule, so they are left to the caller.
+function withLabels(summary, labels) {
+  var next = {}
+  for (var key in summary) next[key] = summary[key]
   next.labelIds = labels
   next.inInbox = labels.indexOf("INBOX") >= 0
-  // Every flag that mirrors a label, rather than the three that used to be the
-  // only ones read. `spam` moves a row between two of these, and a menu asking
-  // a stale `inSpam` offers "Move to Inbox" on a message just reported as
-  // spam — which would add INBOX and keep SPAM. Unread and starred are the
-  // conversation's as well as the labels', which is `rowWithThread`'s rule.
   next.inTrash = labels.indexOf("TRASH") >= 0
   next.inSpam = labels.indexOf("SPAM") >= 0
   next.isSent = labels.indexOf("SENT") >= 0
   next.isDraft = labels.indexOf("DRAFT") >= 0
-  return rowWithThread(next, thread)
+  return next
 }
 
 // Skeleton rows replace only an empty list's first fetch. Loading another page
@@ -1060,6 +1065,28 @@ function detailSummary(previous, summary) {
   return merged
 }
 
+// A detail read answered from disk, against what the account holds about the
+// same message. The file is a live read as the server answered it once, and
+// everything since — the quiet mark-read on opening, a star, a move — went
+// through the store and never touched the file. So a cached copy has nothing
+// to say about labels that the account does not know better. Painted as it
+// came, a member read a moment ago went unread again in the rail for one
+// round trip, and the reader marked it read a second time. The labels in
+// hand replace the file's, and so does the block when the account holds one
+// — a representative's block is recomputed from its members as they are
+// marked, and the file's is from before — with the flags following
+// `rowWithThread`'s rule, the conversation's as well as the labels', which is
+// what a live read of the same message carries.
+//
+// Only when there is something in hand. A message opened from a notification
+// has no row and no member summary yet, and the file is then the only account
+// of it there is.
+function cachedDetailSummary(known, summary) {
+  if (!summary || !known || known.id !== summary.id || !Array.isArray(known.labelIds)) return summary
+  var block = known.thread && known.thread.count > 0 ? known.thread : null
+  return rowWithThread(withLabels(summary, known.labelIds.slice()), block)
+}
+
 function indexById(list, id) {
   var source = Array.isArray(list) ? list : []
   for (var i = 0; i < source.length; i++) {
@@ -1290,21 +1317,12 @@ function newArrivals(summaries, seenIds, primed, floorMs) {
   return arrivals
 }
 
-// The desktop notification spec says a body may carry a small markup subset,
-// and the daemons that implement it read one out of whatever they are handed.
-// A subject is a stranger's sentence, so its angle brackets are its own — and
-// an <img> left in one is a fetch made by the notification rather than by the
-// reader, which is the same beacon by a different door.
-//
-// A leading "-" is stripped for a different reason: these values become
-// arguments to notify-send, and one that starts with a dash is read as an
-// option there.
+// This is the canonical plain text handed to every platform. A platform whose
+// notification API accepts markup escapes at that final boundary; doing it
+// here would make native notification centres show the entities themselves.
+// A leading dash remains harmless behind notify-send's `--` separator.
 function notificationText(value) {
   return String(value === undefined || value === null ? "" : value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/^[-\s]+/, "")
 }
 
 function notificationTitle(summary) {
@@ -1361,6 +1379,67 @@ function listNoun(list) {
 function badgeCount(summary) {
   var block = Conversation.blockOf(summary ? summary.thread : null)
   return block && block.count >= Conversation.MINIMUM_MEMBERS ? block.count : 0
+}
+
+// ------------------------------------------------------------ reload depth
+
+// How many rows a reload asks for.
+//
+// Load more extends a list a page at a time, and everything that reloads the
+// list — the poll, F5, a push, the revalidation after an action — used to ask
+// for page one again and replace the whole list with the answer, so the rows
+// the user had paged down to vanished under them the moment any of those ran.
+// Opening an unread message was enough: its quiet mark-read is a write, the
+// server pushes the change, and the push is a reload.
+//
+// So a reload asks for as many rows as the view had reached, and the answer
+// replaces the list at that depth. Bounded, because IMAP answers at most a
+// hundred rows in one window and a reload should never cost more than the
+// user's own paging did.
+var RELOAD_CEILING = 100
+
+function reloadLimit(pageSize, loadedDepth) {
+  var page = Math.max(1, Math.floor(Number(pageSize)) || 1)
+  var depth = Math.floor(Number(loadedDepth)) || 0
+  if (depth <= page) return page
+  return Math.min(Math.max(page, RELOAD_CEILING), depth)
+}
+
+// ---------------------------------------------------- conversation projection
+
+// The rail a projection source is about, as one key: the account that holds
+// the thread, the thread's id, and the mailbox it is viewed from. The source
+// names a thread when the reader is inside one; two sources with the same key
+// are asking about the same rail.
+//
+// The account is part of it because a thread id is the provider's, not the
+// world's. All mailboxes composes a message id with its account on the way
+// out and leaves `thread.id` as it came, so two accounts can each hold a
+// thread called `t1` in their Inbox — and a reader moving from one to the
+// other is moving between two rails, not asking again about one. The parts
+// are JSON-encoded so no id can run into the next.
+function projectionKey(source) {
+  var fields = source && typeof source === "object" ? source : ({})
+  var thread = fields.thread
+  var id = thread && typeof thread === "object" && thread.id ? String(thread.id) : ""
+  return JSON.stringify([String(fields.accountId || ""), id, String(fields.mailboxKey || "")])
+}
+
+// What the reader draws while a new projection is in flight. About the same
+// rail, the one in hand stays up — its stops and its caption — and only the
+// ways along it go: the navigation, and the first and last stop that `n` and
+// `p` fall back to when the open message has no entry there. So a stale next
+// or previous cannot be followed before the answer lands, and neither can an
+// end be jumped to. About a different rail, nothing: its stops are not this
+// one's. A blank is built afresh each time, lists included, so nothing drawn
+// from one can reach into another.
+function blankProjection() {
+  return { showsRail: false, stops: [], caption: "", navigation: {}, memberIds: [] }
+}
+
+function pendingProjection(projection, sameRail) {
+  if (!sameRail || !projection || typeof projection !== "object") return blankProjection()
+  return Object.assign({}, projection, { navigation: {}, first: "", last: "" })
 }
 
 function resultSummary(list, estimate, hasMore) {

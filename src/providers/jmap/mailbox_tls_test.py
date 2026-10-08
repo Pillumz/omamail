@@ -1,19 +1,26 @@
 """Synthetic native JMAP integration peer. All data and credentials are fictitious."""
+import contextlib
 import http.server
+import socketserver
 import json
 import pathlib
 import ssl
 import socket
-import subprocess
-import tempfile
 import threading
 import sys
 
 scenario = sys.argv[1] if len(sys.argv) > 1 else "default"
 
-with tempfile.TemporaryDirectory(prefix="omamail-jmap-mailbox-") as directory:
-    root = pathlib.Path(directory)
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(root / "key.pem"), "-out", str(root / "cert.pem"), "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-addext", "basicConstraints=critical,CA:FALSE"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+# HTTPServer.server_bind resolves the bound address to a name: a reverse lookup
+# that a CI host's resolver leaves to time out, ten seconds a start. The peer
+# has no use for a name.
+class LoopbackServer(http.server.HTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.socket.getsockname()[:2]
+
+
+with contextlib.nullcontext(pathlib.Path(__file__).parent.parent / "testdata" / "tls") as root:
     requests = []
     email_gets = 0
     mode = "success"
@@ -113,8 +120,8 @@ with tempfile.TemporaryDirectory(prefix="omamail-jmap-mailbox-") as directory:
                 else: replies.append(["error",{"type":"unknownMethod"},id]);continue
                 replies.append([method,result,id])
             self.answer({"methodResponses":None if scenario=="bad-envelope" else replies,"sessionState":"s1"})
-    server=http.server.HTTPServer(("127.0.0.1",0),Handler)
-    context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(root / "cert.pem",root / "key.pem")
+    server=LoopbackServer(("127.0.0.1",0),Handler)
+    context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(root / "server.pem",root / "server-key.pem")
     server.socket=context.wrap_socket(server.socket,server_side=True)
-    print(server.server_port,flush=True);print(root / "cert.pem",flush=True)
+    print(server.server_port,flush=True);print(root / "ca.pem",flush=True)
     server.serve_forever(poll_interval=0.05);server.server_close()

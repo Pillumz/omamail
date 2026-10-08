@@ -10,6 +10,21 @@ QtObject {
   required property var composer
   required property var recoveryTimer
   readonly property var composeRecoveryTimer: recoveryTimer
+  // A refusal the write provably never survived can go again on the revision
+  // this window already holds: the backend answered it and left the record
+  // alone, or the host refused to send it at all with too many requests in
+  // flight. A transport failure proves nothing — the write may have landed and
+  // taken the answer with it — and its reconnect re-reads the revision first.
+  readonly property var unsentRefusals: [-32000, -32011]
+  // Six attempts, doubling from one second to 32: an outage that outlasts that
+  // is not one more writes will fix, and the warning stays up to say so.
+  readonly property int maxRecoveryRetries: 6
+  property int recoveryRetries: 0
+  readonly property Timer recoveryRetryTimer: Timer {
+    interval: 1000
+    repeat: false
+    onTriggered: controller.drainComposeRecovery()
+  }
   readonly property var root: app
   readonly property var compose: composer
   readonly property var service: app ? app.service : null
@@ -20,13 +35,37 @@ QtObject {
   readonly property bool recoveryNeedsUpdate: !!service && !!service.backend
     && service.backend.ready && !recoverySupported
   readonly property string recoveryUpdateNotice: "Draft recovery needs an updated backend. Keep this window open."
+  // The composer says one thing at a time, so a failed save hides whatever the
+  // window was already warning about. Remember that line for as long as the
+  // failure is the line on screen and put it back when a write lands. Anything
+  // else that speaks owns the slot from then on, and takes the memory with it:
+  // a warning raised after the failure is current, and must not be written over
+  // by what an older failure happened to cover.
+  property bool recoverySaveFailurePending: false
+  property string noticeBehindSaveFailure: ""
+  property bool saveFailureHidUpdateNotice: false
   onRecoverySupportedChanged: { if (recoverySupported) root.readComposeRecovery() }
   onRecoveryNeedsUpdateChanged: {
     if (recoveryNeedsUpdate && root.composeWriteQueued) showRecoveryNotice(recoveryUpdateNotice, true)
   }
   function showRecoveryNotice(message, needsUpdate) {
+    controller.forgetNoticeBehindSaveFailure()
     root.composeRecoveryUpdateNoticePending = needsUpdate === true
     root.composeRecoveryNotice = message
+  }
+  function showSaveFailureNotice() {
+    var owned = controller.recoverySaveFailurePending
+    var behind = owned ? controller.noticeBehindSaveFailure : root.composeRecoveryNotice
+    var hidUpdate = owned ? controller.saveFailureHidUpdateNotice : root.composeRecoveryUpdateNoticePending
+    showRecoveryNotice("Draft recovery could not be saved. Keep this window open.")
+    controller.recoverySaveFailurePending = true
+    controller.noticeBehindSaveFailure = behind
+    controller.saveFailureHidUpdateNotice = hidUpdate
+  }
+  function forgetNoticeBehindSaveFailure() {
+    controller.recoverySaveFailurePending = false
+    controller.noticeBehindSaveFailure = ""
+    controller.saveFailureHidUpdateNotice = false
   }
   function reconcileComposeReceipts() {
     if (root.composeReceiptChecking) return
@@ -83,7 +122,8 @@ QtObject {
       root.composeRecovery = updated
       root.composeRecoveryRevision++
       root.lastComposeRecoveryText = updated.active ? JSON.stringify(updated) : ""
-      root.writeComposeRecovery(JSON.stringify(updated))
+      // Recovery.empty() is presentation state; Rust only stores versioned records.
+      root.writeComposeRecovery(all.length ? JSON.stringify(updated) : '{"version":1,"active":false}')
       for (var a = 0; a < receipts.length; a++) root.queueComposeReceiptAck(receipts[a].accountId, receipts[a].sendId, root.composeRecoveryRevision)
       Qt.callLater(root.restoreComposeRecovery)
     }
@@ -92,6 +132,8 @@ QtObject {
 
   function queueComposeReceiptAck(accountId, sendId, revision) {
     if (accountId === "" || sendId === "") return
+    // Forget releases the payload, not the send ID/digest tombstone. Proposal
+    // receipts use the same durable-recovery gate as every other send.
     var next = root.composeReceiptAcks.filter(function(entry) { return entry.accountId !== accountId || entry.sendId !== sendId })
     next.push({accountId:accountId,sendId:sendId,revision:revision})
     root.composeReceiptAcks = next
@@ -195,6 +237,24 @@ QtObject {
     return root.composeRecoveryRevision
   }
 
+  // The editor only writes a payload whose text changed, so a refused save is
+  // the one write nothing else repeats. Drain again on a timer, which sends
+  // whatever the composer has queued by then — the failed text if nothing moved,
+  // the newer draft if it did.
+  function scheduleComposeRecoveryRetry() {
+    if (recoveryRetries >= maxRecoveryRetries) return
+    recoveryRetries++
+    recoveryRetryTimer.interval = 1000 * Math.pow(2, recoveryRetries - 1)
+    recoveryRetryTimer.restart()
+  }
+
+  // A write that lands is the only evidence that writing works, so it alone
+  // ends the ladder. A read says nothing about it.
+  function resetComposeRecoveryRetry() {
+    recoveryRetries = 0
+    recoveryRetryTimer.stop()
+  }
+
   function scheduleComposeRecovery() {
     if (root.composeRecoveryRestoring) return
     composeRecoveryTimer.restart()
@@ -203,6 +263,11 @@ QtObject {
   function clearComposeRecovery(expectedRevision) {
     if (expectedRevision !== undefined
         && Number(expectedRevision) !== root.composeRecoveryRevision) return false
+    // The draft is going, so a line that warned about it has nothing to come back
+    // to. The failure's own warning is not the draft's and still needs the write
+    // that answers it, so the memory goes and the ownership stays.
+    controller.noticeBehindSaveFailure = ""
+    controller.saveFailureHidUpdateNotice = false
     composeRecoveryTimer.stop()
     root.composeRecovery = Recovery.empty()
     root.composeRecoveryRevision++
@@ -236,12 +301,23 @@ QtObject {
         // instance's saved recovery just by retrying with a fresh revision.
         root.composeWriteQueued = true
         root.composeRecoveryConflict = !!error && error.message === "recovery_conflict"
-        showRecoveryNotice("Draft recovery could not be saved. Keep this window open.")
+        controller.showSaveFailureNotice()
+        if (!root.composeRecoveryConflict && error
+            && controller.unsentRefusals.indexOf(error.code) >= 0)
+          controller.scheduleComposeRecoveryRetry()
         return
       }
+      controller.resetComposeRecoveryRetry()
       root.composeStorageRevision = String(result.revision || "")
       root.composeCommittedRevision = Math.max(root.composeCommittedRevision, mine)
-      if (root.composeRecoveryUpdateNoticePending) controller.showRecoveryNotice("")
+      if (controller.recoverySaveFailurePending) {
+        // This write answers the warning about it, and the "needs an updated
+        // backend" line it may have covered, but not a delivery warning.
+        controller.showRecoveryNotice(
+          controller.saveFailureHidUpdateNotice ? "" : controller.noticeBehindSaveFailure)
+      } else if (root.composeRecoveryUpdateNoticePending) {
+        controller.showRecoveryNotice("")
+      }
       root.acknowledgeComposeReceipts()
       if (mine === root.composeRecoveryRevision && !root.composeWriteQueued) {
         root.composeRecovery = result.record

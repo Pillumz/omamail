@@ -70,7 +70,7 @@ Example request:
 
 Replies contain `jsonrpc: "2.0"`, the original `id`, and either `result` or an `error` object with a numeric code and static message. Clients should use string IDs to avoid QML number precision issues. Notifications omit `id` and receive no response, including on method failures. Explicit null IDs receive responses. Batches contain at most 128 entries and return only non-notification responses. Invalid envelopes return null IDs; unknown fields and duplicate envelope keys are refused. Frames are bounded to 1 MiB including the newline. Oversized or unterminated frames return an error and end the stream. Invalid complete frames allow the next request. Errors never include input bytes.
 
-A Tokio runtime runs up to 32 concurrent frame futures behind a bounded 16-frame queue. Gmail uses a shared native reqwest/rustls connection pool, with asynchronous HTTP and Hickory DNS resolution, verified TLS, fixed Google HTTPS origins, no redirects or environment proxies, and a streamed 16 MiB response ceiling. OAuth refresh is coalesced per account; one account's refresh does not block another account. HTTP has a 10-second connection timeout and a 20-second whole-request timeout. Gmail IPC requests have a 25-second deadline including queue time. Expired queued frames never start domain operations.
+A Tokio runtime runs up to 32 concurrent frame futures behind a bounded 16-frame queue. Gmail uses a shared native reqwest/rustls connection pool, with asynchronous HTTP and Hickory DNS resolution, verified TLS, fixed Google HTTPS origins, no redirects or environment proxies, and a streamed 16 MiB response ceiling. OAuth refresh is coalesced per account; one account's refresh does not block another account. HTTP has a 10-second connection timeout and a 20-second whole-request timeout. Gmail IPC requests have a 25-second deadline including queue time. Expired queued frames never start domain operations. Gmail meters each user at 250 quota units per second and answers a burst past that with HTTP 403 `rateLimitExceeded` (or 429); the session paces every call per account at 200 units per second by its documented cost, so trashing a screen of conversations — one 5-unit call per message — streams out instead of failing, and a request Gmail still refuses for rate limiting is resent with exponential backoff (1 s, 2 s, 4 s plus jitter) inside its 20-second budget. A refused request never ran, so this applies to mutations too; a timed-out mutation is still never retried. Message mutations — `gmail.modify`, `gmail.batchModify`, `gmail.trash`, `gmail.untrash` — do not hold the request for any of that: they answer at once with `{"queued":true,"ticket":"…"}` and join an in-memory per-account queue (`src/providers/gmail_queue.rs`) that one task sends in order, paced by the same bucket, waiting a further 5, 10, 20 and 30 seconds when Gmail keeps refusing for rate limiting before giving up. The outcome is announced as a `gmail.settled` notification `{accountId, ticket, method, ok, error}`; `GmailApiClient.qml` keeps the request in flight until then and hands the outcome to the original callback, so the optimistic edit stays on screen and nothing is shown unless the queue finally fails. The CLI's `mail.act` waits on the ticket in process. Logout refuses what the queue has not yet sent; a send already on the wire settles on its real answer. Nothing in the queue survives the process.
 
 Every TLS connection the backend opens — Gmail, JMAP, Microsoft, calendars, public HTTP and IMAP/SMTP — verifies the peer against the bundled Mozilla list plus the operating system's certificate store (`/etc/ssl/certs`, or `SSL_CERT_FILE` and `SSL_CERT_DIR` when set), so a mail server behind a private authority the system trusts is reachable, as it was under curl before the backend existed. reqwest's `rustls-tls-native-roots` feature does this for HTTPS; `src/tls/` builds the same union once for the tokio-rustls connections IMAP and SMTP make. An entry in the system store that rustls cannot parse is skipped, not fatal.
 
@@ -159,6 +159,24 @@ subject to account capabilities. Search syntax follows the account's provider.
 List results include `accountId`, `messages`, `nextPageToken`, and `estimate`;
 an empty next-page token ends pagination. `read` returns safe text and attachment
 metadata without marking the message read or exporting attachment files.
+The `message.links` array contains `{text, url}` entries from HTML anchors in the sanitized document, including links whose destination is absent from the plain-text body. Plain-text URLs remain in `nativeContent.body.text`; they are not separately extracted. `message.unsubscribe` contains `urls` from `List-Unsubscribe` and a `oneClick` boolean for the sender's `List-Unsubscribe-Post: List-Unsubscribe=One-Click` declaration when an HTTPS target is available. Missing metadata produces empty arrays and `oneClick: false`; providers can only expose metadata they supply. These additive fields are available in builds containing the read-link projection.
+
+Destinations are data only: extracting them does not resolve their DNS, open a browser, fetch links, send unsubscribe mail or submit an unsubscribe POST. Exported destinations are absolute HTTP(S) links passing the reader's public-host spelling policy, or nonempty `mailto:` links; controls, whitespace, backslashes and HTTP credentials are refused. This is not a DNS/public-address guarantee or sender authentication. `oneClick` reports a declaration, not authorization or proof of DKIM coverage. A caller executing a request must independently enforce its network and approval policy. Raw HTML, other headers, image/resource URLs and document attributes remain excluded.
+
+For example, `omamail read MESSAGE_ID --account ACCOUNT_ID --json` now includes:
+
+```json
+{
+  "links": [{"text": "Unsubscribe", "url": "https://news.example.org/leave"}],
+  "unsubscribe": {
+    "urls": ["https://news.example.org/leave", "mailto:leave@example.org"],
+    "oneClick": true
+  }
+}
+```
+
+The fragment above is under `result.message` in CLI JSON output (under `message` in the `mail.read` RPC result).
+
 `mark` accepts exactly `read`, `unread`, `star`, and `unstar`. Actions accept
 multiple message IDs. Their previews retain `requestedIds` and show the resolved
 `targetIds`, including expanded conversation members where applicable.
@@ -230,12 +248,12 @@ the seven root commands.
 | Area | Rust backend responsibility | UI or external boundary |
 | --- | --- | --- |
 | Gmail | Fixed-origin pooled HTTP; per-account token refresh; list, metadata/full message, attachments, labels/counts, profile and send-as; modify/batch modify, trash/restore, label changes, sending and draft create/update/delete. Draft message IDs are resolved to draft resources in Rust with bounded pagination. | QML tracks selection, displays progress and composes the user's message. |
-| IMAP / SMTP | Async DNS, verified TLS/STARTTLS, authenticated connection reuse, bounded octet-aware literals, special-use folders, UID search windows and continuations, counts, MIME reads, attachment extraction, mutations, folder changes, drafts and submission. Rust validates the SMTP envelope and preserves confirmed-send results if filing the Sent copy fails. | `ImapClient.qml` is a presentation adapter using account-bound domain requests. Setup presentation remains in QML; cached-query interpretation runs in Rust, and old wire helpers remain as test references. |
+| IMAP / SMTP | Async DNS, verified TLS/STARTTLS, authenticated connection reuse, bounded octet-aware literals, special-use folders, UID search windows and continuations, counts, MIME reads, attachment extraction, mutations, folder changes, drafts and submission. A dedicated INBOX IDLE connection per watched account wakes the background check. Rust validates the SMTP envelope and preserves confirmed-send results if filing the Sent copy fails. | `ImapClient.qml` is a presentation adapter using account-bound domain requests. Setup presentation remains in QML; cached-query interpretation runs in Rust, and old wire helpers remain as test references. |
 | Outlook | Native Microsoft OAuth and Graph sending; native IMAP handles mailbox reads with XOAUTH2. | Browser/device authorization still requires the user's interaction. |
 | JMAP | HTTPS session discovery and requests, bounded SSE parsing/reconnection, native query/mailbox/read/mutation/resource modules and background checks. Resource conversion preserves MIME depth bounds, charset and conversation-count semantics. | `JmapClient.qml` and `JmapPush.qml` pass account-bound domain requests and display returned state. Legacy JS helpers remain for presentation/configuration and parity tests. |
 | HEY | Async execution of the official client, account identity checks, queries/paging, resource conversion, HTML feature negotiation, profile/labels/send-as, login lifecycle, supported actions, sends and drafts. | `hey` owns its OAuth credential and supported service interface. No private HEY endpoints are accessed and no unavailable capability is invented. |
 | Authentication | Native Google/Microsoft token networking, Google loopback callback, credential lookup/store/clear, fixed credential destinations and account-bound tokens. Gmail first-login identity is verified and its refresh token stored before the UI receives success. | Keyring access uses the system credential service; opening the browser remains a desktop interaction. |
-| Calendar | Native Google/Microsoft and CalDAV requests and pagination, origin checks before CalDAV credential access. | Calendar presentation, iCalendar interpretation and compose/RSVP state remain in UI modules where not explicitly migrated. |
+| Calendar | Native Google/Microsoft and CalDAV requests and pagination, Microsoft/iCloud account-calendar discovery, and origin checks before CalDAV credential access. | Calendar presentation, iCalendar interpretation and compose/RSVP state remain in UI modules where not explicitly migrated. |
 | Local data | Account read/save with conflict detection; private body/calendar persistence; session-owned query cache policy and persistence; bounded render cache; local contacts and attachment read/store. | QML keeps returned snapshots, selection and progress for drawing the interface. |
 | Message content | MIME parsing and outgoing composition; header/address decoding, summaries, body/attachment extraction, direction and signature import; HTML sanitization and reader document preparation. | QML owns editor text, theme values and drawing the returned document. |
 | Actions | Model transforms, unified mailbox calculations and account-bound intent reconciliation. | QML submits user intent and displays authoritative returned state; provider requests remain separate from pure model transforms. |
@@ -260,6 +278,10 @@ blocking workers so parsing and composition do not occupy async network workers.
 Outgoing composition has a separate 32 MiB wire limit and preserves the UI’s
 20 MiB attachment allowance; incoming MIME parsing retains its 16 MiB limit.
 
+Native message preparation decodes supported MIME and RFC 2047 charsets with `encoding_rs`, including Windows-1251 and GB2312. Transfer-decoded attachment and resource bytes stay unchanged; only displayed text is converted to Unicode. The existing strict UTF-8 check still repairs UTF-8 sent under an ASCII, ISO-8859, or Windows-125x label (including supported aliases); other encodings honor their declaration. WHATWG compatibility aliases map GB2312 to GBK and Latin-1/ASCII to Windows-1252, rather than strictly validating those historical character sets. Malformed known legacy sequences become replacement characters; UTF-8 and unknown labels retain the existing permissive fallback. Charset decoding happens before HTML sanitization, never instead of it.
+
+Cached resources are decoded again when opened, so charset fixes apply without deleting their source bytes. Pre-native decoded body records do not supply ordinary reader text; old list summaries are replaced on the next successful list revalidation and may remain stale while offline. Calendar invitation interpretation still uses the separate QML decoder and is not covered by native mail charset support.
+
 The principal shared-domain RPC families are:
 
 | Methods | Result and ownership |
@@ -270,6 +292,7 @@ The principal shared-domain RPC families are:
 | `cache.queryRestore`, `cache.queryGet`, `cache.queryPut`, `cache.querySnapshot`, `cache.queryFlush` | Native query-cache loading, lookup, updates, snapshots and durable flush. Related profile, label, session, bind, clear and invalidate methods update the same account-owned state. |
 | `model.apply`, `model.unified`, `model.intent` | Pure model transformations, cross-account snapshots and stateful action-intent reconciliation. |
 | `outbox.enqueue`, `outbox.snapshot`, `outbox.undo`, `outbox.flush`, `outbox.abandon`, `outbox.forget` | Backend-owned delivery lifecycle. `outbox.changed` publishes revisions; terminal or stale snapshots cannot authorize a resend. |
+| `gmail.modify`, `gmail.batchModify`, `gmail.trash`, `gmail.untrash` | Answer `{"queued":true,"ticket":"…"}` at once and join the account's in-memory send queue; `gmail.settled` publishes each ticket's outcome. Other `gmail.*` methods answer with the provider's result. |
 | `compose.recoveryRead`, `compose.recoverySave` | Normalized private recovery records with expected-revision checks. An editor conflict keeps the live draft rather than silently overwriting another instance. |
 
 API 3 recovery preserves the optional boolean `userModified`, including an
@@ -347,7 +370,7 @@ messages, four concurrent reads, 200,000 UTF-16 text units and a 60-second overa
 deadline. Cancellation is account/request-scoped. It returns a bounded job
 payload, not provider resources. `agent.job*` methods own durable task lifecycle
 and status projections; the native detached worker streams only validated
-public answers into private storage. See [agent lifecycle](AGENT.md).
+public answers into private storage.
 
 ## Automatic mailbox checks
 
@@ -383,8 +406,8 @@ The backend publishes `mail.updated` notifications containing the account,
 sequence, timestamp, count, available message samples and static error state.
 A failure preserves the last successful data. Native fingerprints also detect changed message samples when the count stays equal. The service updates desktop
 state from these events instead of using an open reader's timer to fetch mail.
-This is periodic checking; JMAP's separate event stream supplies push support,
-and other providers do not thereby gain push delivery.
+
+Checks run on the watch interval. IMAP and Outlook watches also keep one dedicated connection per account idling on INBOX (RFC 2177). It is opened with `EXAMINE`, so watching never clears `\Recent`, and an untagged `EXISTS`, `EXPUNGE` or `FETCH` wakes the account's check instead of waiting for the interval; further changes within two seconds of the first wake it once. IDLE is ended and issued again every four minutes, which keeps a quiet connection alive through middleboxes and notices one that died silently; a wall-clock jump after the machine sleeps ends the session at once. A failed session reconnects after five seconds, doubling to five minutes with some jitter, reset once a session completes a refresh; a failed login or unavailable credential waits the full five minutes. Every session after the first asks for one check, because a change during the gap raised nothing. A server that ends IDLE on its own counts as a failed session rather than being idled again at once. Only a server that does not advertise IDLE ends the attempt, for as long as the watch lasts. Replacing, removing or shutting down the watch closes the connection, and polling continues in every case. JMAP's separate event stream supplies its push support; Gmail and HEY remain periodic.
 
 The backend also observes account-registry revisions and publishes
 `accounts.changed` without including account settings or credentials. Shutdown

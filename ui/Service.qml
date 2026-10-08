@@ -1,7 +1,9 @@
 import QtQuick
+import "compose/Recipients.js" as AgentRecipients
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import "account"
 import "calendar"
 import "agent"
@@ -13,23 +15,18 @@ import "account/Accounts.js" as Accounts
 import "account/Model.js" as Model
 import "account/Unified.js" as Unified
 import "providers/Registry.js" as Provider
+import "providers/Credentials.js" as CredentialKeys
+import "providers/Secrets.js" as SecretText
 import "bar/Preview.js" as Preview
+import "bar/Bridge.js" as BarBridge
 import "calendar/Sources.js" as CalendarSources
 import "message/Outbox.js" as Outbox
 import "message/Html.js" as Html
 import "message/Direction.js" as Direction
+import "settings/Appearance.js" as Appearance
 
-// Every mailbox on this machine, and whichever one is on screen.
-//
-// The window and the bar widget were written against a single mailbox, so this
-// keeps that shape: it owns one MailAccount per account and forwards the whole
-// surface to the active one. The alternative — teaching every view to say
-// `service.current.messages` — spreads the account model across two dozen
-// files for no gain.
-//
-// Every account polls its unread count. Only the active one loads lists and
-// bodies: a badge that speaks for one mailbox while you have three is worse
-// than no badge, but fetching mail nobody can see is just spent quota.
+// Owns each MailAccount and forwards the active mailbox's surface to views.
+// All accounts poll unread counts; only the active account loads lists/bodies.
 Item {
   id: root
 
@@ -44,35 +41,59 @@ Item {
   property var manifest: null
   property var pluginRegistry: null
   property var barWidgetRegistry: null
+  // Optional host seam. The Omarchy shell does not inject it and therefore
+  // keeps every existing plugin path; the standalone composition supplies a
+  // narrow adapter for native operations and its bundled backend.
+  property var platform: null
+  property var initialSettings: null
+  readonly property var capabilities: platform && platform.capabilities
+    ? platform.capabilities : ({ agent: true, tray: true, mailto: true, notifications: true })
+  readonly property bool standalone: !!platform && platform.standalone === true
+  readonly property bool smokeTest: standalone
+    && Quickshell.env("OMAMAIL_SMOKE_TEST") === "1"
 
   // One plugin-owned runtime and persistent process survive window openings.
   readonly property var backendRuntime: privateRuntime
   Runtime {
     id: privateRuntime
     pluginDir: root.pluginDir
-    developmentExecutable: Quickshell.env("OMAMAIL_BIN") || ""
+    bundledExecutable: root.standalone ? String(root.platform.backendPath || "") : ""
+    bundledVersion: root.standalone ? root.version : ""
+    bundledApiVersion: root.standalone ? 5 : 0
+    bundledMode: root.standalone
+    developmentExecutable: root.standalone ? "" : (Quickshell.env("OMAMAIL_BIN") || "")
     onValidated: Qt.callLater(rustBackend.reconcileProcess)
   }
   readonly property var backend: rustBackend
-  readonly property bool diagnosing: diagnostics.busy
-  function diagnoseError() { diagnostics.open() }
-  Diagnostics {
-    id: diagnostics
-    pluginDir: root.pluginDir
-    onFailed: function(message) { if (root.current) root.current.fail(message) }
+  readonly property bool diagnosing: !!diagnosticsLoader.item && diagnosticsLoader.item.busy
+  function diagnoseError() {
+    if (hasAgent && diagnosticsLoader.item) diagnosticsLoader.item.open()
+  }
+  Loader {
+    id: diagnosticsLoader
+    active: root.hasAgent
+    sourceComponent: Component {
+      Diagnostics {
+        objectName: "diagnostics"
+        pluginDir: root.pluginDir
+        onFailed: function(message) { if (root.current) root.current.fail(message) }
+      }
+    }
   }
   Backend {
     id: rustBackend
     // The runtime manager resolves symlinks. Launch its validated path rather
     // than comparing it with the spelling used to load this plugin.
     executable: privateRuntime.executable
-    launchEnabled: privateRuntime.state === "ready" && executable !== ""
+    launchEnabled: !root.smokeTest && privateRuntime.state === "ready" && executable !== ""
     expectedVersion: privateRuntime.requiredVersion
     expectedApiVersion: privateRuntime.requiredApiVersion
     latestApiVersion: privateRuntime.latestApiVersion
     unreleasedMethods: privateRuntime.unreleasedMethods
     onReadyChanged: root.scheduleUnifiedSnapshot()
-    onRequestFailed: function(method, error) { diagnostics.record(method, error) }
+    onRequestFailed: function(method, error) {
+      if (diagnosticsLoader.item) diagnosticsLoader.item.record(method, error)
+    }
   }
 
   // Overall update status is diagnostic, not a feature requirement: its
@@ -80,6 +101,15 @@ Item {
   readonly property bool backendNeedsUpdate: backend.needsUpdate
   // Event suggestions require API 2 regardless of when that API is released.
   readonly property bool backendCanSuggestEvents: backend.ready && backend.apiVersion >= 2
+  readonly property bool backendCanCheckMicrosoftConnection: backend.ready && backend.apiVersion >= 5
+  readonly property bool backendCanDiscoverCalendars: backend.ready && backend.apiVersion >= 5
+  readonly property bool backendCanGoogleCalendars: backend.ready && backend.apiVersion >= 6
+  readonly property bool calendarRemindersEnabled: !settings || settings.calendarRemindersEnabled !== false
+  readonly property int calendarSnoozeMinutes: Math.max(1, Math.min(1440,
+    Math.floor(Number(settings && settings.calendarSnoozeMinutes) || 5)))
+  readonly property string calendarReminderError: calendarReminderLoader.item
+    ? calendarReminderLoader.item.lastError || calendarReminderLoader.item.inbox.lastError : ""
+  readonly property var calendarReminderInbox: calendarReminderLoader.item ? calendarReminderLoader.item.inbox : null
 
   readonly property string pluginId: manifest && manifest.id
     ? String(manifest.id) : "omamail"
@@ -102,23 +132,68 @@ Item {
     maxMessages: 50,
     heavyMessageRendering: Html.HEAVY_MESSAGE_RENDERING_DEFAULT,
     contentDirection: Direction.MODE_DEFAULT,
+    appearance: Appearance.MODE_DEFAULT,
     defaultQuery: "in:inbox",
     notifyNewMail: "On",
     oauthPort: 9481,
     undoSendSeconds: 10,
     unifiedCalendarView: false,
+    calendarRemindersEnabled: true,
+    calendarSnoozeMinutes: 5,
     showBarIcon: true,
     unifiedMailboxes: false,
-    suggestEvents: false
+    suggestEvents: false,
+    aiAgent: "System default",
+    aiModel: ""
   })
-  property var settings: defaultSettingValues
+  function normalizedSettings(values) {
+    var next = ({})
+    for (var key in defaultSettingValues) next[key] = defaultSettingValues[key]
+    var source = values || ({})
+    for (var name in source) {
+      if (source[name] !== undefined && source[name] !== null) next[name] = source[name]
+    }
+    return next
+  }
+  // An initial value is merged before any child account completes, so the
+  // standalone host never starts account activity under transient defaults.
+  property var settings: normalizedSettings(initialSettings)
   readonly property int undoSendSeconds: Outbox.normalizeDelay(
     settings ? settings.undoSendSeconds : Outbox.DEFAULT_DELAY_SECONDS)
   readonly property bool alwaysRenderHeavyMessages: Html.alwaysRenderHeavyMessages(
     settings ? settings.heavyMessageRendering : null)
   readonly property bool notifyNewMail: String(settings ? settings.notifyNewMail : "On") !== "Off"
-  // System AI is always reachable. The launcher explains missing setup.
-  readonly property bool hasAgent: true
+  // Capability controls visibility; resolved provider controls availability.
+  readonly property bool hasAgent: capabilities.agent === true
+  readonly property bool agentAvailable: hasAgent && agentRunner.providerAvailable === true
+  readonly property string agentUnavailableReason: agentRunner.availabilityError || "AI is unavailable."
+  readonly property bool hasTray: capabilities.tray === true
+  readonly property bool hasMailto: capabilities.mailto === true
+  readonly property bool hasNotifications: capabilities.notifications === true
+  // Only a host that paints its own window has a palette to choose. The
+  // Omarchy plugin's colours are the shell's, decided in colors.toml.
+  readonly property bool hasAppearance: capabilities.appearance === true
+  readonly property string appearance: Appearance.normalizeMode(
+    settings ? settings.appearance : null)
+  readonly property string notificationError: platform && platform.notificationError
+    ? String(platform.notificationError) : ""
+  readonly property string calendarPalettePath: platform
+    && platform.calendarPalettePath !== undefined
+      ? String(platform.calendarPalettePath || "")
+      : Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
+  // Credential RPC was introduced in API 4. This minimum stays fixed after
+  // release; it is a capability of the connected backend, not release state.
+  readonly property bool backendCanStoreCredentials: backend.ready && backend.apiVersion >= 4
+  // API 4 is the permanent typed-RPC capability. Until the pinned plugin
+  // backend itself advances, the Linux plugin keeps its reviewed keyring
+  // adapter; standalone hosts never enter this compatibility path.
+  readonly property bool legacyCredentialCompatibility: !standalone
+    && backend.ready && backend.apiVersion < 4
+  readonly property bool canAccessCredentials: backendCanStoreCredentials
+    || legacyCredentialCompatibility
+  readonly property var agentRunner: agentRunnerLoader.item || inactiveAgentRunner
+  readonly property var agentContext: agentContextLoader.item || inactiveAgentContext
+  readonly property var eventSuggester: eventSuggesterLoader.item || inactiveEventSuggester
   readonly property string agentError: agentContext.error !== "" ? agentContext.error : agentRunner.lastError
   readonly property bool agentStarting: agentContext.busy || agentRunner.starting
   // The open account's jobs by message id — another account's job about
@@ -135,6 +210,24 @@ Item {
   // for calendar events in. Off until the owner turns it on: the message
   // text leaves the window for the system AI.
   readonly property bool suggestEvents: !!settings && settings.suggestEvents === true
+  readonly property string aiAgent: {
+    var selected = String(settings ? settings.aiAgent || "System default" : "System default")
+    return platform && platform.standalone && selected === "System default" ? "OpenCode" : selected
+  }
+  readonly property string aiModel: String(settings ? settings.aiModel || "" : "")
+  readonly property bool backendCanChooseAgent: backend.ready && backend.apiVersion >= 6
+  readonly property bool backendCanAgentProposals: backend.ready && backend.apiVersion >= 6
+  function setAiAgent(value) {
+    if (String(value) === aiAgent) return
+    persistSetting("aiChatResetAt", Date.now())
+    persistSetting("aiAgent", String(value))
+  }
+  function setAiModel(value) {
+    var model = String(value).trim()
+    if (model === aiModel) return
+    persistSetting("aiChatResetAt", Date.now())
+    persistSetting("aiModel", model)
+  }
   function setSuggestEvents(value) { persistSetting("suggestEvents", value === true) }
   readonly property var eventSuggestions: eventSuggester.suggestions
   function dismissSuggestion(key) { eventSuggester.dismiss(key) }
@@ -198,9 +291,11 @@ Item {
   }
 
   function askAgent(messageId, prompt, accountId) {
+    if (!agentAvailable) return false
     var target = agentTarget(messageId, accountId)
     if (!target.owner || target.id === "") return false
-    return agentContext.request(target.owner, [target.id], prompt)
+    var envelope = Number(backend.apiVersion) >= 6 ? agentReplyEnvelope({accountId: target.owner.accountId, messageId: target.id, draftKey: "",subject:"",body:""}) : null
+    return agentContext.request(target.owner, [target.id], prompt, null, envelope)
   }
 
   // Contextual results, forwarded so a view never
@@ -209,24 +304,66 @@ Item {
   readonly property string agentShownId: agentRunner.shownId
   readonly property string agentShownOutput: agentRunner.shownOutput
   readonly property var agentShownTranscript: agentRunner.shownTranscript
+  readonly property var agentShownProposals: agentRunner.shownProposals
+  readonly property bool agentHasEarlier: agentRunner.previousPage !== ""
+  readonly property bool agentLoadingEarlier: agentRunner.loadingEarlier
+  readonly property bool agentHasOlderChats: agentRunner.hasMoreJobs
+  readonly property bool agentHasNewerChats: agentRunner.listingOffset > 0
+  function loadEarlierAgentMessages() { return agentRunner.loadEarlier() }
+  function clearAgentError() { agentContext.error = ""; agentRunner.lastError = "" }
+  readonly property int agentSelectionRevision: agentRunner.selectionRevision || 0
+  function canContinueAgentJob(job) { return agentRunner.canContinueSelection(job) }
+  function pageAgentChats(older) { agentRunner.pageChats(older) }
+  function agentReplyEnvelope(proposal) {
+    var owner = findAccount(String(proposal.accountId || ""))
+    if (!owner || String(owner.selectedId) !== String(proposal.messageId)
+        || !owner.selectedMessage || String(proposal.draftKey || "") !== "") return null
+    var message = owner.selectedMessage
+    var own = [{email: owner.accountEmail}]
+    for (var i = 0; i < sendIdentities.length; i++)
+      if (String(sendIdentities[i].accountId) === String(proposal.accountId)) own.push(sendIdentities[i])
+    var recipients = AgentRecipients.replyFields(message, "reply", own)
+    var choice = preferredSendAs(recipients.outgoing ? [message.from]
+      : (message.to || []).concat(message.cc || []))
+    var from = choice && String(choice.accountId) === String(proposal.accountId) ? String(choice.email) : owner.accountEmail
+    return {accountId: String(proposal.accountId), from: from, to: recipients.to, cc: recipients.cc, bcc: "",
+      replyTo: "", subject: String(proposal.subject), body: String(proposal.body || signatureFor(String(proposal.accountId)) || ""), attachments: [],
+      draftId: "", threadId: String(message.threadId || ""), inReplyTo: String(message.messageId || ""),
+      replyMessageId: String(proposal.messageId)}
+  }
 
   function showAgentJob(jobId) { agentRunner.show(jobId) }
 
   // The answer to a question, or a follow-up: a new job that continues the
   // one named, with the runner rebuilding the prompt from it.
-  function answerAgent(jobId, answer) {
-    if (!hasAgent) return false
+  function answerAgent(jobId, answer, fields) {
+    if (!agentAvailable) return false
     var job = agentRunner.jobFor2(jobId)
-    if (!job || !job.canContinue || agentRunner.isActive(job) || !findAccount(job.accountId)
+    if (!job || !job.canContinue || !canContinueAgentJob(job) || agentRunner.isActive(job) || !findAccount(job.accountId)
         || String(answer || "").trim() === "") return false
     agentContext.error = ""
-    if (!agentRunner.start({ parent: String(job.id), prompt: String(answer || "").trim() })) return false
+    var payload = { parent: String(job.id), prompt: String(answer || "").trim() }
+    if (fields && !Agent.canUseDraftChat(job, fields)) return false
+    // API 5 keeps the original snapshot; current-draft updates need API 6.
+    if (fields && Number(backend.apiVersion) >= 6) {
+      var attaching = String(job.draftKey || "") === "" && String(fields.draftKey || "") !== ""
+      payload.draftUpdate = {accountId: String(fields.accountId), draftKey: String(fields.draftKey),
+        draft: {from: String(fields.from || ""), to: String(fields.to || ""),
+          cc: String(fields.cc || ""), bcc: String(fields.bcc || ""),
+          subject: String(fields.subject || ""), body: String(fields.body || "")}}
+      if (attaching) payload.draftUpdate.messageId = String(fields.replyMessageId)
+      if (fields.envelope) payload.draftUpdate.envelope = fields.envelope
+    }
+    if (Number(backend.apiVersion) >= 6 && job.messageId && (!Array.isArray(job.messageIds) || job.messageIds.length === 1)) {
+      return agentContext.request(findAccount(job.accountId), [String(job.messageId)], answer, null, null, payload)
+    }
+    if (!agentRunner.start(payload)) return false
     return true
   }
 
   // One job over several messages, as the list knows them.
   function askAgentMany(ids, prompt, accountId) {
-    if (!hasAgent) return false
+    if (!agentAvailable) return false
     // One job is one account's: rows ticked across the merged view are
     // handed over only when they all come from the same mailbox.
     var list = Array.isArray(ids) ? ids : []
@@ -257,9 +394,11 @@ Item {
   }
 
   function askAgentDraft(fields, ask) {
+    if (!agentAvailable) return false
     var owner = sendHostFor(fields)
     if (!owner || !fields || !fields.draftKey || String(ask || "").trim() === "") return false
     agentContext.error = ""
+    if (fields.replyMessageId) return agentContext.request(owner, [String(fields.replyMessageId)], ask, fields)
     return agentRunner.start({ draftFields: fields, ask: ask, account: owner.accountEmail, accountId: owner.accountId })
   }
 
@@ -315,20 +454,218 @@ Item {
   }
 
   function registerMailtoHandler() {
-    if (pluginDir === "" || mailtoInstaller.running) return
+    if (!hasMailto || pluginDir === "" || mailtoInstaller.running) return
     mailtoInstaller.command = [pluginDir + "/scripts/register-mailto.sh", pluginDir]
     mailtoInstaller.running = true
   }
 
+  // Whether mailto: links and Omarchy's SUPER+SHIFT+E open Omamail. Empty
+  // until default-mail.sh has been asked; the settings page asks on open,
+  // because either half can change behind this window's back.
+  property string defaultMailClient: ""
+  property bool defaultMailClientBusy: false
+  property string defaultMailClientError: ""
+
+  function refreshDefaultMailClient() {
+    if (!hasMailto || pluginDir === "" || defaultMailClientProcess.running) return
+    defaultMailClientProcess.command = [pluginDir + "/scripts/default-mail.sh", "status"]
+    defaultMailClientProcess.running = true
+  }
+
+  function setDefaultMailClient(enabled) {
+    if (!hasMailto || pluginDir === "" || defaultMailClientProcess.running) return
+    defaultMailClientBusy = true
+    defaultMailClientError = ""
+    defaultMailClientProcess.command = enabled
+      ? [pluginDir + "/scripts/default-mail.sh", "on", pluginDir]
+      : [pluginDir + "/scripts/default-mail.sh", "off"]
+    defaultMailClientProcess.running = true
+  }
+
   function applySettings(values) {
-    var next = ({})
-    for (var key in defaultSettingValues) next[key] = defaultSettingValues[key]
-    var source = values || ({})
-    for (var name in source) {
-      if (source[name] === undefined || source[name] === null) continue
-      next[name] = source[name]
-    }
+    var next = normalizedSettings(values)
     if (JSON.stringify(next) !== JSON.stringify(settings)) settings = next
+  }
+
+  function openExternal(value) {
+    var target = String(value || "")
+    if (target === "") return false
+    if (platform && typeof platform.openExternal === "function")
+      return platform.openExternal(target)
+    return Quickshell.execDetached(["xdg-open", target])
+  }
+
+  function copyText(value) {
+    var text = String(value === undefined || value === null ? "" : value)
+    if (platform && typeof platform.setClipboard === "function")
+      return platform.setClipboard(text)
+    return Quickshell.execDetached(["wl-copy", text])
+  }
+
+  function configPath(name) {
+    if (platform && typeof platform.configPath === "function")
+      return String(platform.configPath(String(name || "")) || "")
+    var home = Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")
+    return home + "/omamail/" + String(name || "")
+  }
+
+  function cachePath(name) {
+    if (platform && typeof platform.cachePath === "function")
+      return String(platform.cachePath(String(name || "")) || "")
+    var home = Quickshell.env("XDG_CACHE_HOME") || (Quickshell.env("HOME") + "/.cache")
+    return home + "/omamail/" + String(name || "")
+  }
+
+  function writeConfig(name, text, callback) {
+    var allowed = ["credentials.json", "window.json", "calendars.json"]
+    if (allowed.indexOf(String(name || "")) < 0) {
+      if (typeof callback === "function") callback(false, "Invalid configuration file")
+      return false
+    }
+    if (platform && typeof platform.writeConfig === "function")
+      return platform.writeConfig(String(name), String(text), callback)
+    var request = hostProcessComponent.createObject(root, {
+      operation: "write", callback: callback, payload: String(text) + "\n",
+      command: [root.pluginDir + "/scripts/config-store.sh", String(name)]
+    })
+    if (!request) {
+      if (typeof callback === "function") callback(false, "Could not start configuration write")
+      return false
+    }
+    request.running = true
+    return true
+  }
+
+  function chooseFiles(callback) {
+    if (platform && typeof platform.chooseFiles === "function")
+      return platform.chooseFiles(callback)
+    var request = hostProcessComponent.createObject(root, {
+      operation: "result", callback: callback,
+      command: [root.pluginDir + "/scripts/attachment.sh", "pick"]
+    })
+    if (!request) {
+      if (typeof callback === "function") callback(({ok:false,error:"No file picker is available"}))
+      return false
+    }
+    request.running = true
+    return true
+  }
+
+  function clipboardAttachment(directory, callback) {
+    if (platform && typeof platform.clipboardAttachment === "function")
+      return platform.clipboardAttachment(String(directory || ""), callback)
+    var request = hostProcessComponent.createObject(root, {
+      operation: "result", callback: callback,
+      command: [root.pluginDir + "/scripts/attachment.sh", "clipboard", String(directory || "")]
+    })
+    if (!request) {
+      if (typeof callback === "function") callback(({ok:false,error:"no-image"}))
+      return false
+    }
+    request.running = true
+    return true
+  }
+
+  function credentialFields(kind, accountId, clientId) {
+    var fields = { kind: String(kind || ""), accountId: String(accountId || "") }
+    if (String(clientId || "") !== "") fields.clientId = String(clientId)
+    return fields
+  }
+
+  function legacyCredentialAttributes(kind, accountId, clientId) {
+    var account = String(accountId || "")
+    var client = String(clientId || "")
+    var controlled = /[\u0000-\u001f\u007f]/
+    if (account === "" || account.length > 1024 || account.trim() !== account
+        || controlled.test(account) || client.length > 1024 || controlled.test(client)) return []
+    if (kind === "google-refresh-token")
+      return client === "" || (account !== "default"
+        && (account.indexOf("@") < 0 || account.indexOf(":") >= 0))
+          ? [] : CredentialKeys.keyringAttributes(client, account)
+    if (kind === "outlook-refresh-token")
+      return client === "" || account.indexOf("outlook:") !== 0
+        || account.indexOf("@") < 0 ? []
+          : CredentialKeys.outlookKeyringAttributes(client, account)
+    if (kind === "imap-password")
+      return account.indexOf("imap:") === 0 && account.indexOf("@") >= 0
+        ? CredentialKeys.imapKeyringAttributes(account) : []
+    if (kind === "jmap-secret")
+      return account.indexOf("jmap:") === 0 && account.indexOf("@") >= 0
+        ? CredentialKeys.jmapKeyringAttributes(account) : []
+    if (kind === "calendar-password") return CalendarSources.keyringAttributes(account)
+    return []
+  }
+
+  function legacyCredentialOperation(operation, kind, accountId, clientId, secret, callback) {
+    var attributes = legacyCredentialAttributes(kind, accountId, clientId)
+    var value = String(secret || "")
+    if (attributes.length === 0 || (operation === "put"
+        && (value === "" || /[\u0000\r\n]/.test(value)))) {
+      if (typeof callback === "function") {
+        if (operation === "get") callback("", "invalid_params")
+        else callback(false, "invalid_params")
+      }
+      return false
+    }
+    var request = legacyCredentialProcessComponent.createObject(root, {
+      operation: operation, done: callback, payload: value,
+      command: operation === "get" ? ["secret-tool", "lookup"].concat(attributes)
+        : operation === "delete" ? ["secret-tool", "clear"].concat(attributes)
+        : [root.pluginDir + "/scripts/keyring-store.sh"].concat(attributes)
+    })
+    value = ""
+    if (!request) {
+      if (typeof callback === "function") {
+        if (operation === "get") callback("", "credential_store_unavailable")
+        else callback(false, "credential_store_unavailable")
+      }
+      return false
+    }
+    request.running = true
+    return true
+  }
+
+  function credentialGet(kind, accountId, clientId, callback) {
+    if (!backendCanStoreCredentials) {
+      if (legacyCredentialCompatibility)
+        return legacyCredentialOperation("get", kind, accountId, clientId, "", callback)
+      if (typeof callback === "function") callback("", "backend_needs_update")
+      return false
+    }
+    backend.call("credentials.get", credentialFields(kind, accountId, clientId), function(result, error) {
+      if (typeof callback === "function") callback(!error && result && result.found === true
+        ? String(result.secret || "") : "", error ? String(error.message || error) : "")
+    })
+    return true
+  }
+
+  function credentialPut(kind, accountId, clientId, secret, callback) {
+    if (!backendCanStoreCredentials) {
+      if (legacyCredentialCompatibility)
+        return legacyCredentialOperation("put", kind, accountId, clientId, secret, callback)
+      if (typeof callback === "function") callback(false, "backend_needs_update")
+      return false
+    }
+    var fields = credentialFields(kind, accountId, clientId)
+    fields.secret = String(secret || "")
+    backend.call("credentials.put", fields, function(result, error) {
+      if (typeof callback === "function") callback(!error && !!result && result.stored === true,
+        error ? String(error.message || error) : "")
+    })
+    return true
+  }
+
+  function credentialDelete(kind, accountId, clientId, callback) {
+    if (!backendCanStoreCredentials) {
+      if (legacyCredentialCompatibility)
+        return legacyCredentialOperation("delete", kind, accountId, clientId, "", callback)
+      if (typeof callback === "function") callback(false, "backend_needs_update")
+      return false
+    }
+    backend.call("credentials.delete", credentialFields(kind, accountId, clientId), function(result, error) {
+      if (typeof callback === "function") callback(!error, error ? String(error.message || error) : "")
+    })
+    return true
   }
 
   function persistSetting(name, value) {
@@ -357,6 +694,10 @@ Item {
 
   function setContentDirection(value) {
     persistSetting("contentDirection", Direction.normalizeMode(value))
+  }
+
+  function setAppearance(value) {
+    persistSetting("appearance", Appearance.normalizeMode(value))
   }
 
   function setUnifiedCalendarView(value) {
@@ -445,6 +786,15 @@ Item {
     return null
   }
 
+  // The id of the first saved Gmail account, or "" if there is none yet.
+  function gmailAccountId() {
+    var accounts = accountList ? accountList.accounts : []
+    for (var i = 0; i < accounts.length; i++) {
+      if (accounts[i].provider === "gmail") return accounts[i].id
+    }
+    return ""
+  }
+
   function refreshCurrent() {
     var next = activeIndex >= 0 && activeIndex < accountHosts.count
       ? accountHosts.objectAt(activeIndex)
@@ -510,9 +860,10 @@ Item {
   }
 
   function openNotification(accountId, messageId) {
-    if (!Accounts.find(accountList, accountId) || !messageId) return
+    if (!Accounts.find(accountList, accountId) || !messageId) return false
     if (shell && typeof shell.summon === "function")
-      shell.summon("omamail", JSON.stringify({ accountId: accountId, messageId: messageId }))
+      return shell.summon("omamail", JSON.stringify({ accountId: accountId, messageId: messageId }))
+    return false
   }
 
   // The switcher selects by position, because that is the only handle a mailbox
@@ -841,6 +1192,11 @@ Item {
           && (!root.accountsLoaded || root.accountsRevision !== result.revision)) {
         root.accountsRevision = String(result.revision || "")
         root.applyAccounts(JSON.stringify(result.registry))
+      } else if (error && !root.accountsLoaded) {
+        // First-run storage failure still settles the registry with a local
+        // placeholder. Cold-start notification routing can then fall back to
+        // the ordinary window instead of waiting forever for a missing read.
+        root.applyAccounts("")
       }
       if (reload) root.restoreAccountRegistry()
     })
@@ -915,6 +1271,7 @@ Item {
   property bool alwaysShowImages: false
   property bool windowPrefsLoaded: false
   property string windowWritePayload: ""
+  property bool windowWriting: false
   property bool restoreWindow: false
   property int restoreAttempts: 0
 
@@ -953,7 +1310,7 @@ Item {
   // `running` guard does, loses the one value the user settled on.
   function saveWindowPrefs() {
     if (!windowPrefsLoaded) return
-    if (windowWriter.running) {
+    if (windowWriting) {
       windowPrefsSettling.restart()
       return
     }
@@ -968,8 +1325,12 @@ Item {
       alwaysShowImages: alwaysShowImages,
       windowOpen: windowOpen || restoreWindow
     })
-    windowWriter.command = [pluginDir + "/scripts/config-store.sh", "window.json"]
-    windowWriter.running = true
+    windowWriting = true
+    writeConfig("window.json", windowWritePayload, function(ok, error) {
+      root.windowWriting = false
+      root.windowWritePayload = ""
+      if (!ok && root.current) root.current.fail(error || "Could not save window settings")
+    })
   }
 
   // Written when a drag ends, not while it runs: a drag is a hundred values
@@ -1023,9 +1384,6 @@ Item {
     if (next === alwaysShowImages) return
     alwaysShowImages = next
     saveWindowPrefs()
-    // The message on screen is the one the answer was given about, so it
-    // answers now rather than at the next message.
-    if (next && current) current.showRemoteImages()
   }
   signal duplicateAccount(string email)
 
@@ -1103,6 +1461,7 @@ Item {
         id: accounts[i].id,
         email: accounts[i].email,
         provider: accounts[i].provider,
+        calendarProvider: Accounts.calendarProvider(accounts[i]),
         label: Accounts.label(accounts[i]),
         // The name that was chosen, if one was. `label` always answers —
         // falling through to the local part — so it cannot say whether
@@ -1327,14 +1686,13 @@ Item {
     barCalendar.events, Date.now(), 2)
 
   function refreshCalendarPreview() {
-    var now = new Date()
-    barCalendar.refresh(now.getTime(),
-      new Date(now.getFullYear(), now.getMonth(), now.getDate() + 31).getTime())
+    var range = Preview.previewRange(Date.now())
+    barCalendar.refresh(range[0], range[1])
   }
 
   function openCalendarEditor() {
     var url = CalendarSources.calendarEditorUrl(sharedCalendar.sourceList)
-    if (url !== "") Quickshell.execDetached(["xdg-open", url])
+    if (url !== "") openExternal(url)
   }
 
   // ------------------------------------------------------------- forwarding
@@ -1524,24 +1882,58 @@ Item {
   readonly property string viewedMailboxKey: String(conversationProjection.viewedMailboxKey || "")
   property var conversationProjection: ({ showsRail: false, stops: [], caption: "", navigation: {}, memberIds: [] })
   property int conversationProjectionSerial: 0
+  // What the projection in hand was asked about: the source as text, and the
+  // account, thread and mailbox it names (`Model.projectionKey`). The source
+  // is an object literal, so it is a new object — and
+  // `conversationSourceChanged` fires — whenever any input is reassigned,
+  // whether or not anything in it is different. In All mailboxes that is
+  // constant: the composed thread and members are built afresh on every
+  // read, and the mailbox list is a new array on every snapshot. Compared as
+  // text, an unchanged source asks nothing.
+  property string projectedSource: ""
+  property string projectedRail: ""
   readonly property var conversationSource: ({
     operation: "project", thread: selectedThread, summaries: memberSummaries,
     selectedId: selectedId, mailboxKey: mailboxKey,
     searching: searchQuery !== "" || rawQuery !== "", mailboxes: mailboxes,
-    conversations: !!reading && reading.showsConversations
+    conversations: !!reading && reading.showsConversations,
+    // Whose thread it is. The projection does not need it — a thread's members
+    // are composed with their account on the way out — but the key that decides
+    // whether the rail in hand is this source's does: All mailboxes leaves
+    // `thread.id` as the provider gave it, so two accounts can each hold a `t1`.
+    accountId: reading ? String(reading.accountId || "") : ""
   })
-  function scheduleConversationProjection() {
+  // A new projection is asked for; until it lands, the one in hand stays up
+  // when it is about the same rail — the same thread, in the same mailbox, of
+  // the same account (`Model.pendingProjection`).
+  // Blanking it drew the rail to nothing and reflowed the reader on every
+  // member merge, mark-read and list refresh that opening a thread brings —
+  // several times per open. `sourceText` is the source already serialised by
+  // the caller, when it has it.
+  function scheduleConversationProjection(sourceText) {
     conversationProjectionSerial++
-    conversationProjection = ({ showsRail: false, stops: [], caption: "", navigation: {}, memberIds: [] })
+    var source = conversationSource
+    var rail = Model.projectionKey(source)
+    var sameRail = rail === projectedRail
+    projectedSource = sourceText || JSON.stringify(source)
+    projectedRail = rail
+    conversationProjection = Model.pendingProjection(conversationProjection, sameRail)
     conversationProjectionTimer.restart()
   }
   Timer { id: conversationProjectionTimer; interval: 0; onTriggered: root.refreshConversationProjection() }
-  onConversationSourceChanged: scheduleConversationProjection()
+  onConversationSourceChanged: {
+    var text = JSON.stringify(conversationSource)
+    if (text === projectedSource) return
+    scheduleConversationProjection(text)
+  }
   function refreshConversationProjection() {
     if (!backend || !backend.ready) return
     var serial = conversationProjectionSerial
     backend.call("account.conversation", conversationSource, function(result, error) {
-      if (!root || serial !== root.conversationProjectionSerial || error || !result) return
+      if (!root || serial !== root.conversationProjectionSerial) return
+      // A failed ask leaves the source unanswered: forget it was asked, so
+      // the next change of the same source asks again.
+      if (error || !result) { root.projectedSource = ""; return }
       root.conversationProjection = result
     })
   }
@@ -1610,6 +2002,8 @@ Item {
   readonly property string selectedResponse: reading ? reading.selectedResponse : ""
   readonly property bool canRespondToInvite: !!reading && reading.canRespondToInvite
   readonly property bool rsvpSending: !!reading && reading.rsvpSending
+  readonly property bool rsvpFallbackAvailable: !!reading && reading.rsvpFallbackAvailable === true
+  readonly property string rsvpCalendarUrl: reading ? Provider.calendarAttendanceUrl(reading.providerId, reading.accountId) : ""
   // Empty when this message offers no way off a list, which is the answer for
   // everything that is not a newsletter.
   readonly property string unsubscribeLabel: reading ? reading.unsubscribeLabel : ""
@@ -1765,6 +2159,7 @@ Item {
     if (typeof callback === "function") callback("")
   }
   function rsvp(response) { if (reading) reading.rsvp(response) }
+  function rsvpMailOnly(response) { if (reading) reading.rsvpMailOnly(response) }
   function unsubscribe() { if (reading) reading.unsubscribe() }
   function cursorOffset(cursorId, delta) {
     if (unified) return Unified.cursorOffset(unifiedMessages, cursorId, delta)
@@ -1896,16 +2291,23 @@ Item {
       "send-" + sendSession + "-" + sendSequence, sendSequence)
   }
 
-  // The mailbox a submission is sent from.
-  //
-  // A named one is the answer, and a named one that is not here is a refusal
-  // rather than permission to guess: falling through to matching the address
-  // sent the message from whichever mailbox matched first, which for two that
-  // share a send-as alias is not the one the composer chose. The address is
-  // only consulted when nothing named a mailbox at all.
-  //
-  // Resolved in one place so the choice can be asserted, rather than inferred
-  // from what happened after it.
+  function sendAgentProposal(proposalId, fields) {
+    var id = String(proposalId || "")
+    if (!/^[a-f0-9]{32}-[0-9]+$/.test(id)) return false
+    var host = sendHostFor(fields)
+    if (!host) return false
+    sendSequence += 1
+    // The durable outbox owns idempotency across panels and application restarts.
+    var outgoing = Object.assign({}, fields, {exactBody: true})
+    return host.send(outgoing, "agent-" + id, sendSequence)
+  }
+  function agentProposalQueue(accountId) {
+    var host = findAccount(String(accountId || ""))
+    return host ? host.sendQueue : null
+  }
+
+  // An explicit mailbox must exist; never fall back to a shared send-as alias.
+  // Resolve by address only when the submission has no mailbox identity.
   function sendHostFor(fields) {
     var values = fields || ({})
     var target = draftOwner(values)
@@ -1922,13 +2324,8 @@ Item {
     return Unified.accountOf(String(values.draftId || ""))
   }
 
-  // The same submission with its draft id as the owning provider issued it.
-  //
-  // Asked of the id rather than of `unified`, because the composer can be
-  // opened from a merged list and saved after the reader has left it — and a
-  // provider handed a composed id answers that the draft is no longer there
-  // and writes nothing. A bare id cannot hold the separator, so this is safe
-  // to ask of any of them.
+  // Decode a merged draft id even after the reader leaves the merged list.
+  // Provider-local ids cannot contain the separator.
   function withSourceDraftId(values) {
     var id = String(values.draftId || "")
     if (Unified.accountOf(id) === "") return values
@@ -2057,6 +2454,16 @@ Item {
   function signIn() { if (current) current.signIn() }
   function cancelSignIn() { if (current) current.cancelSignIn() }
   function signOut() { if (current) current.signOut() }
+  function checkMicrosoftConnection(callback) {
+    var host = current
+    if (!host || typeof host.checkMicrosoftConnection !== "function") {
+      if (typeof callback === "function") callback({ mail: false, graph: false, calendar: false })
+      return
+    }
+    host.checkMicrosoftConnection(function(report) {
+      if (root.current === host && typeof callback === "function") callback(report)
+    })
+  }
 
   // The password providers' sign-in. Gmail's is a browser and answers false,
   // which is what lets one setup page ask without checking first.
@@ -2133,14 +2540,14 @@ Item {
   // address yet.
   function openProviderWebsite(id) {
     var url = Provider.webHomeUrl(id)
-    if (url !== "") Quickshell.execDetached(["xdg-open", url])
+    if (url !== "") openExternal(url)
   }
 
   // The program a provider runs on, which is a different address from the
   // service — HEY is hey.com, and the client that reaches it is a repository.
   function openProviderClient(id) {
     var url = Provider.clientUrl(id)
-    if (url !== "") Quickshell.execDetached(["xdg-open", url])
+    if (url !== "") openExternal(url)
   }
   function openCloudConsole() { if (current) current.openCloudConsole() }
   function openGmailApiPage() { if (current) current.openGmailApiPage() }
@@ -2148,11 +2555,11 @@ Item {
   // Not forwarded to an account: the project exists whether or not anyone has
   // signed in, and the menu offers it on the setup page too.
   function openProjectPage() {
-    Quickshell.execDetached(["xdg-open", "https://github.com/huacnlee/omamail"])
+    openExternal("https://github.com/huacnlee/omamail")
   }
 
   function openAuthorPage() {
-    Quickshell.execDetached(["xdg-open", "https://x.com/huacnlee"])
+    openExternal("https://x.com/huacnlee")
   }
   function openConsentScreen() { if (current) current.openConsentScreen() }
 
@@ -2223,6 +2630,19 @@ Item {
     Component.onCompleted: Qt.callLater(root.refreshCalendarPreview)
   }
 
+  Loader {
+    id: calendarReminderLoader
+    active: root.backendCanGoogleCalendars && root.calendarRemindersEnabled
+    sourceComponent: Component {
+      CalendarReminders {
+        service: root
+        pluginDir: root.pluginDir
+        notificationForeground: Commons.Color.foreground
+        notificationAccent: Commons.Color.accent
+      }
+    }
+  }
+
   Timer {
     interval: 600000
     repeat: true
@@ -2240,6 +2660,7 @@ Item {
     model: root.accountCount
 
     delegate: MailAccount {
+      platform: root
       required property int index
 
       readonly property var entry: {
@@ -2247,9 +2668,8 @@ Item {
         return index < accounts.length ? accounts[index] : null
       }
 
-      notificationForeground: root.shell && root.shell.bar
-        ? root.shell.bar.barForeground : Color.foreground
-      notificationAccent: Color.accent
+      notificationForeground: Commons.Color.foreground
+      notificationAccent: Commons.Color.accent
       pluginDir: root.pluginDir
       accountId: entry ? entry.id : ""
       backend: root.backend
@@ -2306,10 +2726,7 @@ Item {
 
   FileView {
     id: windowFile
-    path: {
-      var home = Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")
-      return home + "/omamail/window.json"
-    }
+    path: root.configPath("window.json")
     printErrors: false
     onLoaded: root.applyWindowPrefs(text())
     // No file yet is the ordinary first-run state, not an error.
@@ -2329,45 +2746,147 @@ Item {
     onTriggered: root.reopenWindow()
   }
 
-  AgentContext {
-    id: agentContext
-    service: root
-    runner: agentRunner
+  QtObject {
+    id: inactiveAgentContext
+    property string error: ""
+    property bool busy: false
+    function request() { return false }
   }
 
-  EventSuggester {
-    id: eventSuggester
-    service: root
-    runner: agentRunner
+  QtObject {
+    id: inactiveEventSuggester
+    property var suggestions: []
+    function compose() { return false }
+    function dismiss() { return false }
   }
 
-  AgentRunner {
-    id: agentRunner
-    backend: root.backend
-    pluginDir: root.pluginDir
-    // The open account owns what the rows show and cancel: an IMAP id is
-    // only unique inside one account, and two accounts can share an address.
-    accountId: root.current ? root.current.accountId : ""
-    onJobFinished: function(job) {
-      var text = Agent.finishedNote(job)
-      // On the account the job was about; the open one only for a job that
-      // named none.
-      var owner = findAccount(String(job && job.accountId || "")) || root.current
-      if (text !== "" && owner) owner.note(text)
+  QtObject {
+    id: inactiveAgentRunner
+    property string lastError: ""
+    property bool starting: false
+    property var byMessage: ({})
+    property bool attention: false
+    property var attentionByMessage: ({})
+    property bool anyActive: false
+    property var jobs: []
+    property string shownId: ""
+    property string shownOutput: ""
+    property var shownTranscript: []
+    property bool cancelling: false
+    function acknowledge() {}
+    function cancel() { return false }
+    function cancelById() { return false }
+    function draftJobs() { return [] }
+    function forget() {}
+    function forgetFinished() {}
+    function historyFor() { return [] }
+    function isActive() { return false }
+    function jobFor2() { return null }
+    function refresh() {}
+    function selectionJob() { return null }
+    function show() {}
+    function start() { return false }
+    function wantsAttention() { return false }
+  }
+
+  Loader {
+    id: agentContextLoader
+    active: root.hasAgent
+    sourceComponent: Component { AgentContext { service: root; runner: root.agentRunner } }
+  }
+
+  Loader {
+    id: eventSuggesterLoader
+    active: root.hasAgent
+    sourceComponent: Component { EventSuggester { service: root; runner: root.agentRunner } }
+  }
+
+  Loader {
+    id: agentRunnerLoader
+    active: root.hasAgent
+    // A stable facade keeps plugin test and shell integrations from depending
+    // on Loader ownership while the standalone build leaves `item` uncreated.
+    property string pluginDir: root.pluginDir
+    property var backend: root.backend
+    readonly property var jobs: item ? item.jobs : []
+    function applyListing(values) { if (item) item.applyListing(values) }
+    sourceComponent: Component {
+      AgentRunner {
+        objectName: "agent-runner"
+        backend: agentRunnerLoader.backend
+        pluginDir: root.pluginDir
+        selectedAgent: root.aiAgent
+        selectedModel: root.aiModel
+        selectionResetAt: Number(root.settings ? root.settings.aiChatResetAt || 0 : 0)
+        // The open account owns what the rows show and cancel: an IMAP id is
+        // only unique inside one account, and two accounts can share an address.
+        accountId: root.current ? root.current.accountId : ""
+        onJobFinished: function(job) {
+          var text = Agent.finishedNote(job)
+          var owner = root.findAccount(String(job && job.accountId || "")) || root.current
+          if (text !== "" && owner) owner.note(text)
+        }
+        onFailed: function(text) { if (root.current) root.current.fail(text) }
+      }
     }
-    onFailed: function(text) { if (root.current) root.current.fail(text) }
   }
 
-  Process {
-    id: windowWriter
-    stdinEnabled: true
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onStarted: {
-      write(root.windowWritePayload + "\n")
-      root.windowWritePayload = ""
+  Component {
+    id: hostProcessComponent
+    Process {
+      required property string operation
+      property var callback: null
+      property string payload: ""
+      stdinEnabled: payload !== ""
+      stdout: StdioCollector { waitForEnd: true }
+      stderr: StdioCollector { waitForEnd: true }
+      onStarted: if (payload !== "") { write(payload); payload = "" }
+      onExited: function(exitCode) {
+        var done = callback
+        callback = null
+        if (typeof done === "function") {
+          if (operation === "write") done(exitCode === 0,
+            exitCode === 0 ? "" : String(stderr.text || "Could not write configuration"))
+          else {
+            var value = null
+            try { value = JSON.parse(String(stdout.text || "")) } catch (e) {}
+            done(value || ({ok:false,error:String(stderr.text || "Host operation failed")}))
+          }
+        }
+        destroy()
+      }
     }
-    onExited: root.windowWritePayload = ""
+  }
+
+  Component {
+    id: legacyCredentialProcessComponent
+    Process {
+      id: legacyCredentialProcess
+      required property string operation
+      property var done: null
+      property string payload: ""
+      objectName: "legacy-credential-" + operation
+      stdinEnabled: operation === "put"
+      stdout: StdioCollector { id: legacyCredentialOutput; waitForEnd: true }
+      stderr: StdioCollector { waitForEnd: true }
+      onStarted: if (operation === "put") {
+        write(payload + "\n")
+        payload = ""
+      }
+      onExited: function(exitCode) {
+        payload = ""
+        var callback = done
+        done = null
+        if (typeof callback === "function") {
+          if (operation === "get") callback(exitCode === 0
+            ? SecretText.fromKeyring(legacyCredentialOutput.text) : "",
+            exitCode === 0 ? "" : (exitCode === 1
+              ? "credential_missing" : "credential_store_unavailable"))
+          else callback(exitCode === 0, exitCode === 0 ? "" : "credential_store_unavailable")
+        }
+        destroy()
+      }
+    }
   }
 
   Connections {
@@ -2394,9 +2913,40 @@ Item {
     stderr: StdioCollector { waitForEnd: true }
   }
 
+  Process {
+    id: defaultMailClientProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      if (root.defaultMailClientBusy) {
+        root.defaultMailClientBusy = false
+        if (exitCode !== 0) root.defaultMailClientError =
+          String(stderr.text || "").trim() || "Could not change the default mail client"
+        // The status read cannot start from inside this process's own exit.
+        Qt.callLater(root.refreshDefaultMailClient)
+        return
+      }
+      if (exitCode === 0) root.defaultMailClient = String(stdout.text || "").trim()
+    }
+  }
+
   Component.onCompleted: {
+    barBridge = BarBridge.publish(function() {
+      return {
+        ready: root.ready, windowOpen: root.windowOpen,
+        showBarIcon: root.showBarIcon, unreadTotal: root.unreadTotal,
+        barTooltip: root.barTooltip, contentDirection: root.contentDirection,
+        barMessages: root.barMessages, barEvents: root.barEvents
+      }
+    }, function(values) { root.applySettings(BarBridge.settings(values, root.defaultSettingValues)) },
+      function() { root.refresh() },
+      function() { root.refreshCalendarPreview() })
     Qt.callLater(root.restoreAccountRegistry)
     Qt.callLater(root.refreshRecipientContacts)
     Qt.callLater(root.registerMailtoHandler)
+    Qt.callLater(root.refreshDefaultMailClient)
   }
+
+  property var barBridge: null
+  Component.onDestruction: BarBridge.clear(barBridge)
 }

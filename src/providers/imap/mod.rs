@@ -1,5 +1,6 @@
 //! Native asynchronous IMAP and SMTP. Credentials never cross a process boundary.
 mod cancel;
+pub(crate) mod idle;
 mod mutation;
 mod read;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -43,12 +44,12 @@ async fn acquire(p: &Value) -> Result<(Wire, String)> {
     // Capabilities are negotiated afresh after authentication/TLS, and ID is
     // sent once on this connection before any mailbox can be selected.
     let capabilities = command(&mut wire, "CAPABILITY").await?;
-    if advertises_id(&capabilities) {
+    if advertises(&capabilities, "ID") {
         command(&mut wire, "ID (\"name\" \"Omamail\")").await?;
     }
     Ok((wire, key))
 }
-fn advertises_id(response: &[u8]) -> bool {
+fn advertises(response: &[u8], capability: &str) -> bool {
     response.split(|b| *b == b'\n').any(|line| {
         let mut words = line
             .split(|b| b.is_ascii_whitespace())
@@ -57,7 +58,7 @@ fn advertises_id(response: &[u8]) -> bool {
             && words
                 .next()
                 .is_some_and(|word| word.eq_ignore_ascii_case(b"CAPABILITY"))
-            && words.any(|word| word.eq_ignore_ascii_case(b"ID"))
+            && words.any(|word| word.eq_ignore_ascii_case(capability.as_bytes()))
     })
 }
 async fn release(wire: Wire, key: String) {
@@ -114,9 +115,26 @@ async fn line(w: &mut Wire) -> Result<Vec<u8>> {
 }
 async fn response(w: &mut Wire, tag: &str, continuation: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+    response_each(w, tag, continuation, |record| {
+        out.extend_from_slice(record);
+        Ok(())
+    })
+    .await?;
+    Ok(out)
+}
+/// Visit complete IMAP response records, keeping literals attached to their
+/// protocol record. UID inventories can retain only numbers instead of a full
+/// response and a second, much larger parsed syntax tree.
+async fn response_each(
+    w: &mut Wire,
+    tag: &str,
+    continuation: bool,
+    mut visit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut total = 0;
     loop {
         let l = line(w).await?;
-        if out.len() + l.len() > LIMIT {
+        if total + l.len() > LIMIT {
             return Err("mail_response_too_large");
         }
         let text = String::from_utf8_lossy(&l);
@@ -128,36 +146,49 @@ async fn response(w: &mut Wire, tag: &str, continuation: bool) -> Result<Vec<u8>
             {
                 return Err("imap_command_failed");
             }
-            out.extend_from_slice(&l);
-            return Ok(out);
+            visit(&l)?;
+            return Ok(());
         }
         if text.starts_with("* BYE") {
             return Err("mail_connection_closed");
         }
         if text.starts_with('+') {
             if continuation {
-                return Ok(out);
+                return Ok(());
             }
             return Err("imap_unexpected_continuation");
         }
-        let literal = text
-            .trim_end_matches(['\r', '\n'])
-            .rsplit_once('{')
-            .and_then(|(_, s)| s.strip_suffix('}'))
-            .map(|s| s.trim_end_matches('+').parse::<usize>());
-        out.extend_from_slice(&l);
-        if let Some(n) = literal {
+        let mut literal = literal_length(&text);
+        total += l.len();
+        let mut record = l;
+        while let Some(n) = literal {
             let n = n.map_err(|_| "imap_invalid_response")?;
-            if n > LIMIT - out.len() {
+            if n > LIMIT - total {
                 return Err("mail_response_too_large");
             }
-            let start = out.len();
-            out.resize(start + n, 0);
-            w.read_exact(&mut out[start..])
+            let start = record.len();
+            record.resize(start + n, 0);
+            w.read_exact(&mut record[start..])
                 .await
                 .map_err(|_| "mail_network_failed")?;
+            total += n;
+            let suffix = line(w).await?;
+            if total + suffix.len() > LIMIT {
+                return Err("mail_response_too_large");
+            }
+            total += suffix.len();
+            literal = literal_length(&String::from_utf8_lossy(&suffix));
+            record.extend(suffix);
         }
+        visit(&record)?;
     }
+}
+/// The octet count a line announces with a trailing `{n}` or `{n+}` literal.
+fn literal_length(line: &str) -> Option<std::result::Result<usize, std::num::ParseIntError>> {
+    line.trim_end_matches(['\r', '\n'])
+        .rsplit_once('{')
+        .and_then(|(_, s)| s.strip_suffix('}'))
+        .map(|s| s.trim_end_matches('+').parse::<usize>())
 }
 async fn command(w: &mut Wire, cmd: &str) -> Result<Vec<u8>> {
     write(w, format!("O1 {cmd}\r\n").as_bytes()).await?;
@@ -177,6 +208,12 @@ async fn tls_with_roots(w: Wire, host: &str, roots: impl Into<Arc<RootCertStore>
     .map_err(|_| "mail_tls_failed")?
     .with_root_certificates(roots)
     .with_no_client_auth();
+    tls_with_config(w, host, config).await
+}
+async fn tls_with_config(w: Wire, host: &str, config: ClientConfig) -> Result<Wire> {
+    if !w.buffer().is_empty() {
+        return Err("mail_tls_failed");
+    }
     let name = ServerName::try_from(host.to_owned()).map_err(|_| "invalid_params")?;
     let stream = TlsConnector::from(Arc::new(config))
         .connect(name, w.into_inner())
@@ -184,6 +221,7 @@ async fn tls_with_roots(w: Wire, host: &str, roots: impl Into<Arc<RootCertStore>
         .map_err(|_| "mail_tls_failed")?;
     Ok(BufReader::new(Box::new(stream)))
 }
+mod bridge_tls;
 async fn dial_host(host: &str, port: u16) -> Result<TcpStream> {
     let addresses = async {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -213,6 +251,23 @@ async fn dial_resolved(
     Err("mail_network_failed")
 }
 async fn connect(settings: &Value, smtp: bool) -> Result<Wire> {
+    connect_with_dial(settings, smtp, |host, port| async move {
+        dial_host(&host, port).await
+    })
+    .await
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Tls,
+    StartTls,
+    #[cfg(any(test, feature = "integration-test-credentials"))]
+    TestPlaintext,
+}
+async fn connect_with_dial<F, Fut>(settings: &Value, smtp: bool, dial: F) -> Result<Wire>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<TcpStream>>,
+{
     let host = string(settings, if smtp { "smtpHost" } else { "imapHost" })?;
     if host.is_empty()
         || !host
@@ -225,22 +280,44 @@ async fn connect(settings: &Value, smtp: bool) -> Result<Wire> {
         .as_u64()
         .filter(|p| *p > 0 && *p <= 65535)
         .ok_or("invalid_params")? as u16;
-    let local = settings["insecure"] == true && matches!(host, "127.0.0.1" | "::1" | "localhost");
-    // Loopback plaintext is an explicitly configured bridge, never a TLS fallback.
-    let dial = if local && host == "localhost" {
+    let loopback = matches!(host, "127.0.0.1" | "::1" | "localhost");
+    let allow_self_signed = loopback && settings["insecure"] == true;
+    // Bridge supports custom ports. Its clear greeting still requires STARTTLS;
+    // `insecure` relaxes certificate trust, never the encryption requirement.
+    // Remote nonstandard ports retain the existing implicit-TLS convention.
+    let transport = if (smtp && matches!(port, 25 | 587))
+        || (!smtp && port == 143)
+        || (loopback && port != if smtp { 465 } else { 993 })
+    {
+        Transport::StartTls
+    } else {
+        Transport::Tls
+    };
+    // Plain peers are only available in test builds, by explicit fixture opt-in.
+    #[cfg(any(test, feature = "integration-test-credentials"))]
+    let transport = if allow_self_signed && settings["testPlaintext"] == true {
+        Transport::TestPlaintext
+    } else {
+        transport
+    };
+    let dial_host = if host == "localhost" {
         "127.0.0.1"
     } else {
         host
     };
-    let stream = dial_host(dial, port).await?;
-    let mut w: Wire = BufReader::new(Box::new(stream));
-    let upgrade = if smtp {
-        matches!(port, 25 | 587)
-    } else {
-        port == 143
-    };
-    if !local && !upgrade {
-        w = tls(w, host).await?
+    let stream = dial(dial_host.to_owned(), port).await?;
+    let w: Wire = BufReader::new(Box::new(stream));
+    handshake(w, host, smtp, allow_self_signed, transport).await
+}
+async fn handshake(
+    mut w: Wire,
+    host: &str,
+    smtp: bool,
+    allow_self_signed: bool,
+    transport: Transport,
+) -> Result<Wire> {
+    if transport == Transport::Tls {
+        w = secure(w, host, allow_self_signed).await?
     }
     if smtp {
         smtp_response(&mut w, 220).await?;
@@ -250,16 +327,23 @@ async fn connect(settings: &Value, smtp: bool) -> Result<Wire> {
             return Err("imap_invalid_response");
         }
     }
-    if upgrade && !local {
+    if transport == Transport::StartTls {
         if smtp {
             smtp_cmd(&mut w, "EHLO omamail", 250).await?;
             smtp_cmd(&mut w, "STARTTLS", 220).await?;
         } else {
             command(&mut w, "STARTTLS").await?;
         }
-        w = tls(w, host).await?;
+        w = secure(w, host, allow_self_signed).await?;
     }
     Ok(w)
+}
+async fn secure(w: Wire, host: &str, allow_self_signed: bool) -> Result<Wire> {
+    if allow_self_signed {
+        bridge_tls::upgrade(w, host).await
+    } else {
+        tls(w, host).await
+    }
 }
 fn credentials(p: &Value) -> Result<(String, String)> {
     let supplied = string(p, "credential")?;
@@ -286,15 +370,23 @@ async fn login(w: &mut Wire, p: &Value) -> Result<()> {
         }
         let auth = STANDARD.encode(format!("user={user}\x01auth=Bearer {secret}\x01\x01"));
         write(w, format!("{auth}\r\n").as_bytes()).await?;
-        response(w, "O1", false)
-            .await
-            .map_err(|_| "mail_auth_failed")?;
+        response(w, "O1", false).await.map_err(refused)?;
     } else {
         command(w, &format!("LOGIN {} {}", quote(&user)?, quote(&secret)?))
             .await
-            .map_err(|_| "mail_auth_failed")?;
+            .map_err(refused)?;
     }
     Ok(())
+}
+/// Only a tagged NO/BAD means the credentials were refused. A dropped
+/// connection or a BYE during the exchange is a transport failure, which
+/// callers retry sooner than they would a bad password.
+fn refused(error: &'static str) -> &'static str {
+    if error == "imap_command_failed" {
+        "mail_auth_failed"
+    } else {
+        error
+    }
 }
 /// Read live LIST/SPECIAL-USE facts without touching the folder cache or
 /// persistent account metadata. Execution retains these exact destinations.

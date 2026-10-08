@@ -28,6 +28,8 @@ Item {
     property var backendRuntime: null
 
     property bool hasAgent: true
+    property bool agentAvailable: true
+    property string agentUnavailableReason: "Your system-default agent is not supported. Choose Claude, Codex or OpenCode in Settings → AI."
     property bool agentStarting: false
     property string agentError: ""
     property string agentShownId: ""
@@ -39,13 +41,17 @@ Item {
     property var agentJobs: ({})
     property var agentAttentionByMessage: ({})
     property var draftAgentJobs: []
+    property var readerAgentJob: null
+    readonly property var agentAllJobs: readerAgentJob ? [readerAgentJob] : []
     property string cancelledAgentId: ""
     function agentJobsForDraft(fields) { return draftAgentJobs }
     function cancelAgentJob(id) { cancelledAgentId=id; return true }
     function showAgentJob(id) { agentShownId=id }
     function acknowledgeAgentJob(id) {}
     function agentJobWantsAttention(job) { return false }
-    function agentJobFor(id, owner) { return null }
+    function agentJobFor(id, owner) {
+      return readerAgentJob && readerAgentJob.messageId === id && readerAgentJob.accountId === owner ? readerAgentJob : null
+    }
     function agentSelectionJob(ids, owner) { return null }
     function refreshAgentJobs() {}
     property bool ready: true
@@ -211,7 +217,114 @@ Item {
       return item
     }
 
+    function typed(item, prefix) {
+      if (String(item).indexOf(prefix) === 0) return item
+      var children = item.children || []
+      for (var i = 0; i < children.length; i++) {
+        var found = typed(children[i], prefix)
+        if (found) return found
+      }
+      return null
+    }
+
+    SignalSpy { id: shortcutSpy; signalName: "triggered" }
+
+    function test_readiness_changes_keep_the_open_draft_and_keyboard_together() {
+      var compose = composeView()
+      app.open("{}")
+      shortcutSpy.target = named(app, "key-router")
+      shortcutSpy.clear()
+      wait(20)
+      compare(shortcutSpy.target.context, "list")
+      keyClick(Qt.Key_D)
+      keyClick(Qt.Key_E)
+      compare(shortcutSpy.count, 2, "positive control: real mailbox shortcuts dispatch")
+      compare(shortcutSpy.signalArguments[0][0], "trash")
+      compare(shortcutSpy.signalArguments[1][0], "archive")
+      app.startCompose("new")
+      named(compose, "compose-subject-field").text = "Readiness draft"
+      named(compose, "compose-body-editor").text = "Keep these words"
+      var sidebar = typed(app, "MailboxSidebar_")
+      var reader = typed(app, "MessageReader_")
+      var list = typed(app, "MessageList_")
+      verify(sidebar)
+      verify(reader)
+      verify(list)
+
+      mailService.anyAccountReady = false
+      wait(20)
+      compare(compose.opened, true)
+      compare(app.composing, true)
+      compare(sidebar.visible, false)
+      compare(reader.visible, false)
+      compare(list.visible, false)
+      compare(named(app, "key-router").context, "page")
+
+      mailService.anyAccountReady = true
+      wait(20)
+      compare(compose.opened, true)
+      compare(compose.visible, true)
+      compare(app.composing, true)
+      compare(app.navKinds.join(","), "list,compose")
+      compare(sidebar.visible, false)
+      compare(reader.visible, false)
+      compare(list.visible, false)
+      compare(named(app, "key-router").context, "compose")
+      compare(named(compose, "compose-subject-field").text, "Readiness draft")
+      compare(named(compose, "compose-body-editor").text, "Keep these words")
+
+      var subject = named(compose, "compose-subject-field")
+      subject.forceActiveFocus()
+      subject.cursorPosition = subject.text.length
+      shortcutSpy.clear()
+      keyClick(Qt.Key_D)
+      keyClick(Qt.Key_E)
+      compare(subject.text, "Readiness draftde")
+      compare(shortcutSpy.count, 0, "typing must never dispatch a mailbox action")
+
+      app.openSettings()
+      compare(compose.visible, false)
+      compare(named(app, "key-router").context, "page")
+      app.back()
+      compare(compose.visible, true)
+      compare(app.composing, true)
+      compare(named(app, "key-router").context, "compose")
+
+      // A normal queued send must remove the restored overlay as well.
+      named(compose, "compose-to-field").text = "synthetic@example.com"
+      compose.submit()
+      compare(compose.opened, false)
+      compare(app.navKinds.join(","), "list")
+      mailService.anyAccountReady = false
+      mailService.anyAccountReady = true
+      compare(app.composing, false)
+      compare(app.navKinds.join(","), "list")
+    }
+
+    function test_readiness_changes_keep_the_event_composer_in_navigation() {
+      app.open("{}")
+      var composer = typed(app, "CalendarEventComposer_")
+      verify(composer)
+      composer.begin()
+      mailService.anyAccountReady = false
+      wait(20)
+      compare(composer.opened, true)
+      compare(app.composing, true)
+      compare(named(app, "key-router").context, "page")
+      mailService.anyAccountReady = true
+      wait(20)
+      compare(composer.visible, true)
+      compare(app.navKinds.join(","), "list,eventComposer")
+      compare(named(app, "key-router").context, "eventCompose")
+      app.back()
+      compare(composer.opened, false)
+      compare(app.composing, false)
+      compare(app.navKinds.join(","), "list")
+    }
+
     function init() {
+      mailService.agentAvailable = true
+      mailService.anyAccountReady = true
       mailService.backendRuntime = null
       app.draftSavedToast = ""
       app.composeRecoveryNotice = ""
@@ -248,6 +361,7 @@ Item {
       if (aiDock) { aiDock.submittedPrompt=""; findChild(aiDock,"agent-pending-queue").messages=[] }
       app.preferredAssistantWidth = 0
       mailService.draftAgentJobs = []; mailService.cancelledAgentId = ""
+      mailService.readerAgentJob = null
       mailService.agentRequests = 0
       mailService.lastAgentPrompt = ""
       mailService.sending = false
@@ -382,7 +496,7 @@ Item {
       app.writeComposeRecovery(raw)
       var warning = app.draftSavedNotice
       verify(warning.indexOf("Keep this window open") >= 0)
-      wait(4200)
+      tryCompare(app, "draftSavedToast", "", 6000)
       compare(app.draftSavedNotice, warning, "the prior save's timer cannot dismiss a recovery warning")
       compare(recoveryBackend.requests.length, priorRequests, "the old connection receives no recovery RPC")
       verify(app.composeWriteQueued)
@@ -410,9 +524,41 @@ Item {
       verify(app.composeRecovery.active !== true);verify(!composeView().opened)
       compare(lastNativeRequest("outbox.forget"),null)
       var saved = lastNativeRequest("compose.recoverySave")
+      // Rust refuses a record without version 1, which left the stale receipt on disk.
+      compare(saved.params.record.version, 1)
+      compare(saved.params.record.active, false)
       saved.done({record:saved.params.record,revision:"r2"},null)
       lastNativeRequest("outbox.snapshot").done({entries:[{state:"sent"}]},null)
       verify(lastNativeRequest("outbox.forget") !== null)
+    }
+    function test_proposal_receipt_ack_waits_for_durable_recovery_data() {
+      return [{tag:"cancelled",state:"cancelled"},{tag:"failed",state:"failed"}]
+    }
+    function test_proposal_receipt_ack_waits_for_durable_recovery(data) {
+      var id = "agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-1"
+      var record = recoveredPending()
+      record.draft.pendingSendId = id
+      recoveryBackend.ready = true
+      lastNativeRequest("compose.recoveryRead").done({record:record,revision:"r1"},null)
+      lastNativeRequest("outbox.snapshot").done({entries:[{id:id,state:data.state}]},null)
+      tryVerify(function(){return lastNativeRequest("compose.recoverySave") !== null})
+      var saved = lastNativeRequest("compose.recoverySave")
+      compare(saved.params.record.draft.body, record.draft.body)
+      verify(!saved.params.record.draft.pendingSendId)
+      compare(app.composeReceiptAcks.length, 1)
+      compare(lastNativeRequest("outbox.forget"), null)
+      // Even another ack drain cannot release the only durable payload early.
+      app.acknowledgeComposeReceipts()
+      compare(lastNativeRequest("outbox.forget"), null)
+      saved.done({record:saved.params.record,revision:"r2"},null)
+      var receipt = lastNativeRequest("outbox.snapshot")
+      compare(receipt.params.sendId, id)
+      receipt.done({entries:[{id:id,state:data.state}]},null)
+      var ack = lastNativeRequest("outbox.forget")
+      verify(ack !== null)
+      compare(ack.params, {accountId:record.draft.accountId,sendId:id})
+      ack.done({},null)
+      compare(app.composeReceiptAcks.length, 0)
     }
     function test_queued_receipt_stays_parked_instead_of_opening_a_duplicate_composer() {
       recoveryBackend.ready = true
@@ -476,12 +622,149 @@ Item {
       compare(app.composeRecovery.draft.body,"Keep local draft")
       app.saveComposeRecovery({body:"New local edit"})
       compare(recoveryBackend.requests.length,2)
+      wait(1200)
+      compare(recoveryBackend.requests.length,2,"a conflict is owned by another instance and is never retried")
       recoveryBackend.ready = false
       recoveryBackend.ready = true
       compare(recoveryBackend.requests.length,3)
       recoveryBackend.requests[2].done({record:{active:true,draft:{body:"Other instance"}},revision:"other"},null)
       compare(app.composeRecovery.draft.body,"New local edit")
       compare(recoveryBackend.requests.length,3)
+    }
+    function test_native_recovery_failure_notice_clears_once_a_save_lands() {
+      beginNativeRecovery()
+      app.saveComposeRecovery({body:"Keep local draft",accountId:"one@example.org"})
+      recoveryBackend.requests[1].done(null,{message:"recovery_unavailable"})
+      verify(app.draftSavedNotice.indexOf("could not be saved") >= 0)
+      app.saveComposeRecovery({body:"Second edit",accountId:"one@example.org"})
+      var saved = lastNativeRequest("compose.recoverySave")
+      verify(saved !== recoveryBackend.requests[1])
+      saved.done({record:saved.params.record,revision:"durable"},null)
+      compare(app.draftSavedNotice,"","a durable save answers its own failure warning")
+    }
+    function test_native_recovery_save_gives_back_the_delivery_warning_it_covered() {
+      recoveryBackend.ready = true
+      lastNativeRequest("compose.recoveryRead").done({record:recoveredPending(),revision:"r1"},null)
+      lastNativeRequest("outbox.snapshot").done({accountId:"me@example.com",entries:[{id:"receipt-one",state:"unknown"}]},null)
+      tryVerify(function(){return lastNativeRequest("compose.recoverySave") !== null})
+      var reconciled = lastNativeRequest("compose.recoverySave")
+      reconciled.done({record:reconciled.params.record,revision:"r2"},null)
+      app.opened = true
+      app.restoreComposeRecovery()
+      var warning = app.draftSavedNotice
+      verify(warning.indexOf("Delivery status is unknown") >= 0)
+      app.saveComposeRecovery({body:"Edited after recovery",accountId:"me@example.com"})
+      var failed = lastNativeRequest("compose.recoverySave")
+      verify(failed !== reconciled)
+      failed.done(null,{message:"recovery_unavailable"})
+      verify(app.draftSavedNotice.indexOf("could not be saved") >= 0)
+      app.saveComposeRecovery({body:"Edited once more",accountId:"me@example.com"})
+      var durable = lastNativeRequest("compose.recoverySave")
+      verify(durable !== failed)
+      durable.done({record:durable.params.record,revision:"r3"},null)
+      compare(app.draftSavedNotice,warning,"a save answers its own warning, not the one it covered")
+    }
+    function test_native_recovery_failure_notice_is_answered_after_the_draft_goes() {
+      beginNativeRecovery()
+      app.saveComposeRecovery({body:"Keep local draft",accountId:"one@example.org"})
+      var refused = recoveryBackend.requests[1]
+      refused.done(null,{message:"recovery_unavailable"})
+      verify(app.draftSavedNotice.indexOf("could not be saved") >= 0)
+      verify(app.clearComposeRecovery())
+      var tombstone = lastNativeRequest("compose.recoverySave")
+      verify(tombstone !== refused)
+      compare(tombstone.params.record.active,false)
+      tombstone.done({record:{active:false},revision:"cleared"},null)
+      compare(app.draftSavedNotice,"","the write that discards the draft answers the warning too")
+    }
+    function test_native_recovery_save_keeps_a_warning_raised_after_the_failure() {
+      recoveryBackend.ready = true
+      lastNativeRequest("compose.recoveryRead").done({record:recoveredPending(),revision:"r1"},null)
+      lastNativeRequest("outbox.snapshot").done({accountId:"me@example.com",entries:[{id:"receipt-one",state:"unknown"}]},null)
+      tryVerify(function(){return lastNativeRequest("compose.recoverySave") !== null})
+      var refused = lastNativeRequest("compose.recoverySave")
+      // The window is shut, so the failure covers nothing at all.
+      compare(app.draftSavedNotice,"")
+      refused.done(null,{message:"recovery_unavailable"})
+      verify(app.draftSavedNotice.indexOf("could not be saved") >= 0)
+      app.opened = true
+      app.restoreComposeRecovery()
+      var warning = app.draftSavedNotice
+      verify(warning.indexOf("Delivery status is unknown") >= 0)
+      app.saveComposeRecovery({body:"Edited after recovery",accountId:"me@example.com"})
+      var durable = lastNativeRequest("compose.recoverySave")
+      verify(durable !== refused)
+      durable.done({record:durable.params.record,revision:"r2"},null)
+      compare(app.draftSavedNotice,warning,"a warning raised after the failure is the current one")
+    }
+    function test_native_recovery_save_answers_the_update_notice_it_covered() {
+      recoveryBackend.apiVersion = 2
+      recoveryBackend.ready = true
+      app.writeComposeRecovery(JSON.stringify({version:1,active:true,draft:{userModified:true,body:"Keep this draft"}}))
+      verify(app.draftSavedNotice.indexOf("needs an updated backend") >= 0)
+      verify(app.composeRecoveryUpdateNoticePending)
+      recoveryBackend.apiVersion = 3
+      tryVerify(function(){return lastNativeRequest("compose.recoveryRead") !== null})
+      lastNativeRequest("compose.recoveryRead").done({record:{active:false},revision:"initial"},null)
+      var refused = lastNativeRequest("compose.recoverySave")
+      verify(refused !== null)
+      refused.done(null,{message:"recovery_unavailable"})
+      verify(app.draftSavedNotice.indexOf("could not be saved") >= 0)
+      app.saveComposeRecovery({body:"Edited once more",accountId:"one@example.org"})
+      var durable = lastNativeRequest("compose.recoverySave")
+      verify(durable !== refused)
+      durable.done({record:durable.params.record,revision:"durable"},null)
+      compare(app.draftSavedNotice,"","the write answers the old backend warning it covered")
+    }
+    function test_native_recovery_retries_a_failed_save_without_another_edit_data() {
+      return [{tag:"the backend refused it",code:-32000,message:"recovery_unavailable"},
+              {tag:"the host never sent it",code:-32011,message:"Too many pending requests"}]
+    }
+    function test_native_recovery_retries_a_failed_save_without_another_edit(data) {
+      beginNativeRecovery()
+      app.saveComposeRecovery({body:"Keep local draft",accountId:"one@example.org"})
+      compare(recoveryBackend.requests.length,2)
+      recoveryBackend.requests[1].done(null,{code:data.code,message:data.message})
+      compare(app.composeRecoveryConflict,false)
+      verify(app.composeWriteQueued)
+      app.saveComposeRecovery({body:"Keep local draft",accountId:"one@example.org"})
+      compare(recoveryBackend.requests.length,2,"an unchanged draft produces no second write of its own")
+      tryVerify(function(){return recoveryBackend.requests.length === 3},3000,"the refused save retries on its own")
+      var retry = recoveryBackend.requests[2]
+      compare(retry.method,"compose.recoverySave")
+      compare(retry.params.record.draft.body,"Keep local draft")
+      compare(retry.params.expectedRevision,"initial")
+      retry.done({record:retry.params.record,revision:"durable"},null)
+      compare(app.composeWriteQueued,false)
+      compare(app.composeWritePayload,"")
+      compare(app.draftSavedNotice,"","a durable retry answers its save-failure warning")
+    }
+    function test_native_recovery_leaves_an_unanswered_save_to_the_reconnect() {
+      beginNativeRecovery()
+      app.saveComposeRecovery({body:"Keep local draft",accountId:"one@example.org"})
+      compare(recoveryBackend.requests.length,2)
+      // The host, not the backend: this write may have landed and lost only its
+      // answer, so sending it again on the same revision would collide with it.
+      recoveryBackend.requests[1].done(null,{code:-32010,message:"Backend unavailable"})
+      verify(app.composeWriteQueued)
+      wait(1200)
+      compare(recoveryBackend.requests.length,2,"an unanswered write is not replayed on a stale revision")
+      recoveryBackend.ready = false
+      recoveryBackend.ready = true
+      compare(recoveryBackend.requests.length,3)
+      compare(recoveryBackend.requests[2].method,"compose.recoveryRead",
+        "reconnecting reads the revision before it writes again")
+    }
+    function test_native_recovery_retry_that_finds_a_conflict_stops_there() {
+      beginNativeRecovery()
+      app.saveComposeRecovery({body:"Keep local draft",accountId:"one@example.org"})
+      recoveryBackend.requests[1].done(null,{code:-32000,message:"recovery_unavailable"})
+      tryVerify(function(){return recoveryBackend.requests.length === 3},3000)
+      recoveryBackend.requests[2].done(null,{code:-32000,message:"recovery_conflict"})
+      compare(app.composeRecoveryConflict,true)
+      wait(1200)
+      compare(recoveryBackend.requests.length,3,"a retry that meets another instance's record writes no more")
+      compare(app.composeRecovery.draft.body,"Keep local draft")
     }
     function test_ai_dock_reserves_space_and_escape_keeps_the_draft() {
       app.open("{}")
@@ -509,6 +792,32 @@ Item {
       tryCompare(body,"activeFocus",true)
     }
 
+    function test_open_ai_follows_reply_into_composer_data() {
+      return [{tag:"Reply",mode:"reply"},{tag:"Reply all",mode:"replyAll"}]
+    }
+    function test_open_ai_follows_reply_into_composer(data) {
+      app.open("{}")
+      var reader = named(app,"agent-prompt")
+      var draft = named(app,"compose-agent")
+      mailService.readerAgentJob = {id:"reader-chat",messageId:mailService.selectedId,
+        accountId:mailService.composeAccountId,state:"done",canContinue:true}
+      reader.openCenteredFor(mailService.selectedId,"Original message")
+      compare(reader.opened,true)
+      compare(reader.job.id,"reader-chat")
+      app.startCompose(data.mode)
+      compare(app.composing,true)
+      compare(reader.opened,false)
+      compare(draft.opened,true)
+      compare(app.assistantOpen,true)
+      compare(composeView().agentParentJobId,"reader-chat")
+      compare(draft.job.id,"reader-chat")
+    }
+    function test_closed_ai_stays_closed_when_replying() {
+      app.open("{}")
+      named(app,"agent-prompt").close()
+      app.startCompose("replyAll")
+      compare(app.assistantOpen,false)
+    }
     function test_ai_dock_resizes_from_left_edge_and_keeps_width() {
       app.open("{}")
       app.startCompose("new")
@@ -597,56 +906,82 @@ Item {
       mouseClick(toggle, toggle.width / 2, toggle.height / 2)
       tryCompare(dock, "opened", false)
     }
+    function test_unsupported_default_keeps_ai_visible_but_blocks_mouse_and_shortcut() {
+      app.open("{}")
+      app.backToList()
+      app.startCompose("new")
+      mailService.agentAvailable = false
+      var toggle = named(app, "header-ai-button")
+      tryVerify(function() { return toggle.visible })
+      verify(!toggle.enabled)
+      verify(toggle.tooltipText.indexOf("not supported") >= 0)
+      mouseClick(toggle, toggle.width / 2, toggle.height / 2)
+      app.runShortcut("askAgent", "Alt+G")
+      verify(!app.assistantOpen)
+      compare(mailService.agentRequests, 0)
+      mailService.agentAvailable = true
+      verify(toggle.enabled)
+      mouseClick(toggle, toggle.width / 2, toggle.height / 2)
+      tryCompare(app, "assistantOpen", true)
+    }
 
-    function test_ai_command_keys_fill_without_sending_and_escape_in_order() {
+    function test_ai_slash_text_uses_normal_send_and_close_keys() {
       app.open("{}")
       app.startCompose("new")
       app.runShortcut("askAgent", "Alt+G")
       var dock = named(app, "compose-agent")
       var field = named(dock, "agent-prompt-field")
       tryCompare(field, "activeFocus", true)
-      field.text = "/"
+      field.text = "/r"
       field.cursorPosition = field.length
-      tryCompare(dock, "commandsOpen", true)
-      tryCompare(named(app, "key-router"), "context", "assistantCommands")
-      wait(0)
-      keyClick(Qt.Key_Down)
-      compare(dock.commandIndex, 1, "Down must route to command selection")
-      keyClick(Qt.Key_Up)
-      compare(dock.commandIndex, 0, "Up must route to command selection")
-      keyClick(Qt.Key_Return)
-      tryCompare(dock, "commandsOpen", false)
-      verify(field.text.length > 1)
-      compare(field.text, "/review ")
-      compare(mailService.agentRequests, 0)
-      compare(field.activeFocus, true)
-      keyClick(Qt.Key_Backspace)
-      compare(field.text, "")
-      compare(dock.commandTokens.length, 0)
-      field.text = "/"
-      field.cursorPosition = field.length
-      tryCompare(dock, "commandsOpen", true)
+      tryCompare(named(app, "key-router"), "context", "assistant")
       keyClick(Qt.Key_Enter, Qt.ShiftModifier)
-      compare(field.text, "/\n")
+      compare(field.text, "/r\n")
       compare(mailService.agentRequests, 0)
       field.text = "/r"
-      tryCompare(dock, "commandsOpen", true)
       keyClick(Qt.Key_Enter)
-      tryCompare(dock, "commandsOpen", false)
-      compare(field.text, "/review ")
-      compare(mailService.agentRequests, 0)
-      field.clear()
-      field.text = "/"
-      tryCompare(dock, "commandsOpen", true)
+      compare(mailService.lastAgentPrompt, "/r")
+      compare(mailService.agentRequests, 1)
+      field.text = "/unknown"
       wait(0)
-      keyClick(Qt.Key_Escape)
-      tryCompare(dock, "commandsOpen", false)
-      compare(dock.opened, true)
       keyClick(Qt.Key_Escape)
       tryCompare(dock, "opened", false)
       compare(app.composing, true)
     }
 
+    function test_clear_suggestion_selects_before_executing() {
+      app.open("{}")
+      app.startCompose("new")
+      app.runShortcut("askAgent", "Alt+G")
+      var dock=named(app,"compose-agent")
+      var field=named(dock,"agent-prompt-field")
+      tryCompare(field,"activeFocus",true)
+      field.text="/"
+      tryCompare(dock,"commandsOpen",true)
+      tryCompare(named(app,"key-router"),"context","assistantCommands")
+      keyClick(Qt.Key_Return)
+      compare(field.text,"/clear ")
+      compare(dock.clearCommandStart,0)
+      compare(dock.commandsOpen,false)
+      compare(mailService.agentRequests,0)
+      keyClick(Qt.Key_Return)
+      compare(field.text,"")
+      compare(dock.clearCommandStart,-1)
+      compare(dock.opened,true)
+      compare(mailService.agentRequests,0)
+      field.text="/clear"
+      tryCompare(dock,"commandsOpen",true)
+      keyClick(Qt.Key_Return)
+      compare(field.text,"")
+      compare(mailService.agentRequests,0)
+      field.text="/cl"
+      tryCompare(dock,"commandsOpen",true)
+      keyClick(Qt.Key_Escape)
+      compare(dock.commandsOpen,false)
+      compare(dock.opened,true)
+      keyClick(Qt.Key_Escape)
+      compare(dock.opened,false)
+    }
     function test_ai_dock_allows_returning_to_draft_fields() {
       app.open("{}")
       app.startCompose("new")
@@ -686,6 +1021,28 @@ Item {
       compare(compose.opened, true)
       compare(named(compose, "compose-subject-field").text, "Quarterly plan")
       compare(named(compose, "compose-body-editor").text, "Keep every word")
+    }
+
+    function test_compose_shortcut_focuses_input_data() {
+      return [
+        { tag: "reply", key: Qt.Key_R, field: "compose-body-editor" },
+        { tag: "reply-all", key: Qt.Key_A, field: "compose-body-editor" },
+        { tag: "new", key: Qt.Key_C, field: "compose-to-field" },
+        { tag: "forward", key: Qt.Key_F, field: "compose-to-field" }
+      ]
+    }
+
+    function test_compose_shortcut_focuses_input(data) {
+      app.open("{}")
+      app.cursorId = "message-1"
+      wait(0)
+      keyClick(data.key)
+      var field = named(app, data.field)
+      tryCompare(field, "activeFocus", true)
+      compare(field.cursorPosition, 0)
+      keyClick(Qt.Key_H)
+      keyClick(Qt.Key_I)
+      compare(field.text.substring(0, 2), "hi")
     }
 
     function test_reply_starts_while_another_send_is_pending() {
@@ -1163,6 +1520,25 @@ Item {
       compare(app.currentView, "reader")
       compare(app.composing, false)
       app.back()
+      mailService.mailboxKey = "inbox"
+    }
+
+    function test_reader_offers_continue_editing_for_a_draft() {
+      app.open("{}")
+      mailService.mailboxKey = "drafts"
+      app.openMessage("draft-7")
+      mailService.selectedMessage = ({id:"draft-7",subject:"Saved subject",isDraft:true,
+        from:({email:"me@example.com"}),to:[],cc:[],bcc:[]})
+      mailService.selectedBody = ({text:"Saved body",source:"plain"})
+      mailService.detailPainted = true
+      mailService.detailLoading = false
+      wait(0)
+      var button = named(app,"reader-continue-draft-button")
+      verify(button && button.visible,"the reader must expose the draft's editing path")
+      button.clicked()
+      compare(app.composing,true)
+      compare(composeView().sourceDraftId,"draft-7")
+      composeView().finish()
       mailService.mailboxKey = "inbox"
     }
 

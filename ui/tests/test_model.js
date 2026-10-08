@@ -577,18 +577,17 @@ assert.strictEqual(model.truncate("a much longer string", 10), "a much lo…")
 assert.strictEqual(model.pluralize(1, "message"), "1 message")
 assert.strictEqual(model.pluralize(0, "message"), "0 messages")
 
-// A notification is markup to the daemons that draw it, and its two strings are
-// arguments to notify-send. Neither is a place for a sender's angle brackets or
-// for a display name that starts with a dash.
+// Model output is canonical plain text. Platform adapters escape only when
+// their final notification boundary accepts markup.
 {
   const crafted = {
     subject: "<img src=\"http://tracker.example.com/p.gif\">",
     snippet: "a & b",
     from: { display: "-u critical" }
   }
-  assert.ok(model.notificationBody(crafted).indexOf("<img") < 0)
-  assert.ok(model.notificationBody(crafted).indexOf("&amp;") > 0)
-  assert.strictEqual(model.notificationTitle(crafted), "u critical")
+  assert.ok(model.notificationBody(crafted).indexOf("<img") >= 0)
+  assert.ok(model.notificationBody(crafted).indexOf("a & b") >= 0)
+  assert.strictEqual(model.notificationTitle(crafted), "-u critical")
   assert.strictEqual(model.notificationTitle({ from: { display: "" } }), "New message")
   assert.strictEqual(model.notificationTitle(null), "New message")
 }
@@ -956,6 +955,57 @@ assert.strictEqual(model.detailSummary(grouped, {
   thread: { id: "d", count: 2, unread: false, flagged: false,
     memberIds: ["maaaaae", "maaaaaf"] }
 }).thread.count, 2)
+
+// A detail read answered from disk is older than what the account holds: the
+// file is the live read that first opened the message, and the quiet mark-read
+// that followed changed the store, not the file. The labels in hand win, and
+// the flags that mirror them follow.
+{
+  const fromDisk = {
+    id: "reply", subject: "Re: Lunch on Friday", snippet: "Yes",
+    unread: true, starred: false, inInbox: true, inTrash: false,
+    labelIds: ["INBOX", "UNREAD"],
+    thread: { id: "d", count: 0, unread: false, flagged: false, memberIds: [] }
+  }
+  const inHand = { id: "reply", unread: false, starred: true, labelIds: ["INBOX", "STARRED"] }
+  const painted = model.cachedDetailSummary(inHand, fromDisk)
+  deepEqual(painted.labelIds, ["INBOX", "STARRED"])
+  assert.strictEqual(painted.unread, false, "read a moment ago stays read")
+  assert.strictEqual(painted.starred, true)
+  assert.strictEqual(painted.inInbox, true)
+  assert.strictEqual(painted.subject, "Re: Lunch on Friday", "everything else is the file's")
+  assert.strictEqual(painted.snippet, "Yes")
+  assert.strictEqual(painted.thread.count, 0, "a member has no block in hand, so the file's stands")
+  deepEqual(fromDisk.labelIds, ["INBOX", "UNREAD"], "the file's summary is not written on")
+  // A representative's file carries the block as it was when the file was
+  // written; the row's block has been recomputed since from its members. The
+  // row's wins, and the flags are the conversation's as well as the labels',
+  // as `rowWithThread` has them — so a thread whose reply is still unread
+  // still reads unread from the representative's copy, as its live read does.
+  const filed = {
+    id: "rep", labelIds: ["INBOX", "UNREAD"], unread: true, starred: false,
+    thread: { id: "d", count: 2, unread: true, flagged: false, memberIds: ["rep", "reply"] }
+  }
+  const settled = { id: "rep", unread: false, starred: false, labelIds: ["INBOX"],
+    thread: { id: "d", count: 2, unread: false, flagged: false, memberIds: ["rep", "reply"] } }
+  const rep = model.cachedDetailSummary(settled, filed)
+  assert.strictEqual(rep.unread, false)
+  assert.strictEqual(rep.thread.unread, false, "the row's block replaced the file's")
+  const replyStillUnread = { ...settled, thread: { ...settled.thread, unread: true } }
+  assert.strictEqual(model.cachedDetailSummary(replyStillUnread, filed).unread, true)
+  // A count of 0 in hand is no block at all, so the file's stays.
+  assert.strictEqual(model.cachedDetailSummary({ ...settled, thread: { id: "d", count: 0, memberIds: [] } }, filed).thread.count, 2)
+  // A message moved since the file was written follows the move.
+  const moved = model.cachedDetailSummary({ id: "reply", labelIds: ["TRASH"] }, fromDisk)
+  assert.strictEqual(moved.inInbox, false)
+  assert.strictEqual(moved.inTrash, true)
+  // Nothing in hand — a message opened from a notification — leaves the file
+  // as the only account of the message there is; so does another message's.
+  assert.strictEqual(model.cachedDetailSummary(null, fromDisk), fromDisk)
+  assert.strictEqual(model.cachedDetailSummary({ id: "reply" }, fromDisk), fromDisk)
+  assert.strictEqual(model.cachedDetailSummary({ id: "other", labelIds: [] }, fromDisk), fromDisk)
+  assert.strictEqual(model.cachedDetailSummary(inHand, null), null)
+}
 
 // ------------------------------------------------------ a CLI-shaped sign-in
 //
@@ -1481,6 +1531,71 @@ const deep = { id: "m", a: { b: { c: { d: { e: 1 } } } } }
 const alsoDeep = { id: "m", a: { b: { c: { d: { e: 1 } } } } }
 assert.strictEqual(model.sameSummaries([deep], [alsoDeep]), false,
   "the comparison stops rather than following an unbounded structure")
+
+// ------------------------------------------------------------ reload depth
+
+// A first load is a page. A reload of a list Load more has extended asks for
+// the rows the view reached, so the answer replaces it at that depth rather
+// than at page one — which is what a poll, a push or F5 used to do.
+assert.strictEqual(model.reloadLimit(25, 0), 25)
+assert.strictEqual(model.reloadLimit(25, 25), 25)
+assert.strictEqual(model.reloadLimit(25, 50), 50, "two pages in, two pages back")
+assert.strictEqual(model.reloadLimit(25, 63), 63,
+  "rows trashed since do not round the depth down to a page")
+assert.strictEqual(model.reloadLimit(50, 150), 100, "bounded by the IMAP window")
+assert.strictEqual(model.reloadLimit(100, 300), 100)
+assert.strictEqual(model.reloadLimit(25, -5), 25)
+assert.strictEqual(model.reloadLimit(25, "nonsense"), 25)
+assert.strictEqual(model.reloadLimit(0, 40), 40, "a page of nothing still asks for what was shown")
+assert.strictEqual(model.reloadLimit(null, null), 1)
+
+// ---------------------------------------------------- conversation projection
+
+const adaT1 = { accountId: "ada@example.org", thread: { id: "t1" }, mailboxKey: "inbox" }
+assert.strictEqual(model.projectionKey(adaT1), JSON.stringify(["ada@example.org", "t1", "inbox"]))
+assert.strictEqual(model.projectionKey({ accountId: "ada@example.org", thread: { id: "t1" }, mailboxKey: "archive" }),
+  JSON.stringify(["ada@example.org", "t1", "archive"]),
+  "the same thread viewed from another mailbox is another rail")
+// All mailboxes leaves a thread's id as its provider gave it, so two accounts
+// in one merged view can each hold a `t1` in their Inbox. A reader moving from
+// one to the other is moving between two rails, and the key says so.
+const bobT1 = { accountId: "bob@example.net", thread: { id: "t1" }, mailboxKey: "inbox" }
+assert.strictEqual(model.projectionKey(bobT1), JSON.stringify(["bob@example.net", "t1", "inbox"]))
+assert.notStrictEqual(model.projectionKey(adaT1), model.projectionKey(bobT1),
+  "the same thread id in another account is another rail")
+assert.notStrictEqual(model.projectionKey({ accountId: "a", thread: { id: "b\nc" }, mailboxKey: "d" }),
+  model.projectionKey({ accountId: "a\nb", thread: { id: "c" }, mailboxKey: "d" }),
+  "and no id can run into the part beside it, whatever characters it carries")
+assert.strictEqual(model.projectionKey({ accountId: "ada@example.org", thread: null, mailboxKey: "inbox" }),
+  JSON.stringify(["ada@example.org", "", "inbox"]),
+  "a message outside any thread has no thread in its key")
+assert.strictEqual(model.projectionKey({ thread: { id: "t1" }, mailboxKey: "inbox" }),
+  JSON.stringify(["", "t1", "inbox"]), "a source naming no account is keyed without one")
+assert.strictEqual(model.projectionKey(null), JSON.stringify(["", "", ""]))
+assert.strictEqual(model.projectionKey({ accountId: "ada@example.org", thread: "t1" }),
+  JSON.stringify(["ada@example.org", "", ""]), "a thread that is not an object names nothing")
+
+const drawn = { showsRail: true, stops: [{ id: "a" }, { id: "b" }], caption: "2 messages",
+  navigation: { a: { next: "b" } }, memberIds: ["a", "b"], first: "b", last: "a" }
+deepEqual(model.pendingProjection(drawn, true),
+  { showsRail: true, stops: [{ id: "a" }, { id: "b" }], caption: "2 messages", navigation: {}, memberIds: ["a", "b"],
+    first: "", last: "" },
+  "the same rail keeps its stops and caption and loses the ways along it: the navigation, and the ends the keys fall back to")
+assert.notStrictEqual(model.pendingProjection(drawn, true), drawn, "as a new object, so the view notices")
+deepEqual(drawn.navigation, { a: { next: "b" } }, "and the one in hand is not written to")
+assert.strictEqual(drawn.first, "b")
+deepEqual(model.pendingProjection(drawn, false),
+  { showsRail: false, stops: [], caption: "", navigation: {}, memberIds: [] },
+  "a different rail starts from nothing")
+deepEqual(model.pendingProjection(null, true), { showsRail: false, stops: [], caption: "", navigation: {}, memberIds: [] })
+{
+  const one = model.pendingProjection(null, false)
+  const other = model.pendingProjection(null, false)
+  assert.notStrictEqual(one, other, "a blank is a fresh object each time")
+  assert.notStrictEqual(one.stops, other.stops, "down to its lists")
+  assert.notStrictEqual(one.navigation, other.navigation)
+  assert.notStrictEqual(one.memberIds, other.memberIds)
+}
 
 assert.strictEqual(model.activityStatus({}), "", "nothing in flight says nothing")
 assert.strictEqual(model.activityStatus({ sending: 1 }), "Sending")

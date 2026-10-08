@@ -3,6 +3,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "../message/Direction.js" as Direction
+import "../settings/Appearance.js" as Appearance
 import "../message/Html.js" as Html
 
 // Where mailboxes are managed.
@@ -27,6 +28,8 @@ Column {
   signal clientSetupRequested()
   signal addRequested()
   signal editRequested(int index)
+  signal openCalendarRequested()
+  signal calendarSignInRequested(int index)
 
   readonly property var accounts: service ? service.accountSummaries : []
   // A separate list on purpose: accountSummaries carries live mailbox state and
@@ -39,16 +42,22 @@ Column {
   // off the headings themselves, so a section that grows moves the ones
   // below it in the rail's map as well as on screen. The calendars section
   // is a component with its own heading, so its top stands in.
-  readonly property var sections: [
-    { key: "backend", title: "Mail backend", y: backendSetup.y },
-    { key: "bar", title: "Bar", y: barHeading.y },
-    { key: "reading", title: "Reading", y: readingHeading.y },
-    { key: "notifications", title: "Notifications", y: notificationsHeading.y },
-    { key: "writing", title: "Writing", y: writingHeading.y },
-    { key: "mailboxes", title: "Mailboxes", y: mailboxesHeading.y },
-    { key: "calendars", title: "Calendars", y: calendarsSection.y },
-    { key: "oauth", title: "Google OAuth client", y: oauthHeading.y }
-  ]
+  readonly property var sections: {
+    var values = [{ key: "backend", title: "Mail backend", y: backendSetup.y }]
+    if (!root.service || root.service.hasTray !== false)
+      values.push({ key: "bar", title: "Bar", y: barHeading.y })
+    if (root.service && root.service.hasMailto === true)
+      values.push({ key: "mailClient", title: "Default mail client", y: mailClientHeading.y })
+    values.push({ key: "reading", title: "Reading", y: readingHeading.y })
+    if (!root.service || root.service.hasNotifications !== false
+        || String(root.service.notificationError || "") !== "")
+      values.push({ key: "notifications", title: "Notifications", y: notificationsHeading.y })
+    values.push({ key: "writing", title: "Writing", y: writingHeading.y })
+    values.push({ key: "mailboxes", title: "Mailboxes", y: mailboxesHeading.y })
+    values.push({ key: "calendars", title: "Calendars", y: calendarsSection.y })
+    values.push({ key: "oauth", title: "Google OAuth client", y: oauthHeading.y })
+    return values
+  }
   readonly property var auth: service ? service.auth : null
 
   function signatureAccount(id) {
@@ -138,8 +147,11 @@ Column {
     importNote = ""
     importFailed = false
     importStage = "pick"
-    signatureImporter.command = [root.attachScript, "pick"]
-    signatureImporter.running = true
+    if (typeof service.chooseFiles !== "function") {
+      finishImport(JSON.stringify({ok:false,error:"No file picker is available"}))
+      return
+    }
+    service.chooseFiles(function(result) { root.finishImport(JSON.stringify(result || {})) })
   }
 
   function finishImport(text) {
@@ -155,8 +167,13 @@ Column {
       var paths = Array.isArray(result.paths) ? result.paths : []
       if (paths.length === 0) { importing = false; return }
       importStage = "read"
-      signatureImporter.command = [root.attachScript, "read", String(paths[0])]
-      signatureImporter.running = true
+      if (!service.backend || !service.backend.ready) {
+        finishImport(JSON.stringify({ok:false,error:"Mail backend unavailable"}))
+        return
+      }
+      service.backend.call("attachment.read", {path:String(paths[0])}, function(read, error) {
+        root.finishImport(JSON.stringify(error ? {ok:false,error:"That file could not be read"} : read))
+      })
       return
     }
     var mime = String(result.mimeType || "").toLowerCase()
@@ -197,17 +214,6 @@ Column {
     })
   }
 
-  readonly property string attachScript: {
-    return service && service.pluginDir ? String(service.pluginDir) + "/scripts/attachment.sh" : ""
-  }
-
-  Process {
-    id: signatureImporter
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: root.finishImport(String(stdout.text || ""))
-  }
-
   function saveSignature() {
     if (service && selectedSignatureAccountId !== "")
       service.setAccountSignature(selectedSignatureAccountId, signatureEdit.text)
@@ -238,7 +244,17 @@ Column {
     ensureSignatureAccount()
     ensureNameAccount()
   }
+  // The page is built with the window, before `service` is bound, and either
+  // half of the answer can change from a terminal while the window is open —
+  // so ask whenever the page comes into view, not once.
+  function refreshDefaultMailClient() {
+    if (visible && service && typeof service.refreshDefaultMailClient === "function")
+      service.refreshDefaultMailClient()
+  }
+  onServiceChanged: refreshDefaultMailClient()
+  onVisibleChanged: refreshDefaultMailClient()
   Component.onCompleted: {
+    refreshDefaultMailClient()
     renderSignaturePreview()
     ensureSignatureAccount()
     ensureNameAccount()
@@ -251,7 +267,8 @@ Column {
     width: parent.width
     runtime: root.service ? root.service.backendRuntime || null : null
     backendError: root.service && root.service.backend ? root.service.backend.failure : ""
-    diagnosisAvailable: !!root.service && typeof root.service.diagnoseError === "function"
+    diagnosisAvailable: !!root.service && root.service.hasAgent === true
+      && typeof root.service.diagnoseError === "function"
     diagnosing: !!root.service && !!root.service.diagnosing
     onDiagnosisRequested: root.service.diagnoseError()
     textColor: root.textColor
@@ -268,10 +285,86 @@ Column {
     font.bold: true
   }
 
+  // ------------------------------------------------------------ appearance
+  //
+  // Standalone only. The plugin's palette is the shell's, and the row would
+  // have nothing to change.
+
+  Text {
+    id: appearanceHeading
+    visible: !!root.service && root.service.hasAppearance === true
+    text: "APPEARANCE"
+    color: root.dimColor
+    font.family: root.panelFontFamily
+    font.pixelSize: Style.font.caption
+    font.letterSpacing: 1
+  }
+
+  Rectangle {
+    objectName: "appearance-settings"
+    visible: !!root.service && root.service.hasAppearance === true
+    width: parent.width
+    implicitHeight: Math.max(appearanceText.implicitHeight, appearanceTrack.implicitHeight)
+      + Style.space(16)
+    radius: Style.cornerRadius
+    color: Style.normalFillFor(root.textColor, root.accentColor)
+
+    Column {
+      id: appearanceText
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      anchors.right: appearanceTrack.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        width: parent.width
+        text: "Theme"
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        width: parent.width
+        text: "System follows the desktop's light or dark setting."
+        color: root.dimColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+    }
+
+    Rectangle {
+      id: appearanceTrack
+      objectName: "appearanceTrack"
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      width: appearanceSegments.implicitWidth
+      height: appearanceSegments.implicitHeight
+      radius: Style.cornerRadius
+      color: "transparent"
+      border.width: 1
+      border.color: Style.normalBorderFor(root.textColor, root.accentColor)
+
+      Row {
+        id: appearanceSegments
+        spacing: 0
+
+        AppearanceButton { text: Appearance.SYSTEM; mode: Appearance.SYSTEM; firstSegment: true }
+        AppearanceButton { text: Appearance.LIGHT; mode: Appearance.LIGHT }
+        AppearanceButton { text: Appearance.DARK; mode: Appearance.DARK }
+      }
+    }
+  }
+
   // ------------------------------------------------------------------- bar
 
   Text {
     id: barHeading
+    visible: !root.service || root.service.hasTray !== false
     text: "BAR"
     color: root.dimColor
     font.family: root.panelFontFamily
@@ -280,6 +373,8 @@ Column {
   }
 
   Rectangle {
+    objectName: "bar-settings"
+    visible: !root.service || root.service.hasTray !== false
     width: parent.width
     implicitHeight: Math.max(barIconText.implicitHeight, barIconSwitch.implicitHeight)
       + Style.space(16)
@@ -342,6 +437,96 @@ Column {
       foreground: root.textColor
       accent: root.accentColor
       onToggled: if (root.service) root.service.setShowBarIcon(!root.service.showBarIcon)
+    }
+  }
+
+  // --------------------------------------------------- default mail client
+  //
+  // Omarchy opens HEY's web app on SUPER+SHIFT+E, and mailto: links go to
+  // whatever claimed them. scripts/default-mail.sh moves both, and undoing it
+  // gives the key back to Omarchy.
+
+  Text {
+    id: mailClientHeading
+    visible: !!root.service && root.service.hasMailto === true
+    text: "DEFAULT MAIL CLIENT"
+    color: root.dimColor
+    font.family: root.panelFontFamily
+    font.pixelSize: Style.font.caption
+    font.letterSpacing: 1
+  }
+
+  Rectangle {
+    id: mailClientRow
+    objectName: "default-mail-client-settings"
+    visible: !!root.service && root.service.hasMailto === true
+    width: parent.width
+    implicitHeight: Math.max(mailClientText.implicitHeight, mailClientButton.implicitHeight)
+      + Style.space(16)
+    radius: Style.cornerRadius
+    color: Style.normalFillFor(root.textColor, root.accentColor)
+
+    readonly property bool isDefault: !!root.service
+      && root.service.defaultMailClient === "default"
+
+    Column {
+      id: mailClientText
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(12)
+      anchors.right: mailClientButton.left
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+
+      Text {
+        width: parent.width
+        text: mailClientRow.isDefault
+          ? "Omamail is the default mail client"
+          : "Set up Omamail as the default mail client"
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+      }
+
+      Text {
+        width: parent.width
+        text: "Opens mailto: links, SUPER+SHIFT+E, and SUPER+SHIFT+ALT+E for a new message."
+        color: root.dimColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+      }
+
+      Text {
+        width: parent.width
+        visible: text !== ""
+        text: root.service ? String(root.service.defaultMailClientError || "") : ""
+        color: root.urgentColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
+      }
+    }
+
+    IconTextButton {
+      id: mailClientButton
+      objectName: "defaultMailClientButton"
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(10)
+      anchors.verticalCenter: parent.verticalCenter
+      enabled: !!root.service && !root.service.defaultMailClientBusy
+        && root.service.defaultMailClient !== ""
+      text: mailClientRow.isDefault ? "Undo" : "Set as default"
+      tooltipText: mailClientRow.isDefault
+        ? "Give SUPER+SHIFT+E back to Omarchy's own email binding"
+        : "Make Omamail open mailto: links and SUPER+SHIFT+E"
+      foreground: root.textColor
+      fontFamily: root.panelFontFamily
+      onClicked: root.service.setDefaultMailClient(!mailClientRow.isDefault)
     }
   }
 
@@ -522,11 +707,23 @@ Column {
     }
   }
 
+  AiSettings {
+    objectName: "settings-ai"
+    visible: !!root.service && root.service.hasAgent !== false
+    width: parent.width
+    service: root.service
+    textColor: root.textColor
+    dimColor: root.dimColor
+    accentColor: root.accentColor
+    panelFontFamily: root.panelFontFamily
+  }
+
   // A look at every message opened, on the owner's behalf. Off until it is
   // turned on, because the message text leaves the window for the system
   // AI; the switch says in a word which way it stands.
   Rectangle {
     objectName: "settings-suggest-events"
+    visible: !!root.service && root.service.hasAgent !== false
     width: parent.width
     implicitHeight: Math.max(suggestText.implicitHeight, suggestSwitch.implicitHeight)
       + Style.space(16)
@@ -553,7 +750,7 @@ Column {
 
       Text {
         width: parent.width
-        text: "Uses the system AI: a message from a person that names a time is "
+        text: "Uses the selected AI agent and model: a message from a person that names a time is "
           + "sent to it once when opened, which spends tokens. Notifications, "
           + "newsletters and lists are skipped. Nothing is written until you Add."
         color: root.dimColor
@@ -608,6 +805,8 @@ Column {
 
   Text {
     id: notificationsHeading
+    visible: !root.service || root.service.hasNotifications !== false
+      || String(root.service.notificationError || "") !== ""
     text: "NOTIFICATIONS"
     color: root.dimColor
     font.family: root.panelFontFamily
@@ -616,6 +815,8 @@ Column {
   }
 
   Rectangle {
+    objectName: "notification-settings"
+    visible: !root.service || root.service.hasNotifications !== false
     width: parent.width
     implicitHeight: Math.max(notifyText.implicitHeight, notifySwitch.implicitHeight)
       + Style.space(16)
@@ -660,6 +861,18 @@ Column {
       onToggled: if (root.service)
         root.service.setNotifyNewMail(!root.service.notifyNewMail)
     }
+  }
+
+  Text {
+    objectName: "notificationIntegrationError"
+    width: parent.width
+    visible: text !== ""
+    text: root.service ? String(root.service.notificationError || "") : ""
+    color: root.urgentColor
+    font.family: root.panelFontFamily
+    font.pixelSize: Style.font.caption
+    wrapMode: Text.WordWrap
+    textFormat: Text.PlainText
   }
 
   // --------------------------------------------------------------- writing
@@ -1129,6 +1342,14 @@ Column {
     accentColor: root.accentColor
     urgentColor: root.urgentColor
     panelFontFamily: root.panelFontFamily
+    onAccountSetupRequested: function(index) {
+      if (index < 0) return
+      if (root.accounts[index].calendarProvider === "google") root.calendarSignInRequested(index)
+      else root.editRequested(index)
+    }
+    onClientSetupRequested: root.clientSetupRequested()
+    onAddAccountRequested: root.addRequested()
+    onOpenCalendarRequested: root.openCalendarRequested()
   }
 
   PanelSeparator {
@@ -1162,7 +1383,7 @@ Column {
       Text {
         width: parent.width
         text: root.auth && root.auth.credentialsPresent
-          ? String(root.auth.clientDescription || "Google OAuth client") : "No client yet"
+          ? "Google client configured" : "Google client setup required"
         color: root.textColor
         font.family: root.panelFontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1173,7 +1394,7 @@ Column {
         width: parent.width
         // Every mailbox signs in through this one client, which is why adding
         // an account never asks for another.
-        text: "Shared by every mailbox above"
+        text: "Advanced setup · shared by Gmail and Google Calendar accounts"
         color: root.dimColor
         font.family: root.panelFontFamily
         font.pixelSize: Style.font.caption
@@ -1189,6 +1410,29 @@ Column {
       foreground: root.dimColor
       fontFamily: root.panelFontFamily
       onClicked: root.clientSetupRequested()
+    }
+  }
+
+  // One of the three palettes the standalone window can draw with.
+  component AppearanceButton: Button {
+    required property string mode
+    property bool firstSegment: false
+    objectName: "appearance-" + mode.toLowerCase()
+    selected: !!root.service && root.service.appearance === mode
+    bordered: false
+    foreground: selected ? root.textColor : root.dimColor
+    accent: root.accentColor
+    fontFamily: root.panelFontFamily
+    fontSize: Style.font.caption
+    horizontalPadding: Style.space(7)
+    verticalPadding: Style.space(3)
+    onClicked: if (root.service) root.service.setAppearance(mode)
+
+    Rectangle {
+      visible: !parent.firstSegment
+      width: 1
+      height: parent.height
+      color: appearanceTrack.border.color
     }
   }
 

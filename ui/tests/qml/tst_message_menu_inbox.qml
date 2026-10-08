@@ -43,6 +43,7 @@ Item {
     target: menu
     signalName: "actionRequested"
   }
+  SignalSpy { id: composeSpy; target: menu; signalName: "composeRequested" }
 
   TestCase {
     name: "MessageMenuInbox"
@@ -51,8 +52,9 @@ Item {
     // The rows have no objectName, so they are found by position in the array
     // the cursor itself indexes — which is also the thing that has to contain
     // the new row at all.
-    function unarchiveRow() { return menu.menuRows[4] }
-    function archiveRow() { return menu.menuRows[3] }
+    function continueRow() { return menu.menuRows[0] }
+    function unarchiveRow() { return menu.menuRows[5] }
+    function archiveRow() { return menu.menuRows[4] }
 
     // The popup builds its rows only once opened, so nothing about their
     // visibility is readable before that.
@@ -61,6 +63,7 @@ Item {
       fakeService.rawLabelId = ""
       menu.close()
       actionSpy.clear()
+      composeSpy.clear()
       menu.openAt(String(summary.id), 100, 100)
       wait(20)
     }
@@ -90,6 +93,18 @@ Item {
       compare(menu.archived, false)
       compare(unarchiveRow().visible, false)
       compare(archiveRow().visible, true)
+    }
+
+    function test_a_draft_offers_continue_editing() {
+      var summary = archivedMessage()
+      summary.isDraft = true
+      show(summary)
+      compare(continueRow().visible,true)
+      compare(continueRow().text,"Continue editing")
+      continueRow().activated()
+      compare(composeSpy.count,1)
+      compare(composeSpy.signalArguments[0][0],"draft")
+      compare(composeSpy.signalArguments[0][1],"m1")
     }
 
     // The four that have their own verb or their own place. Adding INBOX to any

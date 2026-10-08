@@ -224,7 +224,7 @@ grep -q 'bar ? bar\.barForeground' BarWidget.qml \
   || fail "the bar icon must follow bar.barForeground in transparent mode"
 grep -q 'markColor: root.accent' App.qml \
   || fail "the Omamail header M must use the active theme accent"
-grep -q 'markColor: Color.accent' BarWidget.qml \
+grep -q 'markColor: Commons.Color.accent' BarWidget.qml \
   || fail "the bar M must use the active theme accent"
 
 # IconTextButton has no separate hover glyph colour. Assigning one makes the
@@ -325,13 +325,7 @@ if grep -vE '^[[:space:]]*//' App.qml | grep -n 'focusScope\.forceActiveFocus'; 
   fail "forceActiveFocus on the focus scope re-elects the field being left; park the keyboard instead"
 fi
 
-# A component that declares `focus: true` owns the window's focus even while it
-# is invisible, and an owner that accepts keys is a sink for everything routed
-# by focus rather than by Shortcut. ComposeView is instantiated whether or not
-# anyone is writing, so an unconditional focus there swallowed every Escape in
-# the window. Focus must follow "in use".
-grep -q '^  focus: root.opened$' components/ComposeView.qml \
-  || fail "ComposeView must own the focus only while it is open"
+# Hidden items can still hold focus; the key context owns focus placement.
 if grep -rn '^\s*focus: true\s*$' components/ComposeView.qml; then
   fail "ComposeView must not hold the focus unconditionally"
 fi
@@ -357,16 +351,16 @@ for icon in chevronLeft chevronRight chevronDown mail; do
     fail "Icons.js does not define the $icon icon"
   fi
 done
-grep -q 'text: "Week"' components/CalendarView.qml \
-  || fail "the calendar needs a week-view control"
+grep -q 'objectName: "calendar-view-selector"' components/CalendarView.qml \
+  || fail "the calendar needs a view dropdown"
 python3 - <<'PY'
 from pathlib import Path
 text = Path("components/CalendarView.qml").read_text()
-if text.index('text: "Week"') > text.index('text: "Month"'):
+if '["Day", "Week", "Month", "Agenda"]' not in text:
     raise SystemExit("test_source.sh: Week must appear before Month in the view switcher")
-if 'text: "Go to today"' not in text:
+if 'text: "Today"' not in text or 'onClicked: root.goToday()' not in text:
     raise SystemExit("test_source.sh: Today must read as a navigation action")
-today = text.index('text: "Go to today"')
+today = text.index('text: "Today"')
 right = text.index('anchors.right: parent.right')
 if today > right:
     raise SystemExit("test_source.sh: Go to today must sit with the date on the left")
@@ -437,7 +431,7 @@ text = Path("App.qml").read_text()
 header = text[text.index("id: headerRight"):text.index("PanelSeparator {", text.index("id: headerRight"))]
 if "spacing: Style.space(8)" not in header:
     raise SystemExit("test_source.sh: refresh needs breathing room before the header action")
-for name in ("create-event-button", "compose-button"):
+for name in ("compose-button",):
     marker = 'objectName: "' + name + '"'
     start = text.index(marker)
     opening = text.rfind("\n          Button {", 0, start)
@@ -462,7 +456,8 @@ app = Path("App.qml").read_text()
 sidebar_use = app[app.index("id: sidebar"):app.index("MailboxTabs {")]
 if "!root.calendarVisible" in sidebar_use or "calendarSelected: root.calendarVisible" not in sidebar_use:
     raise SystemExit("test_source.sh: the mailbox sidebar must remain visible and select Calendar")
-header = app[app.index("id: headerRight"):app.index("// mailbox as a whole")]
+header_start = app.index("id: headerRight")
+header = app[header_start:app.index("PanelSeparator {", header_start)]
 if 'iconName: root.calendarVisible ? "mail" : "calendar"' in header:
     raise SystemExit("test_source.sh: Calendar navigation belongs in the sidebar, not the header")
 
@@ -483,12 +478,12 @@ if "calendarTodayBackgroundColor: root.calendarTodayBackground" not in app:
     raise SystemExit("test_source.sh: App must pass the system Today background token")
 if "readonly property color calendarBorder: Style.normalBorderColor" not in app:
     raise SystemExit("test_source.sh: calendar borders must originate from the system border token")
-if "readonly property color calendarTodayBackground: Style.selectedAccentFill" not in app:
+if "readonly property color calendarTodayBackground: Qt.alpha(root.accent, 0.035)" not in app:
     raise SystemExit("test_source.sh: Today must use the quieter system accent fill token")
 if "calendarBorderWidth: root.calendarBorderWidth" not in app:
     raise SystemExit("test_source.sh: App must pass the system calendar border width")
-if "border.color: root.calendarBorderColor" not in calendar or "border.width: root.calendarBorderWidth" not in calendar:
-    raise SystemExit("test_source.sh: month cells must consume the themed calendar border")
+if "color: Qt.alpha(root.calendarBorderColor, 0.25)" not in calendar or "width: root.calendarBorderWidth" not in calendar or "height: root.calendarBorderWidth" not in calendar:
+    raise SystemExit("test_source.sh: month dividers must consume the themed calendar border")
 if "? root.calendarTodayBackgroundColor" not in calendar:
     raise SystemExit("test_source.sh: the Month Today cell must consume the themed background")
 if ("calendarBorderColor: root.calendarBorderColor" not in calendar
@@ -504,8 +499,8 @@ grep -q 'function setSourceColor' calendar/CalendarController.qml \
   || fail "calendar colors must persist through the controller"
 grep -q 'property bool sourcesLoaded' calendar/CalendarController.qml \
   || fail "calendar refresh must wait for the saved source list"
-grep -q 'if (firstLoad && root.rangeStart && root.rangeEnd)' calendar/CalendarController.qml \
-  || fail "calendar events must load automatically after startup source discovery"
+grep -q 'onEnabledSourceKeyChanged: reloadVisibleRange()' calendar/CalendarController.qml \
+  || fail "calendar events must load automatically when a source is discovered"
 grep -q 'function onSourcesLoadedChanged' components/CalendarView.qml \
   || fail "the calendar view must refresh when its saved sources become ready"
 grep -q 'property double pendingRangeStart' calendar/CalendarController.qml \
@@ -533,7 +528,7 @@ service = Path("Service.qml").read_text()
 if "readonly property var pendingSendHost" not in service:
     raise SystemExit("test_source.sh: an undoable send must remain reachable across accounts")
 PY
-grep -q 'allDayEventsOnDay' components/WeekCalendarView.qml \
+grep -q 'Calendar.displayInAllDayLane' components/WeekCalendarView.qml \
   || fail "all-day events must have a pinned week-view lane"
 grep -q 'signal createAt' components/WeekCalendarView.qml \
   || fail "empty week slots must start event creation"
@@ -587,9 +582,9 @@ grep -q 'leaving.kind === "calendarDetail"' App.qml \
 if grep -q 'Shortcut { sequence: "Escape"' components/CalendarEventComposer.qml; then
   fail "event creation must use the central Escape route, not an ambiguous duplicate"
 fi
-grep -q 'text: "Make recurring"' components/CalendarEventComposer.qml \
+grep -q 'objectName: "event-repeat-selector"' components/CalendarEventComposer.qml \
   || fail "event creation needs an optional recurrence section"
-grep -q 'text: "Add a calendar"' components/CalendarSettings.qml \
+grep -q 'text: "Connect a CalDAV calendar\.\.\."' components/CalendarSettings.qml \
   || fail "settings must let a user add a calendar"
 grep -q 'placeholderText: "Calendar name"' components/CalendarSettings.qml \
   || fail "calendar setup needs a name field"
@@ -700,10 +695,12 @@ awk '
   || fail "a conversation member must not be given the row's thread block"
 grep -q 'if (ids.length > 0) progress({' providers/ImapClient.qml \
   || fail "IMAP search windows must report ids before the final page"
-grep -q 'UID FETCH \*:\* (UID)' ../src/providers/imap/read.rs \
-  || fail "native IMAP search must read its highest UID before a complete snapshot"
-grep -q 'sparse_search_emits_numeric_prefix_then_snapshot_continuation' ../src/providers/imap/read/tests.rs \
-  || fail "native sparse search needs a tested snapshot continuation"
+grep -q 'UID FETCH {set} (UID INTERNALDATE)' ../src/providers/imap/read.rs \
+  || fail "native IMAP paging must read arrival dates in bounded UID batches"
+grep -q 'sparse_search_orders_by_date_before_paging_even_when_progressive' ../src/providers/imap/read/tests.rs \
+  || fail "native sparse search needs tested date-ordered pagination"
+grep -q 'multi_window_dates_settle_before_paging_and_ignore_unsolicited_flags' ../src/providers/imap/read/tests.rs \
+  || fail "native IMAP ordering needs a bounded multi-window network regression"
 grep -q 'continuation' ../src/providers/imap/read.rs \
   || fail "native streamed IMAP reads must continue through opaque bounded batches"
 grep -q 'fetchQueue\.push(wanted)' account/MailAccount.qml \
@@ -763,7 +760,7 @@ awk '
   END { exit !(checks_ids && clears_page) }
 ' account/MailAccount.qml \
   || fail "ordinary metadata reads must detect holes and close paging"
-grep -q 'Err(error) => return Err(error)' ../src/providers/imap/read.rs \
+grep -Fq 'let (mut matches, dates) = scan?;' ../src/providers/imap/read.rs \
   || fail "an IMAP failure before SEARCH answers must keep the cached preview"
 grep -q 'callback(ordered, firstError)' providers/GmailApiClient.qml \
   || fail "Gmail must report partial metadata failures"
@@ -1070,6 +1067,8 @@ oversized=$(cd ..
       [ -f "$file" ] || continue
       case "$file" in
         (preview.png) ceiling=$preview_limit ;;
+        (app/assets/fonts/SymbolsNerdFontMono-Regular.ttf) ceiling=2610012 ;;
+        (app/resources/macos/omamail.icns) ceiling=111809 ;;
         (*) ceiling=$limit ;;
       esac
       size=$(wc -c < "$file")
@@ -1081,6 +1080,47 @@ if [ -n "$oversized" ]; then
   printf '%s\n' "$oversized" >&2
   fail "the files above are over their size ceiling; keep large assets out of the clone"
 fi
+
+# The standalone host embeds one exact upstream Nerd Fonts icon asset. Keep its
+# exception tied to reviewed bytes and to the provenance shipped beside it; a
+# different font must update all three deliberately.
+font_provenance=app/assets/fonts/NerdFonts-PROVENANCE.md
+[ -f "../$font_provenance" ] || fail "bundled fonts must record their provenance"
+while read -r expected file; do
+  actual=$(cd .. && shasum -a 256 "$file" | awk '{print $1}')
+  [ "$actual" = "$expected" ] || fail "$file does not match its reviewed upstream checksum"
+  grep -q "$expected" "../$font_provenance" \
+    || fail "$file checksum is missing from its shipped provenance"
+done <<'FONT_CHECKSUMS'
+fe471e538392f51910faab985fa8e192a39dd3426125edd15b71b3680df0e749 app/assets/fonts/SymbolsNerdFontMono-Regular.ttf
+FONT_CHECKSUMS
+
+# The macOS bundle icon is generated from the small reviewed SVG beside it.
+# Keep the binary exception pinned to its exact bytes and documented recipe;
+# changing the artwork or encoder must be an explicit review rather than an
+# accidental expansion of the repository-wide asset ceiling.
+icon_provenance=app/resources/macos/ICON-PROVENANCE.md
+[ -f "../$icon_provenance" ] || fail "the macOS icon must record its provenance"
+mac_icon=app/resources/macos/omamail.icns
+[ "$(cd .. && wc -c < "$mac_icon")" -eq 111809 ] \
+  || fail "$mac_icon does not match its reviewed byte size"
+mac_icon_checksum=bd29ce1e72aa9db37ed5b1cb930956d2d933dc4426e7cea7f1b8baf2edb9262d
+actual_mac_icon_checksum=$(cd .. && shasum -a 256 "$mac_icon" | awk '{print $1}')
+[ "$actual_mac_icon_checksum" = "$mac_icon_checksum" ] \
+  || fail "$mac_icon does not match its reviewed checksum"
+grep -q "$mac_icon_checksum" "../$icon_provenance" \
+  || fail "$mac_icon checksum is missing from its shipped provenance"
+grep -q '1277a2cf247b275a15961fb20175420abb5dfc5489acb95313f4f604c09b6e78' "../$icon_provenance" \
+  || fail "the macOS icon source checksum is missing from its shipped provenance"
+windows_icon=app/resources/windows/omamail.ico
+windows_icon_checksum=2562966adb272711ae0274f7eade7ef2680781bb4405182280a310658752131d
+actual_windows_icon_checksum=$(cd .. && shasum -a 256 "$windows_icon" | awk '{print $1}')
+[ "$actual_windows_icon_checksum" = "$windows_icon_checksum" ] \
+  || fail "$windows_icon does not match its reviewed checksum"
+grep -q "$windows_icon_checksum" "../$icon_provenance" \
+  || fail "$windows_icon checksum is missing from its shipped provenance"
+grep -q '3c780a0881ca98ffb717eb2877bf2e8a877deb9ddc3593a2bcca1d19139616e4' "../$icon_provenance" \
+  || fail "the canonical Omamail logo checksum is missing from icon provenance"
 
 # The compose form, account boundary and raw-message builder must keep the
 # selected send-as address all the way to the provider. A missing link silently
@@ -1311,3 +1351,9 @@ if unknown:
                      + ", ".join(m + " (" + ", ".join(sorted(called[m])) + ")" for m in unknown))
 
 CONTRACTCALLS
+# Credential metadata and secret values cross one typed backend RPC. Provider
+# and calendar QML must never regain a platform command or keyring helper.
+if grep -E 'secret-tool|scripts/keyring-(lookup|store|clear)\.sh' \
+    providers/*.qml calendar/*.qml >/dev/null; then
+  fail "QML credential paths must use the typed backend credential RPC"
+fi

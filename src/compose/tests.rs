@@ -1,8 +1,9 @@
 use super::*;
+use std::io::Write;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        let p = std::env::temp_dir().join(format!(
+        let p = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "omamail-compose-test-{}-{}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
@@ -19,6 +20,70 @@ impl Drop for Temp {
 fn saved(body: &str) -> Value {
     json!({"version":1,"active":true,"returnView":"reader","draft":{"body":body,"accountId":"one@example.org"}})
 }
+#[test]
+fn reply_quote_survives_active_and_parked_durable_recovery() {
+    let temp = Temp::new();
+    let quote = "On Monday, 合成 wrote:\r\n> \"quoted\" \\ text\n";
+    let mut value = saved(&format!("Reply\n\n{quote}"));
+    value["draft"]["bodyQuote"] = json!(quote);
+    value["parked"] = json!([
+        {"body":"Edited quote is still editable", "bodyQuote":quote},
+        {"body":"Legacy snapshot"},
+        {"body":"Explicit empty quote", "bodyQuote":""}
+    ]);
+    let answer = call_at(
+        &temp.0,
+        "compose.recoverySave",
+        &json!({
+            "record":value, "expectedRevision":revision(&[])
+        }),
+    )
+    .unwrap();
+    assert_eq!(answer["record"]["draft"]["bodyQuote"], quote);
+    assert_eq!(answer["record"]["parked"][0]["bodyQuote"], quote);
+    assert!(answer["record"]["parked"][1].get("bodyQuote").is_none());
+    assert_eq!(answer["record"]["parked"][2]["bodyQuote"], "");
+    assert_eq!(
+        call_at(&temp.0, "compose.recoveryRead", &json!({})).unwrap(),
+        answer
+    );
+}
+
+#[test]
+fn invalid_or_oversized_reply_quote_never_writes_recovery() {
+    for (quote, error) in [
+        (json!(null), "recovery_invalid"),
+        (json!(true), "recovery_invalid"),
+        (json!(1), "recovery_invalid"),
+        (json!([]), "recovery_invalid"),
+        (json!({}), "recovery_invalid"),
+        (json!("x".repeat(MAX_BYTES + 1)), "recovery_too_large"),
+        // Even a field under its own bound must obey the total record bound.
+        (json!("x".repeat(MAX_BYTES - 1)), "recovery_too_large"),
+    ] {
+        for parked in [false, true] {
+            let temp = Temp::new();
+            let mut value = saved("Keep me");
+            if parked {
+                value["parked"] = json!([{"body":"Parked", "bodyQuote":quote}]);
+            } else {
+                value["draft"]["bodyQuote"] = quote.clone();
+            }
+            assert_eq!(
+                call_at(
+                    &temp.0,
+                    "compose.recoverySave",
+                    &json!({
+                        "record":value, "expectedRevision":revision(&[])
+                    })
+                ),
+                Err(error)
+            );
+            assert!(!temp.0.join("omamail").exists());
+        }
+    }
+}
+
 #[test]
 fn user_edit_history_survives_durable_recovery_including_an_emptied_draft() {
     let temp = Temp::new();
@@ -86,6 +151,7 @@ fn meaningful_body_history_and_parked_identity_survive() {
     assert_eq!(record["parked"].as_array().unwrap().len(), 1);
     assert_eq!(record["parked"][0]["accountId"], "imap:two@example.org");
 }
+#[cfg(unix)]
 #[test]
 fn snapshots_are_private_atomic_and_stale_clear_cannot_erase_newer_draft() {
     use std::os::unix::fs::PermissionsExt;
@@ -131,6 +197,7 @@ fn snapshots_are_private_atomic_and_stale_clear_cannot_erase_newer_draft() {
     .unwrap();
     assert_eq!(cleared["record"], empty());
 }
+#[cfg(unix)]
 #[test]
 fn links_never_read_write_or_modify_outside_target() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -271,6 +338,7 @@ fn delivery_receipts_survive_recovery_without_changing_legacy_empty_fields() {
     assert!(normalize(&value).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn recovery_lock_releases_even_with_an_inherited_file_description() {
     let temp = Temp::new();
@@ -287,7 +355,9 @@ fn recovery_lock_releases_even_with_an_inherited_file_description() {
         0
     );
     let inherited = file.try_clone().unwrap();
-    drop(RecoveryLock(file));
+    drop(crate::platform::private_fs::ExclusiveLock::from_locked(
+        file,
+    ));
     let contender = File::open(&path).unwrap();
     assert_eq!(
         unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },

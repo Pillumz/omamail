@@ -9,6 +9,7 @@ import "../message/Direction.js" as Direction
 import "../message/Message.js" as Mail
 import "../compose/Recipients.js" as Recipients
 import "../compose/Senders.js" as Senders
+import "../agent/Agent.js" as Agent
 
 // Composing takes over the whole content area of the one window rather than
 // opening a second one: Omarchy's panel mechanism would give an extra window
@@ -37,6 +38,7 @@ DropArea {
 
   property bool opened: false
   property bool userModified: false
+  property bool settingBodyText: false
   // Drafts parked for their send's undo window, oldest first, each beside
   // the name of the send it belongs to. The timer owns them while the
   // visible composer stays free for the next message.
@@ -99,8 +101,64 @@ DropArea {
   property string draftKey: newDraftKey()
   function newDraftKey() { return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2) }
   function currentFields() {
-    return ({ to: toField.text, subject: subjectField.text, body: bodyEdit.text,
-      from: fromEmail, accountId: accountId, draftId: sourceDraftId, draftKey: draftKey })
+    return ({ to: toField.text, cc: ccField.text, bcc: bccField.text,
+      subject: subjectField.text, body: Agent.replyOnly(bodyEdit.text, retainedReplyQuote()),
+      from: fromEmail, accountId: accountId, draftId: sourceDraftId, draftKey: draftKey, replyMessageId: replyMessageId,
+      envelope: outgoingEnvelope() })
+  }
+
+  property string agentParentJobId: ""
+  property string replyMessageId: ""
+  function retainedReplyQuote() {
+    if (mode !== "reply" && mode !== "replyAll") return ""
+    return Agent.replyOnly(bodyEdit.text, bodyQuote) !== bodyEdit.text ? bodyQuote : ""
+  }
+  function outgoingEnvelope() {
+    if (forwardAttachmentsLoading || forwardAttachmentError !== "" || attachmentHostPending || attachmentReadPending || attachJobs.length > 0) return null
+    return {accountId: accountId, draftKey: draftKey, from: fromEmail,
+      to: toField.text, cc: ccField.text, bcc: bccField.text, replyTo: replyToField.text,
+      subject: subjectField.text, body: bodyEdit.text,
+      attachments: JSON.parse(JSON.stringify(allOutgoingAttachments())), draftId: sourceDraftId,
+      threadId: mode === "forward" ? "" : threadId, inReplyTo: mode === "forward" ? "" : inReplyTo,
+      replyMessageId: replyMessageId, replyQuote: retainedReplyQuote()}
+  }
+  function beginProposal(envelope, parentId) {
+    begin("new", null, "", [])
+    restoreDraft(Agent.proposalDraft(envelope, parentId, draftKey))
+  }
+  function applyProposal(envelope) {
+    if (!opened || String(envelope.accountId) !== accountId) return false
+    if (envelope.draftKey ? String(envelope.draftKey) !== draftKey
+        : !replyMessageId || String(envelope.replyMessageId || "") !== replyMessageId) return false
+    bodyQuote = String(envelope.replyQuote || "")
+    subjectField.text = String(envelope.subject)
+    replaceBody(envelope.body)
+    return true
+  }
+  function sendProposal(envelope, proposalId, parentId) {
+    if (!service || proposalRoutingChanged(envelope)) return false
+    // Prepare a real recovery draft before dispatch, without replacing newer
+    // manual edits. Undo and failures use the same parked-draft path as Send.
+    var draft = Agent.proposalDraft(envelope, parentId, String(envelope.draftKey || newDraftKey()))
+    var accepted = service.sendAgentProposal(proposalId, fieldsForDraft(draft))
+    if (!accepted) return false
+    parkDraftForSend(String(accepted), draft)
+    return accepted
+  }
+
+  function proposalRoutingChanged(envelope) {
+    if (!opened || !envelope) return false
+    // An unrelated parked draft does not own a reader's proposal. A matching
+    // draft/reply does: never send its old routing after the owner edits it.
+    var sameDraft = envelope.draftKey ? String(envelope.draftKey) === draftKey
+      : replyMessageId !== "" && String(envelope.replyMessageId || "") === replyMessageId
+    if (!sameDraft) return false
+    return String(envelope.accountId || "") !== accountId
+      || String(envelope.from || "") !== fromEmail
+      || String(envelope.to || "") !== toField.text
+      || String(envelope.cc || "") !== ccField.text
+      || String(envelope.bcc || "") !== bccField.text
+      || String(envelope.replyTo || "") !== replyToField.text
   }
 
   function replaceBody(text) {
@@ -145,6 +203,12 @@ DropArea {
     draftChanged()
   }
 
+  function setBodyText(value) {
+    settingBodyText = true
+    bodyEdit.text = value
+    settingBodyText = false
+  }
+
   function hasUserChanges() { return userModified }
 
   onAccountIdChanged: noteDraftChanged()
@@ -158,14 +222,9 @@ DropArea {
   onDraftAttachmentsChanged: noteDraftChanged()
   onForwardedAttachmentsChanged: noteDraftChanged()
 
-  readonly property string attachScript: service && service.pluginDir
-    ? service.pluginDir + "/scripts/attachment.sh" : ""
-  readonly property string composeDir: {
-    var cache = Quickshell.env("XDG_CACHE_HOME")
-    var home = Quickshell.env("HOME")
-    var rootDir = cache !== "" ? cache : (home + "/.cache")
-    return rootDir + "/omamail/compose"
-  }
+  readonly property string composeDir: service && typeof service.cachePath === "function"
+    ? service.cachePath("compose") : ""
+  property bool attachmentHostPending: false
 
   readonly property var contactBook: root.service
     && Array.isArray(root.service.recipientContacts)
@@ -204,6 +263,8 @@ DropArea {
   }
 
   function clearCurrentDraft(forgetAttachments) {
+    agentParentJobId = ""
+    replyMessageId = ""
     composeTextSerial++
     pendingQuoteSummary = null
     pendingQuoteText = ""
@@ -219,7 +280,7 @@ DropArea {
     bccField.text = ""
     replyToField.text = ""
     subjectField.text = ""
-    bodyEdit.text = ""
+    setBodyText("")
     placedBody = ""
     bodyWasEdited = false
     bodyPrefix = ""
@@ -281,7 +342,7 @@ DropArea {
       root.pendingQuoteSummary = null
       root.pendingQuoteText = ""
       root.placedBody = root.bodyPrefix + String(result.body || "")
-      bodyEdit.text = root.placedBody
+      root.setBodyText(root.placedBody)
       if (params.summary && (root.mode === "reply" || root.mode === "replyAll") && subjectField.text === previousSubject)
         subjectField.text = String(result.replySubject || previousSubject)
     })
@@ -299,12 +360,15 @@ DropArea {
   function snapshotDraft() {
     return ({
       draftKey: draftKey,
+      replyMessageId: replyMessageId,
+      agentParentJobId: agentParentJobId,
       to: toField.text,
       cc: ccField.text,
       bcc: bccField.text,
       replyTo: replyToField.text,
       subject: subjectField.text,
       body: bodyEdit.text,
+      bodyQuote: bodyQuote,
       placedBody: placedBody,
       bodyWasEdited: bodyWasEdited,
       userModified: userModified,
@@ -328,6 +392,8 @@ DropArea {
   function restoreDraft(draft) {
     var saved = draft || ({})
     draftKey = String(saved.draftKey || newDraftKey())
+    replyMessageId = String(saved.replyMessageId || "")
+    agentParentJobId = String(saved.agentParentJobId || "")
     mode = String(saved.mode || "new")
     accountId = String(saved.accountId || "")
     sourceDraftId = String(saved.sourceDraftId || "")
@@ -351,7 +417,8 @@ DropArea {
     bccField.text = String(saved.bcc || "")
     replyToField.text = String(saved.replyTo || "")
     subjectField.text = String(saved.subject || "")
-    bodyEdit.text = String(saved.body || "")
+    bodyQuote = typeof saved.bodyQuote === "string" ? saved.bodyQuote : ""
+    setBodyText(String(saved.body || ""))
     placedBody = String(saved.placedBody || "")
     bodyWasEdited = saved.bodyWasEdited === true
     userModified = typeof saved.userModified === "boolean"
@@ -444,24 +511,21 @@ DropArea {
     fromMenu.y = y
   }
 
-  // Everyone on the original except this mailbox: replying to yourself is
-  // never what reply-all was for.
-  //
-  // "This mailbox" is the one the draft is written from, not the one on
-  // screen. Reading the active account's address dropped the wrong name: a
-  // reply owned by B, to a message addressed to both, kept B on the Cc and
-  // removed A — copying the sender and losing a real recipient.
-  function otherRecipients(summary) {
-    if (!summary) return ""
-    var mine = String(root.service
-      ? root.service.accountEmailFor(root.accountId) : "").toLowerCase()
-    var list = Array.isArray(summary.to) ? summary.to : []
-    var kept = []
-    for (var i = 0; i < list.length; i++) {
-      if (String(list[i].email || "").toLowerCase() === mine) continue
-      kept.push(list[i].email)
+  function ownReplyAddresses() {
+    if (!root.service) return []
+    var own = [{email: root.service.accountEmailFor(root.accountId)}]
+    var sources = Senders.asList(root.service.senderSources)
+    for (var i = 0; i < sources.length; i++) {
+      if (String(sources[i].id || "") !== root.accountId) continue
+      own.push({email: sources[i].email})
+      own = own.concat(Senders.asList(sources[i].aliases))
     }
-    return kept.join(", ")
+    var identities = Senders.asList(root.service.sendIdentities)
+    for (var j = 0; j < identities.length; j++) {
+      if (String(identities[j].accountId || "") === root.accountId)
+        own.push(identities[j])
+    }
+    return own
   }
 
   function updateRecipientSuggestions() {
@@ -541,6 +605,8 @@ DropArea {
 
   function begin(nextMode, summary, bodyText, attachments) {
     clearCurrentDraft(true)
+    agentParentJobId = ""
+    replyMessageId = summary && (nextMode === "reply" || nextMode === "replyAll") ? String(summary.id || "") : ""
     mode = String(nextMode || "new")
     // The mailbox the message being answered arrived in, not the one that
     // happens to be active. In a merged list those differ, and a reply sent
@@ -552,8 +618,6 @@ DropArea {
     var quoted = ""
 
     if (summary && mode !== "new") {
-      var replyTo = summary.replyTo && summary.replyTo.email
-        ? summary.replyTo.email : summary.from.email
       threadId = summary.threadId
       inReplyTo = summary.messageId
       // Cc as well as To: an alias is just as often the address a thread
@@ -569,12 +633,12 @@ DropArea {
         originalAttachments = Array.isArray(attachments) ? attachments.slice() : []
         if (originalAttachments.length > 0) loadForwardAttachments()
       } else {
-        toField.text = replyTo
+        var recipients = Recipients.replyFields(summary, mode, ownReplyAddresses())
+        toField.text = recipients.to
+        ccField.text = recipients.cc
+        ccVisible = ccField.text !== ""
+        if (recipients.outgoing) replyRecipients = [summary.from]
         subjectField.text = String(summary.subject || "")
-        if (mode === "replyAll") {
-          ccField.text = otherRecipients(summary)
-          ccVisible = ccField.text !== ""
-        }
       }
       pendingQuoteSummary = summary
       pendingQuoteText = String(bodyText || "")
@@ -613,7 +677,7 @@ DropArea {
     if (mode === "draft") {
       // Somebody wrote this and it was saved. None of it was placed, so all of
       // it is theirs — including the sign-off it already carries.
-      bodyEdit.text = String(values.body || "")
+      root.setBodyText(String(values.body || ""))
       placedBody = ""
       bodyWasEdited = true
       bodyPrefix = ""
@@ -753,9 +817,7 @@ DropArea {
   }
 
   function parkForSend(sendId) {
-    var parked = parkedDrafts.slice()
-    parked.push({ sendId: String(sendId || ""), draft: snapshotDraft() })
-    parkedDrafts = parked
+    parkDraftForSend(sendId, snapshotDraft())
     clearCurrentDraft(false)
     opened = false
     if (interruptedDraft) {
@@ -765,6 +827,16 @@ DropArea {
     } else {
       sendQueued()
     }
+  }
+
+  function parkDraftForSend(sendId, draft) {
+    var parked = parkedDrafts.slice()
+    // A card can appear in both the reader and composer. The outbox send ID
+    // also identifies its one recovery draft.
+    if (parked.some(function(entry) { return entry.sendId === String(sendId) })) return
+    parked.push({ sendId: String(sendId || ""), draft: draft })
+    parkedDrafts = parked
+    draftChanged()
   }
 
   // The parked draft a send names — or, for a caller that does not name its
@@ -910,13 +982,7 @@ DropArea {
   }
 
   function pumpAttach() {
-    if (attacher.running || root.attachmentReadPending || root.attachJobs.length === 0) return
-    if (root.attachScript === "") {
-      root.attachJobs = []
-      if (service && typeof service.fail === "function")
-        service.fail("The attachment helper is missing")
-      return
-    }
+    if (root.attachmentHostPending || root.attachmentReadPending || root.attachJobs.length === 0) return
     var job = root.attachJobs[0]
     var owner = root.draftKey
     var rest = root.attachJobs.slice(1)
@@ -924,7 +990,7 @@ DropArea {
     root.attaching = true
     if (job.mode === "read" || job.mode === "forget") {
       if (!root.service || !root.service.backend || !root.service.backend.ready) {
-        finishAttach(job.mode, JSON.stringify({ ok: false, error: "Mail backend unavailable" }))
+        finishAttach(job.mode, JSON.stringify({ ok: false, error: "Mail backend unavailable" }), owner)
         return
       }
       root.attachmentReadPending = true
@@ -937,17 +1003,25 @@ DropArea {
       })
       return
     }
-    attacher.jobMode = job.mode
-    attacher.draftKey = owner
-    if (job.mode === "clipboard")
-      attacher.command = [root.attachScript, "clipboard", root.composeDir]
-    else if (job.mode === "pick")
-      attacher.command = [root.attachScript, "pick"]
-    else {
-      finishAttach(job.mode, JSON.stringify({ ok: false, error: "Unknown attachment action" }))
+    if (!root.service) {
+      finishAttach(job.mode, JSON.stringify({ ok: false, error: "Attachment service unavailable" }), owner)
       return
     }
-    attacher.running = true
+    root.attachmentHostPending = true
+    if (job.mode === "clipboard" && typeof root.service.clipboardAttachment === "function") {
+      root.service.clipboardAttachment(root.composeDir, function(result) {
+        root.attachmentHostPending = false
+        root.finishAttach(job.mode, JSON.stringify(result || {ok:false,error:"no-image"}), owner)
+      })
+    } else if (job.mode === "pick" && typeof root.service.chooseFiles === "function") {
+      root.service.chooseFiles(function(result) {
+        root.attachmentHostPending = false
+        root.finishAttach(job.mode, JSON.stringify(result || {ok:false,error:"cancelled"}), owner)
+      })
+    } else {
+      root.attachmentHostPending = false
+      finishAttach(job.mode, JSON.stringify({ ok: false, error: "Unknown attachment action" }), owner)
+    }
   }
 
   property bool attachmentReadPending: false
@@ -1046,12 +1120,6 @@ DropArea {
     drop.acceptProposedAction()
     root.attachDroppedUrls(drop.urls)
   }
-  // Only while it is actually in use. A component that declares `focus: true`
-  // owns the window's focus even when invisible — Qt does not exclude hidden
-  // items — and an owner that accepts keys is a sink. This swallowed every
-  // Escape in the window, which is why Esc looked intermittent: whether it
-  // worked depended on where the user had last clicked.
-  focus: root.opened
 
   onFromAliasesChanged: {
     if (opened && !fromWasChosen) selectPreferredFrom()
@@ -1275,6 +1343,7 @@ DropArea {
       TextField {
         id: toField
         objectName: "compose-to-field"
+        TextMenuTrigger {}
         onTextEdited: root.noteUserModified()
         anchors.left: toLabel.right
         anchors.leftMargin: root.formLabelGap
@@ -1360,6 +1429,7 @@ DropArea {
       TextField {
         id: ccField
         objectName: "compose-cc-field"
+        TextMenuTrigger {}
         onTextEdited: root.noteUserModified()
         anchors.left: ccLabel.right
         anchors.leftMargin: root.formLabelGap
@@ -1439,6 +1509,7 @@ DropArea {
       TextField {
         id: bccField
         objectName: "compose-bcc-field"
+        TextMenuTrigger {}
         onTextEdited: root.noteUserModified()
         anchors.left: bccLabel.right
         anchors.leftMargin: root.formLabelGap
@@ -1518,6 +1589,7 @@ DropArea {
       TextField {
         id: replyToField
         objectName: "compose-reply-to-field"
+        TextMenuTrigger {}
         onTextEdited: root.noteUserModified()
         anchors.left: replyToLabel.right
         anchors.leftMargin: root.formLabelGap
@@ -1562,6 +1634,7 @@ DropArea {
       TextField {
         id: subjectField
         objectName: "compose-subject-field"
+        TextMenuTrigger {}
         onTextEdited: root.noteUserModified()
         anchors.left: subjectLabel.right
         anchors.leftMargin: root.formLabelGap
@@ -1810,6 +1883,7 @@ DropArea {
     TextEdit {
       id: bodyEdit
       objectName: "compose-body-editor"
+      TextMenuTrigger {}
       activeFocusOnTab: true
       width: bodyFlick.width
       // Tall enough to fill the visible area even when the draft is short.
@@ -1826,8 +1900,13 @@ DropArea {
       selectedTextColor: root.textColor
       font.family: root.panelFontFamily
       font.pixelSize: Style.font.bodySmall
-      onTextChanged: root.noteDraftChanged()
-      onTextEdited: { root.bodyWasEdited = true; root.noteUserModified() }
+      onTextChanged: {
+        root.noteDraftChanged()
+        if (!root.settingBodyText && activeFocus) {
+          root.bodyWasEdited = true
+          root.noteUserModified()
+        }
+      }
       Keys.priority: Keys.BeforeItem
       Keys.onPressed: root.pasteKey(event)
     }
@@ -1997,16 +2076,35 @@ DropArea {
 
   }
 
-  Process {
-    id: attacher
-    property string jobMode: ""
-    property string draftKey: ""
-    stdinEnabled: false
-    stdout: StdioCollector { id: attachOut; waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode) {
-      root.finishAttach(jobMode, String(attachOut.text || ""), draftKey)
+  // -------------------------------------------------------------- text menu
+  //
+  // One menu for every field: the trigger names the field it sits in, and
+  // Paste takes the route Ctrl+V takes — the clipboard is tried for an image
+  // first, and text goes into whichever field has focus, so the clicked one
+  // is given it before the ask.
+  component TextMenuTrigger: MouseArea {
+    anchors.fill: parent
+    acceptedButtons: Qt.RightButton
+    onPressed: function(mouse) {
+      var scene = parent.mapToGlobal(mouse.x, mouse.y)
+      textMenu.openAt(parent, scene.x, scene.y, "")
     }
   }
 
+  TextMenu {
+    id: textMenu
+    objectName: "compose-text-menu"
+    editable: true
+    textColor: root.textColor
+    popupBackgroundColor: root.popupBackgroundColor
+    popupBorderColor: root.popupBorderColor
+    panelFontFamily: root.panelFontFamily
+    onCopyRequested: function(text) {
+      if (root.service && typeof root.service.copyText === "function") root.service.copyText(text)
+    }
+    onPasteRequested: function(target) {
+      if (target) target.forceActiveFocus()
+      root.paste()
+    }
+  }
 }

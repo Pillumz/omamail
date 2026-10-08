@@ -1,9 +1,11 @@
 import QtQuick
 import Quickshell
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "components"
 import "bar"
+import "bar/Bridge.js" as BarBridge
 
 // The bar's job is one number and one click. Everything the widget knows comes
 // from the shared service, which keeps running whether or not the window is
@@ -13,13 +15,63 @@ BarWidget {
 
   moduleName: "omamail"
 
-  readonly property var gmail: bar && bar.shell
+  readonly property var directService: bar && bar.shell
     ? bar.shell.serviceFor("omamail") : null
+  readonly property var gmail: directService
+    || (bridgeApi && bridgeState ? bridgedStatus : null)
+  property var bridgeApi: null
+  property var bridgeState: null
+  property string bridgeStateText: ""
+
+  function syncBridge() {
+    var api = BarBridge.current()
+    var state = api ? api.snapshot() : null
+    var serialized = JSON.stringify(state)
+    // Leave preview delegates in place when their contents have not changed.
+    if (serialized !== bridgeStateText) {
+      bridgeStateText = serialized
+      bridgeState = state
+    }
+    bridgeApi = api
+  }
+
+  // A replacement bar gets the same preview and actions without a reference
+  // to the service, its authentication managers, or its account models.
+  QtObject {
+    id: bridgedStatus
+    readonly property bool ready: !!root.bridgeState && root.bridgeState.ready
+    readonly property bool windowOpen: !!root.bridgeState && root.bridgeState.windowOpen
+    readonly property bool showBarIcon: !root.bridgeState || root.bridgeState.showBarIcon
+    readonly property int unreadTotal: root.bridgeState ? root.bridgeState.unreadTotal : 0
+    readonly property string barTooltip: root.bridgeState ? root.bridgeState.barTooltip : "Omamail"
+    readonly property string contentDirection: root.bridgeState ? root.bridgeState.contentDirection : ""
+    readonly property var barMessages: root.bridgeState ? root.bridgeState.barMessages : []
+    readonly property var barEvents: root.bridgeState ? root.bridgeState.barEvents : []
+    function applySettings(values) {
+      if (root.bridgeApi) root.bridgeApi.applySettings(values)
+    }
+    function refresh() {
+      if (root.bridgeApi) root.bridgeApi.refresh()
+    }
+    function refreshCalendarPreview() {
+      if (root.bridgeApi) root.bridgeApi.refreshCalendarPreview()
+    }
+  }
+
+  // JS library registration is not a QML property. A small poll discovers
+  // service startup/replacement and reads only three mail rows and two events.
+  Timer {
+    interval: 1000
+    running: !root.directService
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.syncBridge()
+  }
 
   // `barForeground` belongs to qs.Ui.Panel, not to BarWidget: reading it here
   // yields undefined, and assigning undefined to a colour leaves the icon
   // unpainted. The bar itself is the source.
-  readonly property color foreground: bar ? bar.barForeground : Color.foreground
+  readonly property color foreground: bar ? bar.barForeground : Commons.Color.foreground
   property bool previewOpen: false
   property bool popoutSwitchClosing: false
 
@@ -39,11 +91,15 @@ BarWidget {
 
   onSettingsChanged: pushSettings()
   onGmailChanged: pushSettings()
+  onBridgeApiChanged: if (!directService) pushSettings()
   onPreviewOpenChanged: {
     if (previewOpen && gmail && typeof gmail.refreshCalendarPreview === "function")
       root.gmail.refreshCalendarPreview()
   }
-  Component.onCompleted: pushSettings()
+  Component.onCompleted: {
+    syncBridge()
+    pushSettings()
+  }
 
   function openWindow() {
     close()
@@ -113,7 +169,7 @@ BarWidget {
           anchors.centerIn: parent
           iconSize: Style.space(12)
           color: button.glyphColor
-          markColor: Color.accent
+          markColor: Commons.Color.accent
           // The dot is simply whether unread mail is waiting. It used to mean
           // "something arrived since you last looked", which was a different
           // question from the one anyone asks of a mail icon, and it could not
@@ -149,7 +205,7 @@ BarWidget {
     id: openIndicator
     readonly property bool vertical: !!root.bar && root.bar.vertical
     visible: button.windowOpen
-    color: Color.accent
+    color: Commons.Color.accent
     radius: Math.min(width, height) / 2
     width: vertical ? Style.space(2) : Style.space(10)
     height: vertical ? Style.space(10) : Style.space(2)
@@ -176,11 +232,11 @@ BarWidget {
       width: parent ? parent.width : 0
       messages: root.gmail ? root.gmail.barMessages : []
       events: root.gmail ? root.gmail.barEvents : []
-      textColor: Color.popups.text
-      backgroundColor: Color.popups.background
-      accentColor: Color.accent
-      dimColor: Qt.rgba(Color.popups.text.r, Color.popups.text.g,
-        Color.popups.text.b, 0.62)
+      textColor: Commons.Color.popups.text
+      backgroundColor: Commons.Color.popups.background
+      accentColor: Commons.Color.accent
+      dimColor: Qt.rgba(Commons.Color.popups.text.r, Commons.Color.popups.text.g,
+        Commons.Color.popups.text.b, 0.62)
       panelFontFamily: Style.font.family
       contentDirection: root.gmail ? root.gmail.contentDirection : ""
       onMessageRequested: function(accountId, messageId) {

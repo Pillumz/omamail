@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtTest 1.3
 import qs.Commons
+import qs.Commons as Commons
 import "../.." as Omamail
 import "../../components" as Mail
 import "../../account/Accounts.js" as Accounts
@@ -35,6 +36,7 @@ Item {
   QtObject {
     id: bridge
     property bool ready: true
+    property int apiVersion: 6
     property var modelBridge: null
     property var starts: []
     property var listed: []
@@ -43,6 +45,7 @@ Item {
     property var held: []
     property string refuse: ""
     function call(method, params, callback) {
+      if (method === "agent.providerStatus") { callback({available:true,provider:"claude"}, ""); return }
       if (method === "agent.jobsProjection") { modelBridge.call(method, params, function(result, error) { if (error) bridge.projectionErrors = bridge.projectionErrors.concat([error]); callback(result, error) }); return }
       if (method === "agent.jobsList") { callback(listed, ""); return }
       if (method === "agent.jobStart") {
@@ -64,10 +67,10 @@ Item {
   Mail.EventSuggestionCard {
     id: card
     width: 500
-    textColor: Color.foreground
-    accentColor: Color.accent
-    dimColor: Color.foreground
-    dimmerColor: Color.foreground
+    textColor: Commons.Color.foreground
+    accentColor: Commons.Color.accent
+    dimColor: Commons.Color.foreground
+    dimmerColor: Commons.Color.foreground
     panelFontFamily: "monospace"
   }
   SignalSpy { id: added; target: card; signalName: "addRequested" }
@@ -97,7 +100,10 @@ Item {
     }
     function runner() {
       var kids = mailService.children
-      for (var i = 0; i < kids.length; i++) if (kids[i].jobs !== undefined && kids[i].pluginDir !== undefined) return kids[i]
+      for (var i = 0; i < kids.length; i++) {
+        var candidate = kids[i].item || kids[i]
+        if (candidate.jobs !== undefined && candidate.pluginDir !== undefined) return candidate
+      }
       return null
     }
     function calendarFor(email) {
@@ -172,6 +178,7 @@ Item {
     }
 
     function init() {
+      if (Qt.platform.os !== "linux") { skip("The plugin agent backend is Linux-only"); return }
       added.clear(); dismissed.clear(); card.suggestions = []
       mailService.backend.protocolInfo = { apiVersion: 2, protocol: 1, version: "0.0.0" }
       mailService.backendRuntime.latestApiVersion = 2

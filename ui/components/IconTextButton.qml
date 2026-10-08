@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // A bordered button carrying a drawn icon beside its label.
@@ -14,9 +15,11 @@ Rectangle {
   property string iconName: ""
   property string text: ""
   property string tooltipText: ""
-  property color foreground: Color.foreground
-  property color accent: Color.accent
+  property color foreground: Commons.Color.foreground
+  property color accent: Commons.Color.accent
   property bool bordered: true
+  // Reserve the normal border but leave the field clear until interaction.
+  property bool outline: false
   // The look of the icon buttons it may stand beside: no fill and no border
   // at rest, a fill on hover, and the icon and label brightening to
   // `hoverColor` — so a labelled action in a row of icon buttons reads as
@@ -50,7 +53,8 @@ Rectangle {
   color: mouse.pressed ? Style.pressedFillFor(root.foreground, root.accent)
     : (root.selected ? Style.selectedFillFor(root.foreground, root.accent)
       : (hot ? Style.hoverFillFor(root.foreground, root.accent)
-        : (bordered && !ghost ? Style.normalFillFor(root.foreground, root.accent) : "transparent")))
+        : (bordered && !ghost && !outline
+          ? Style.normalFillFor(root.foreground, root.accent) : "transparent")))
   border.width: (ghost ? root.selected : (bordered || hot || root.selected)) ? Style.normalBorderWidth : 0
   border.color: hot || root.selected
     ? Style.hoverBorderFor(root.foreground, root.accent)

@@ -1,19 +1,47 @@
+#[cfg(unix)]
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
+use std::{
+    io::{BufRead, BufReader, Write},
     process::{Command, Stdio},
 };
 
+#[cfg(target_os = "macos")]
+fn config_root(home: &Path, xdg: &Path) -> PathBuf {
+    let _ = xdg;
+    home.join("Library/Application Support")
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn config_root(home: &Path, xdg: &Path) -> PathBuf {
+    let _ = home;
+    xdg.to_owned()
+}
+
+#[test]
+fn gmail_config_directory_uses_the_shared_platform_contract() {
+    let dirs = omamail::platform::dirs::AppDirs::discover().unwrap();
+    assert_eq!(
+        dirs.config_directory(),
+        dirs.config.join(omamail::platform::dirs::APP_DIRECTORY)
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn mail_gmail_actions_default_to_preview_and_keep_credential_failures_explicit() {
     let temp = Command::new("mktemp").arg("-d").output().unwrap();
-    let dir = std::path::PathBuf::from(String::from_utf8(temp.stdout).unwrap().trim());
-    fs::create_dir(dir.join("omamail")).unwrap();
-    fs::write(dir.join("omamail/accounts.json"),br#"{"version":1,"activeId":"a@example.org","accounts":[{"provider":"gmail","email":"a@example.org"}]}"#).unwrap();
-    fs::set_permissions(dir.join("omamail"), fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = PathBuf::from(String::from_utf8(temp.stdout).unwrap().trim())
+        .canonicalize()
+        .unwrap();
+    let config = config_root(&dir, &dir).join("omamail");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("accounts.json"),br#"{"version":1,"activeId":"a@example.org","accounts":[{"provider":"gmail","email":"a@example.org"}]}"#).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(
-        dir.join("omamail/accounts.json"),
+        config.join("accounts.json"),
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
@@ -125,9 +153,10 @@ fn malformed_gmail_requests_are_refused_before_credentials_or_network() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn gmail_registry_and_private_credentials_gate_keyring_access() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "omamail-gmail-boundary-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -135,7 +164,7 @@ fn gmail_registry_and_private_credentials_gate_keyring_access() {
             .unwrap()
             .as_nanos()
     ));
-    let config = dir.join(".config/omamail");
+    let config = config_root(&dir, &dir.join(".config")).join("omamail");
     fs::create_dir_all(&config).unwrap();
     let accounts = config.join("accounts.json");
     fs::write(

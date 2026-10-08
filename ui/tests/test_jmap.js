@@ -1205,11 +1205,9 @@ assert.strictEqual(message.extractHtml(htmlRead.payload), htmlEmail.bodyValues["
 assert.strictEqual(message.extractBody(htmlRead.payload).source, "html")
 assert.strictEqual(message.extractBody(htmlRead.payload).text.indexOf("These are the attached"), -1)
 deepEqual(message.attachments(htmlRead.payload), [
-  { filename: "logo.png", mimeType: "image/png", size: 70, attachmentId: "copng" },
   { filename: "notes.txt", mimeType: "text/plain; charset=utf-8", size: 63,
     attachmentId: "cgnotes" }
-], "the existing attachment rule decides, and it lists a part the sender named — "
-  + "the inline image included, exactly as it does on IMAP")
+], "the inline image the body points at is embedded, while the named file beside it is listed")
 assert.strictEqual(message.partForAttachment(htmlRead.payload, "cgnotes").filename, "notes.txt")
 
 // ------------------------------------------------------ a truncated part
@@ -2347,7 +2345,7 @@ assert.strictEqual(registry.can("jmap", "spam", accountRefusals), true,
 assert.strictEqual(registry.can("jmap", "star", accountRefusals), true)
 assert.strictEqual(registry.can("jmap", "send", accountRefusals), true)
 deepEqual(registry.mailboxes("jmap", jmap.absentMailboxes(boxes)).map(box => box.key),
-  ["inbox", "unread", "starred", "sent", "drafts", "spam", "trash"],
+  ["inbox", "unread", "starred", "drafts", "sent", "spam", "trash"],
   "the Archive row is gone and Junk moves up, because the number keys are positional")
 
 // ------------------------------------------------------- the provider itself

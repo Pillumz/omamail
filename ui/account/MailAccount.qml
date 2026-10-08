@@ -35,6 +35,7 @@ Item {
 
   required property string pluginDir
   property var backend: null
+  property var platform: null
   property string syncFingerprint: ""
   property string configuredEmail: ""
   property string oauthClientId: ""
@@ -123,7 +124,8 @@ Item {
 
   // The mailboxes this account has, which is a property of its provider rather
   // than of the panel. The sidebar and the tab row draw whatever is here.
-  readonly property var mailboxes: Provider.mailboxes(providerId, absentMailboxes)
+  readonly property var mailboxes: Provider.mailboxes(providerId, absentMailboxes,
+    Number(backend && backend.protocolInfo && backend.protocolInfo.apiVersion || 0))
 
   // What the panel may offer for this account. A button the service cannot
   // honour is worse than a missing one: it fails after the user has committed
@@ -184,6 +186,9 @@ Item {
   property int resultEstimate: 0
   property bool listLoading: false
   property bool listLoaded: false
+  // Rows the view has been paged to; a reload asks `Model.reloadLimit` for
+  // this many again, not for page one.
+  property int loadedDepth: 0
   property var listHandle: null
   property int listSerial: 0
 
@@ -216,6 +221,24 @@ Item {
   // message starts. Off, and every message begins blocked and is asked about
   // one at a time.
   property bool alwaysShowImages: false
+  onAlwaysShowImagesChanged: {
+    var allowed = Model.showsRemoteImages(alwaysShowImages, selectionIsPreview)
+    if (allowed !== remoteImagesAllowed) {
+      remoteImagesAllowed = allowed
+      remoteImageData = ({})
+      if (!allowed) {
+        imageFetchSerial++
+        imageFetchQueue = []
+        remoteImagesLoading = false
+        imageBatchDirty = false
+        imagePaintTimer.stop()
+        remoteImageAttempted = ({})
+        selectedDocument = null
+        selectedReaderDocument = null
+      }
+      if (readerSourceKey !== "") renderSource(readerSourceKey)
+    }
+  }
   property bool remoteImagesAllowed: false
   property bool remoteImagesLoading: false
   property var remoteImageData: ({})
@@ -617,6 +640,32 @@ Item {
     })
   }
 
+  // The Outlook settings page asks Rust to prove each boundary without sending
+  // a message or changing a calendar. Rust returns only capability booleans;
+  // credentials and provider responses never cross into QML.
+  function checkMicrosoftConnection(callback) {
+    if (typeof callback !== "function") return
+    var report = { mail: false, graph: false, calendar: false }
+    if (providerId !== "outlook" || !auth || !auth.loggedIn || !backend || !backend.ready || !(backend.apiVersion >= 5)) {
+      callback(report)
+      return
+    }
+    var owner = auth
+    var expectedAccount = accountId
+    function current() {
+      return providerId === "outlook" && auth === owner && owner.loggedIn
+        && accountId === expectedAccount
+    }
+    backend.call("outlook.connectionCheck", { accountId: expectedAccount }, function(result, error) {
+      if (!current()) return
+      callback({
+        mail: !error && !!result && result.mail === true,
+        graph: !error && !!result && result.graph === true,
+        calendar: !error && !!result && result.calendar === true
+      })
+    })
+  }
+
   function loadProfile() {
     if (!ready || profile) return
     if (cacheStore.loaded && cacheStore.store.profile) profile = cacheStore.store.profile
@@ -743,12 +792,13 @@ Item {
     function current() { return !handle.aborted && account === root.accountId && client === root.api }
     function read(cached) {
       if (!current()) return
+      var options = root.readerOptions()
       root.backend.call("reader.open", {accountId: account, id: messageId, requestId: request,
-        cacheOnly: cached, now: Date.now(), options: root.readerOptions()}, function(resource, error) {
+        cacheOnly: cached, now: Date.now(), options: options}, function(resource, error) {
         if (!current()) return
         if (!error && resource && resource.nativeContent) {
           resource.nativeSummary = root.hydrateSummary(resource.nativeSummary)
-          callback(resource, "", cached)
+          callback(resource, "", cached, options.allowRemoteImages)
         } else if (!cached) callback(null, "Could not open that message", false)
         if (cached) read(false)
       })
@@ -876,16 +926,17 @@ Item {
     }
     listLoading = true
     var token = append ? nextPageToken : ""
+    var limit = append ? maxMessages : Model.reloadLimit(maxMessages, loadedDepth)
 
     // A typed search accepts ids while the provider is still finding them.
     // Mailbox and label listings have no long-running search phase, so their
     // simpler page-at-once path stays below.
     if (searchQuery !== "" && rawQuery === "") {
-      loadSearchMessages(append, token, serial, keptError)
+      loadSearchMessages(append, token, limit, serial, keptError)
       return
     }
 
-    listHandle = api.listMessages(effectiveQuery, maxMessages, token,
+    listHandle = api.listMessages(effectiveQuery, limit, token,
       function(page, error) {
         if (serial !== root.listSerial) return
         if (error || !page) {
@@ -902,6 +953,7 @@ Item {
           root.listLoaded = true
           if (!append) {
             root.messages = []
+            root.loadedDepth = 0
             // An empty answer is an answer, and it has to reach the cache. Only
             // a non-empty result was ever written back, so a mailbox that had
             // emptied kept its old rows on disk — and cache-first painted them
@@ -948,7 +1000,7 @@ Item {
   // read immediately, and those payloads paint without waiting for either the
   // rest of the ids or the slowest metadata request. The final list callback
   // remains authoritative for paging and for when "Checking" may stop.
-  function loadSearchMessages(append, token, serial, preservedError) {
+  function loadSearchMessages(append, token, limit, serial, preservedError) {
     var previewSearch = messages.slice()
     var settledBase = append ? messages.slice() : []
     var liveSummaries = []
@@ -1101,7 +1153,7 @@ Item {
       fetchIds(page.ids)
     }
 
-    listHandle = api.listMessages(effectiveQuery, maxMessages, token,
+    listHandle = api.listMessages(effectiveQuery, limit, token,
       function(page, error) {
         if (serial !== root.listSerial) return
         finalPage = page
@@ -1184,6 +1236,7 @@ Item {
     notificationsPrimed = true
 
     messages = merged
+    loadedDepth = merged.length
     listLoaded = true
     lastError = ""
     if (markSynced !== false) lastSyncedMs = Date.now()
@@ -1266,7 +1319,7 @@ Item {
     detailLive = false
     detailCachedResource = false
 
-    detailHandle = preparedRead(messageId, function(payload, error, cached) {
+    detailHandle = preparedRead(messageId, function(payload, error, cached, readAllowsRemoteImages) {
       if (serial !== root.detailSerial || (cached && root.detailLive)) return
       if (error || !payload) {
         root.detailLoading = false
@@ -1286,6 +1339,11 @@ Item {
         if (!root.detailPainted) root.fail("Could not prepare message detail")
         return
       }
+      // A copy from disk is a live read as the server answered it once, and
+      // nothing since — the quiet mark-read on opening, a star — reached the
+      // file. What the account holds about the message is newer and stays:
+      // the file paints the body early, not the labels or the block.
+      if (cached) summary = Model.cachedDetailSummary(root.summaryOf(messageId), summary)
       function paintSummary(summary) {
       if (serial !== root.detailSerial || (cached && root.detailLive)) return
       summary = root.hydrateSummary(summary)
@@ -1295,7 +1353,7 @@ Item {
       root.selectedHasHtml = !!payload.hasHtml
       root.readerSourceKey = payload.hasHtml ? String(payload.readerKey) : ""
       var ready = payload.nativeRender
-      root.adoptRendered(ready)
+      root.adoptRendered(ready, readAllowsRemoteImages)
         root.detailLoading = false
         root.detailPainted = true
         root.lastError = ""
@@ -1490,7 +1548,14 @@ Item {
     })
   }
 
-  function adoptRendered(ready) {
+  function adoptRendered(ready, readAllowsRemoteImages) {
+    // A preference change may overtake either the cached or the live read.
+    // Render its native source under the current policy before painting it.
+    if (readerSourceKey !== "" && readAllowsRemoteImages !== undefined
+        && readAllowsRemoteImages !== remoteImagesAllowed) {
+      renderSource(readerSourceKey)
+      return
+    }
     // A live response may have been prepared before cached images completed.
     // Keep the painted document until Rust incorporates the approved bytes.
     if (readerSourceKey !== "" && remoteImagesAllowed && Object.keys(remoteImageData).length > 0) {
@@ -2012,7 +2077,8 @@ Item {
             ? "That attachment is not something this can open" : "That attachment could not be opened")
           return
         }
-        Quickshell.execDetached(["xdg-open", String(result.path)])
+        if (root.platform && typeof root.platform.openExternal === "function")
+          root.platform.openExternal(String(result.path))
         root.note("Opening " + String(file.filename || "attachment"))
       })
     })
@@ -2254,8 +2320,9 @@ Item {
     for (var fi = 0; fi < files.length; fi++) {
       if (files[fi] && (files[fi].data || files[fi].path)) hasFiles = true
     }
-    var body = String(values.body || "").trim()
-    if (body === "" && !hasFiles) {
+    var body = String(values.body || "")
+    if (values.exactBody !== true) body = body.trim()
+    if (body.trim() === "" && !hasFiles) {
       fail("Write something before sending")
       return false
     }
@@ -2318,6 +2385,8 @@ Item {
 
   // See `Rsvp.qml`: the account file is at its size ceiling.
   function rsvp(response) { rsvpAction.run(response) }
+  readonly property bool rsvpFallbackAvailable: rsvpAction.fallbackAvailable
+  function rsvpMailOnly(response) { rsvpAction.run(response, true) }
   readonly property alias bodies: bodyCache
 
   Rsvp {
@@ -2347,6 +2416,9 @@ Item {
     accountId: root.accountId
     notificationForeground: root.notificationForeground
     notificationAccent: root.notificationAccent
+    nativeNotifications: !!root.platform && root.platform.standalone === true
+      && root.platform.hasNotifications === true
+    pluginNotifications: !root.platform || root.platform.standalone !== true
     onActivated: function(accountId, messageId) {
       root.notificationActivated(accountId, messageId)
     }
@@ -2376,6 +2448,7 @@ Item {
     clearSelection()
     messages = []
     previewMessages = []
+    loadedDepth = 0
     listLoaded = false
     loadMessages(false)
   }
@@ -2410,6 +2483,7 @@ Item {
     rawLabelId = ""
     clearSelection()
     messages = []
+    loadedDepth = 0
     listLoaded = false
     loadMessages(false)
   }
@@ -2433,6 +2507,7 @@ Item {
       root.rawLabelId = id
       root.clearSelection()
       root.messages = []
+      root.loadedDepth = 0
       root.listLoaded = false
       root.loadMessages(false)
     })
@@ -2448,7 +2523,8 @@ Item {
     backend.call("providers.resolve", {provider: providerId, operation: operation, value: String(value || "")}, function(result, error) {
       if (error || boundAccount !== root.accountId || boundProvider !== root.providerId) return
       var url = String((result || {}).value || "")
-      if (url !== "") Quickshell.execDetached(["xdg-open", url])
+      if (url !== "" && root.platform && typeof root.platform.openExternal === "function")
+        root.platform.openExternal(url)
     })
   }
 
@@ -2456,16 +2532,18 @@ Item {
   function openWebInbox() { openProviderUrl("webBoxUrl", effectiveQuery) }
 
   function openCloudConsole() {
-    Quickshell.execDetached(["xdg-open", "https://console.cloud.google.com/auth/clients/create"])
+    if (root.platform && typeof root.platform.openExternal === "function")
+      root.platform.openExternal("https://console.cloud.google.com/auth/clients/create")
   }
 
   function openConsentScreen() {
-    Quickshell.execDetached(["xdg-open", "https://console.cloud.google.com/auth/overview"])
+    if (root.platform && typeof root.platform.openExternal === "function")
+      root.platform.openExternal("https://console.cloud.google.com/auth/overview")
   }
 
   function openGmailApiPage() {
-    Quickshell.execDetached(["xdg-open",
-      "https://console.cloud.google.com/apis/library/gmail.googleapis.com"])
+    if (root.platform && typeof root.platform.openExternal === "function")
+      root.platform.openExternal("https://console.cloud.google.com/apis/library/gmail.googleapis.com")
   }
 
   // What every provider does once it is signed in. Named rather than repeated
@@ -2504,6 +2582,7 @@ Item {
     pendingActionQuery = ""
     if (auth) auth.logout()
     messages = []
+    loadedDepth = 0
     labels = []
     sendAsAliases = []
     sendAsLoading = false
@@ -2613,6 +2692,7 @@ Item {
 
     AuthManager {
       backend: root.backend
+      platform: root.platform
       pluginDir: root.pluginDir
       accountId: root.accountId
       mayAdoptLegacyToken: root.mayAdoptLegacyToken
@@ -2634,6 +2714,7 @@ Item {
 
     ImapAuth {
       backend: root.backend
+      platform: root.platform
       pluginDir: root.pluginDir
       accountId: root.accountId
       // Normalised here rather than trusted from the file: a host that arrived
@@ -2656,6 +2737,7 @@ Item {
 
     JmapAuth {
       backend: root.backend
+      platform: root.platform
       pluginDir: root.pluginDir
       accountId: root.accountId
       // Discovery runs from the address's domain when no server was typed, so
@@ -2703,6 +2785,7 @@ Item {
     id: outlookAuthComponent
 
     OutlookAuth {
+      platform: root.platform
       backend: root.backend
       pluginDir: root.pluginDir
       accountId: root.accountId

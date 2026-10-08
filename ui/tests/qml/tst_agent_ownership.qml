@@ -29,11 +29,13 @@ Item {
   QtObject {
     id: bridge
     property bool ready: true
+    property int apiVersion: 6
     property var modelBridge: null
     property var requests: []
     property var listed: []
     property var projectionErrors: []
     function call(method, params, callback) {
+      if(method === "agent.providerStatus") {callback({available:true,provider:"claude"}, "");return}
       if(method === "agent.jobsProjection") {modelBridge.call(method,params,function(result,error){if(error)bridge.projectionErrors=bridge.projectionErrors.concat([error]);callback(result,error)});return}
       if(method === "agent.jobsList") {callback(listed, "");return}
       requests=requests.concat([{method:method,params:params,callback:callback}])
@@ -58,7 +60,10 @@ Item {
     // The runner is the service child that presents native jobs.
     function runner() {
       var kids = mailService.children
-      for (var i = 0; i < kids.length; i++) if (kids[i].jobs !== undefined && kids[i].pluginDir !== undefined) return kids[i]
+      for (var i = 0; i < kids.length; i++) {
+        var candidate = kids[i].item || kids[i]
+        if (candidate.jobs !== undefined && candidate.pluginDir !== undefined) return candidate
+      }
       return null
     }
     function startedCancels() {
@@ -70,6 +75,7 @@ Item {
       bridge.modelBridge=NativeIntentFixture.backend(mailService)
     }
     function init() {
+      if (Qt.platform.os !== "linux") { skip("The plugin agent backend is Linux-only"); return }
       var agent=runner()
       agent.backend=null
       bridge.requests=[]

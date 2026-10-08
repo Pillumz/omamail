@@ -97,7 +97,8 @@ Item {
     }
     var opened = Html.externallyOpenableHttpUrl(url)
     if (opened === "") return
-    Qt.openUrlExternally(opened)
+    if (root.service && typeof root.service.openExternal === "function")
+      root.service.openExternal(opened)
   }
 
   function openImageMarker(source) {
@@ -123,6 +124,7 @@ Item {
   }
 
   readonly property var summary: service ? service.selectedMessage : null
+  readonly property bool isDraft: !!summary && summary.isDraft === true
 
   // The id the service answers to, which is not always the one on the summary.
   // A list made of several mailboxes addresses a row by mailbox and id, and the
@@ -131,6 +133,18 @@ Item {
   // composed id where there is one and the same string everywhere else, which
   // is what the list and the compose view already hand back.
   readonly property string selectedId: service ? String(service.selectedId || "") : ""
+
+  readonly property var attachments: service ? service.selectedAttachments || [] : []
+  property bool attachmentsExpanded: false
+  onSelectedIdChanged: resetAttachments()
+  onServiceChanged: resetAttachments()
+  onAttachmentsChanged: if (attachments.length === 0) resetAttachments()
+
+  function resetAttachments() {
+    attachmentsExpanded = false
+    attachmentFlick.cancelFlick()
+    attachmentFlick.contentY = 0
+  }
 
   // Which way this message runs.
   //
@@ -314,11 +328,29 @@ Item {
       onActivated: root.backRequested()
     }
 
-    IconButton {
-      id: starButton
+    IconTextButton {
+      id: continueDraftButton
+      objectName: "reader-continue-draft-button"
       anchors.right: parent.right
       anchors.top: backBar.visible ? backBar.bottom : parent.top
       anchors.topMargin: backBar.visible ? Style.space(10) : 0
+      visible: root.isDraft
+      iconName: "edit"
+      text: "Continue editing"
+      outline: true
+      foreground: root.accentColor
+      accent: root.accentColor
+      fontFamily: root.panelFontFamily
+      onClicked: root.composeRequested("draft")
+    }
+
+    IconButton {
+      id: starButton
+      objectName: "reader-star-button"
+      anchors.right: parent.right
+      anchors.top: backBar.visible ? backBar.bottom : parent.top
+      anchors.topMargin: backBar.visible ? Style.space(10) : 0
+      visible: !root.isDraft
       iconName: "star"
       filled: !!root.summary && root.summary.starred
       tooltipText: (root.summary && root.summary.starred ? "Unstar" : "Star") + " · s"
@@ -331,7 +363,7 @@ Item {
     Column {
       id: headerColumn
       anchors.left: parent.left
-      anchors.right: starButton.left
+      anchors.right: root.isDraft ? continueDraftButton.left : starButton.left
       anchors.rightMargin: Style.space(8)
       anchors.top: backBar.visible ? backBar.bottom : parent.top
       anchors.topMargin: backBar.visible ? Style.space(14) : 0
@@ -582,6 +614,8 @@ Item {
       response: root.service ? root.service.selectedResponse : ""
       canRespond: !!root.service && root.service.canRespondToInvite
       sending: !!root.service && root.service.rsvpSending
+      fallbackAvailable: !!root.service && root.service.rsvpFallbackAvailable === true
+      calendarUrl: String(root.service && root.service.rsvpCalendarUrl || "")
       textColor: root.textColor
       accentColor: root.accentColor
       dimColor: root.dimColor
@@ -590,6 +624,7 @@ Item {
       onRespondRequested: function(answer) {
         if (root.service) root.service.rsvp(answer)
       }
+      onMailOnlyRequested: function(answer) { if (root.service) root.service.rsvpMailOnly(answer) }
       // The same rule the body's own links obey: this leaves the app, and it
       // leaves it through the desktop's browser rather than anything here.
       onOpenRequested: function(url) { root.openLink(url) }
@@ -684,12 +719,18 @@ Item {
         root.openLink(link)
       }
 
-      // NoButton so selecting text still works; this exists only to turn the
-      // I-beam into a hand while a link is under the pointer.
+      // Only the right button, so selecting text still works: the left one
+      // passes through to the TextEdit. The hover half turns the I-beam into
+      // a hand while a link is under the pointer; the press half opens the
+      // text menu, naming the link the click landed on if there is one.
       MouseArea {
         anchors.fill: parent
-        acceptedButtons: Qt.NoButton
+        acceptedButtons: Qt.RightButton
         cursorShape: bodyText.hoveredLink !== "" ? Qt.PointingHandCursor : Qt.IBeamCursor
+        onPressed: function(mouse) {
+          var scene = bodyText.mapToGlobal(mouse.x, mouse.y)
+          textMenu.openAt(bodyText, scene.x, scene.y, bodyText.linkAt(mouse.x, mouse.y))
+        }
         onWheel: function(wheel) {
           if (!(wheel.modifiers & Qt.ControlModifier)) {
             wheel.accepted = false
@@ -745,32 +786,76 @@ Item {
     spacing: Style.space(4)
     visible: !!root.summary
 
-    Repeater {
-      model: root.service ? root.service.selectedAttachments : []
+    // The count is always one row. Expanding files must not let their number
+    // take the body away again: they scroll separately and use at most 40% of
+    // the space left below the header, capped at a short list on tall windows.
+    Button {
+      id: attachmentToggle
+      objectName: "attachment-toggle"
+      visible: root.attachments.length > 0
+      text: root.attachments.length + (root.attachments.length === 1
+        ? " attachment" : " attachments") + (root.attachmentsExpanded ? " · Hide" : " · Show")
+      foreground: root.textColor
+      accent: root.accentColor
+      fontFamily: root.panelFontFamily
+      fontSize: Style.font.caption
+      horizontalPadding: Style.space(6)
+      verticalPadding: Style.space(3)
+      selected: root.attachmentsExpanded
+      onClicked: root.attachmentsExpanded = !root.attachmentsExpanded
+    }
 
-      AttachmentRow {
-        required property var modelData
-        width: parent.width
-        attachment: modelData
-        // Asked of the service by message and attachment rather than looked up
-        // by attachment alone: in a merged list the key is the mailbox's as
-        // well, and a bare id found nothing, so the row never went busy.
-        saving: !!root.service && root.service.attachmentIsSaving(root.selectedId,
-          modelData && modelData.attachmentId ? modelData.attachmentId : "")
-        textColor: root.textColor
-        dimColor: root.dimColor
-        dimmerColor: root.dimmerColor
-        panelFontFamily: root.panelFontFamily
-        onOpenRequested: function(attachment) {
-          if (root.service && root.summary)
-            root.service.openAttachment(root.selectedId, attachment)
-        }
-        onSaveRequested: function(attachment) {
-          // `selectedId`, like every other action on this message: `summary.id`
-          // is the id the owning account issued, which reaches no mailbox in a
-          // merged list and so saved from whichever one was active.
-          if (root.service && root.summary)
-            root.service.saveAttachment(root.selectedId, attachment)
+    Flickable {
+      id: attachmentFlick
+      objectName: "attachment-scroller"
+      width: parent.width
+      visible: attachmentToggle.visible && root.attachmentsExpanded
+      height: visible ? Math.min(contentHeight, Style.space(160), Math.max(0,
+        root.height - bodyFlick.y - actionsRow.implicitHeight
+          - attachmentToggle.height - Style.space(18)) * 0.4) : 0
+      contentWidth: width
+      contentHeight: attachmentRows.implicitHeight
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      flickableDirection: Flickable.VerticalFlick
+      WheelScroller { view: attachmentFlick }
+      ScrollBar.vertical: ScrollBar { id: attachmentScrollBar; policy: ScrollBar.AsNeeded }
+
+      Column {
+        id: attachmentRows
+        // Keep the last action clear of the scrollbar's pointer target.
+        width: parent.width - (attachmentScrollBar.visible
+          ? attachmentScrollBar.width + Style.space(4) : 0)
+        spacing: Style.space(4)
+
+        Repeater {
+          model: root.attachments
+
+          AttachmentRow {
+            required property var modelData
+            width: attachmentRows.width
+            attachment: modelData
+            // Asked of the service by message and attachment rather than looked up
+            // by attachment alone: in a merged list the key is the mailbox's as
+            // well, and a bare id found nothing, so the row never went busy.
+            saving: !!root.service && root.service.attachmentIsSaving(root.selectedId,
+              modelData && modelData.attachmentId ? modelData.attachmentId : "")
+            textColor: root.textColor
+            dimColor: root.dimColor
+            dimmerColor: root.dimmerColor
+            panelFontFamily: root.panelFontFamily
+            onOpenRequested: function(attachment) {
+              if (root.service && root.summary)
+                root.service.openAttachment(root.selectedId, attachment)
+            }
+            onSaveRequested: function(attachment) {
+              // `selectedId`, like every other action on this message: `summary.id`
+              // is the id the owning account issued, which reaches no mailbox in a
+              // merged list and so saved from whichever one was active.
+              if (root.service && root.summary)
+                root.service.saveAttachment(root.selectedId, attachment)
+            }
+          }
         }
       }
     }
@@ -789,7 +874,7 @@ Item {
       // across the panel. A row of controls that overlaps another row of
       // controls is worse than a taller toolbar, and the reader can be as
       // narrow as its own minimum beside the list.
-      readonly property bool stacked: messageActions.implicitWidth
+      readonly property bool stacked: messageActions.visible && messageActions.implicitWidth
         + viewTools.implicitWidth + Style.space(24) > width
       implicitHeight: stacked
         ? messageActions.implicitHeight + Style.space(4) + viewTools.implicitHeight
@@ -797,6 +882,7 @@ Item {
 
       Item {
         id: messageActions
+        visible: !root.isDraft
         readonly property int gap: Style.space(2)
         implicitWidth: trashButton.x + trashButton.width
         implicitHeight: Math.max(replyButton.height, replyAllButton.height,
@@ -1006,6 +1092,21 @@ Item {
       height: parent.height
       color: modeTrack.border.color
     }
+  }
+
+  // The body's own menu: Copy, and the link under the pointer. Placed here
+  // rather than in App so the menu can be tested with the body it reads.
+  TextMenu {
+    id: textMenu
+    objectName: "reader-text-menu"
+    textColor: root.textColor
+    popupBackgroundColor: root.popupBackgroundColor
+    popupBorderColor: root.popupBorderColor
+    panelFontFamily: root.panelFontFamily
+    onCopyRequested: function(text) {
+      if (root.service && typeof root.service.copyText === "function") root.service.copyText(text)
+    }
+    onOpenLinkRequested: function(url) { root.openLink(url) }
   }
 
   ImagePopover {

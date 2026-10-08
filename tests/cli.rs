@@ -1,15 +1,20 @@
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
 
 static EMPTY_HOME: AtomicU64 = AtomicU64::new(0);
 static MAIL_LIST_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "integration-test-credentials")]
+#[path = "cli/search.rs"]
+mod search;
 
 fn omamail(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_omamail"))
@@ -99,7 +104,7 @@ fn call(method: &str, params: &[u8]) -> Output {
 }
 
 fn call_in_empty_home(method: &str, params: &[u8]) -> Output {
-    let home = std::env::temp_dir().join(format!(
+    let home = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "omamail-cli-empty-home-{}-{}",
         std::process::id(),
         EMPTY_HOME.fetch_add(1, Ordering::Relaxed)
@@ -108,6 +113,7 @@ fn call_in_empty_home(method: &str, params: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_omamail"))
         .args(["call", method, "--json"])
         .env("XDG_CONFIG_HOME", &home)
+        .env("HOME", &home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -130,12 +136,12 @@ impl Drop for MailListFixture {
 }
 
 fn mail_list_fixture(imap_port: u16, keyring_succeeds: bool) -> MailListFixture {
-    let root = std::env::temp_dir().join(format!(
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "omamail-cli-mail-list-{}-{}",
         std::process::id(),
         MAIL_LIST_FIXTURE.fetch_add(1, Ordering::Relaxed)
     ));
-    let config = root.join("config/omamail");
+    let config = config_root(&root).join("omamail");
     fs::create_dir_all(&config).unwrap();
     fs::write(
         config.join("accounts.json"),
@@ -144,7 +150,7 @@ fn mail_list_fixture(imap_port: u16, keyring_succeeds: bool) -> MailListFixture 
             "activeId":"gmail@example.org",
             "accounts":[
                 {"provider":"gmail","email":"gmail@example.org"},
-                {"provider":"imap","email":"imap@example.org","imap":{"username":"imap@example.org","imapHost":"127.0.0.1","imapPort":imap_port,"insecure":true}},
+                {"provider":"imap","email":"imap@example.org","imap":{"username":"imap@example.org","imapHost":"127.0.0.1","imapPort":imap_port,"insecure":true,"testPlaintext":true}},
                 {"provider":"jmap","email":"jmap@example.org","jmap":{"sessionUrl":"https://localhost:9/session","username":"jmap@example.org"}},
                 {"provider":"outlook","email":"outlook@example.org","clientId":"synthetic-client","imap":{"tenant":"consumers"}}
             ]
@@ -152,12 +158,8 @@ fn mail_list_fixture(imap_port: u16, keyring_succeeds: bool) -> MailListFixture 
         .to_string(),
     )
     .unwrap();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::set_permissions(
-        config.join("accounts.json"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
+    set_mode(&config, 0o700);
+    set_mode(&config.join("accounts.json"), 0o600);
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
     let secret_tool = bin.join("secret-tool");
@@ -170,8 +172,49 @@ fn mail_list_fixture(imap_port: u16, keyring_succeeds: bool) -> MailListFixture 
         },
     )
     .unwrap();
-    fs::set_permissions(&secret_tool, fs::Permissions::from_mode(0o700)).unwrap();
+    set_mode(&secret_tool, 0o700);
+    fs::write(
+        root.join("integration-credential"),
+        if keyring_succeeds {
+            "synthetic\n"
+        } else {
+            "missing\n"
+        },
+    )
+    .unwrap();
     MailListFixture(root)
+}
+
+#[cfg(target_os = "macos")]
+fn config_root(root: &Path) -> PathBuf {
+    root.join("home/Library/Application Support")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn config_root(root: &Path) -> PathBuf {
+    root.join("config")
+}
+
+#[cfg(target_os = "macos")]
+fn state_root(root: &Path) -> PathBuf {
+    root.join("home/Library/Application Support")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn state_root(root: &Path) -> PathBuf {
+    root.join("state")
+}
+
+#[cfg(target_os = "macos")]
+fn assert_no_runtime_storage(root: &Path) {
+    assert!(!root.join("home/Library/Caches/omamail").exists());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn assert_no_runtime_storage(root: &Path) {
+    for name in ["cache", "state", "home"] {
+        assert!(!root.join(name).exists());
+    }
 }
 
 fn call_mail_list(root: &Path, account: &str) -> Output {
@@ -180,6 +223,14 @@ fn call_mail_list(root: &Path, account: &str) -> Output {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root.join("home"))
         .env("PATH", root.join("bin"))
+        .env(
+            "OMAMAIL_INTEGRATION_CREDENTIAL_FILE",
+            root.join("integration-credential"),
+        )
+        .env(
+            "OMAMAIL_INTEGRATION_CREDENTIAL_TRACE",
+            root.join("credential-touched"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -205,6 +256,14 @@ fn call_mail_read(root: &Path, account: &str, id: &str) -> Output {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("HOME", root.join("home"))
         .env("PATH", root.join("bin"))
+        .env(
+            "OMAMAIL_INTEGRATION_CREDENTIAL_FILE",
+            root.join("integration-credential"),
+        )
+        .env(
+            "OMAMAIL_INTEGRATION_CREDENTIAL_TRACE",
+            root.join("credential-touched"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -224,22 +283,41 @@ fn call_mail_read(root: &Path, account: &str, id: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
-fn metadata(path: &Path) -> (u32, (i64, i64), (i64, i64)) {
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+#[cfg(windows)]
+fn set_mode(_: &Path, _: u32) {}
+
+#[cfg(unix)]
+fn metadata(path: &Path) -> (u64, (i64, i64), (i64, i64)) {
     let metadata = fs::metadata(path).unwrap();
     (
-        metadata.mode(),
+        metadata.mode() as u64,
         (metadata.mtime(), metadata.mtime_nsec()),
         (metadata.ctime(), metadata.ctime_nsec()),
     )
 }
+#[cfg(windows)]
+fn metadata(path: &Path) -> (u64, (i64, i64), (i64, i64)) {
+    let metadata = fs::metadata(path).unwrap();
+    (metadata.len(), (0, 0), (0, 0))
+}
 
 type FixtureSnapshot = Vec<(
     std::path::PathBuf,
-    (u32, (i64, i64), (i64, i64)),
+    (u64, (i64, i64), (i64, i64)),
     Option<Vec<u8>>,
 )>;
 fn fixture_snapshot(root: &Path) -> FixtureSnapshot {
     fn visit(path: &Path, snapshot: &mut FixtureSnapshot) {
+        if path
+            .file_name()
+            .is_some_and(|name| name == "credential-touched")
+        {
+            return;
+        }
         snapshot.push((
             path.to_owned(),
             metadata(path),
@@ -260,7 +338,7 @@ fn fixture_snapshot(root: &Path) -> FixtureSnapshot {
 #[test]
 fn malformed_provider_action_previews_refuse_without_credentials_or_writes() {
     let fixture = mail_list_fixture(9, true);
-    let registry = fixture.0.join("config/omamail/accounts.json");
+    let registry = config_root(&fixture.0).join("omamail/accounts.json");
     let mut accounts: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
     accounts["accounts"]
         .as_array_mut()
@@ -384,7 +462,7 @@ async fn malformed_final_imap_action_id_prevents_all_network_and_cache_changes()
 #[test]
 fn configured_list_failures_do_not_repair_registry_metadata() {
     let fixture = mail_list_fixture(9, false);
-    let directory = fixture.0.join("config/omamail");
+    let directory = config_root(&fixture.0).join("omamail");
     let registry = directory.join("accounts.json");
     let before = (
         metadata(&directory),
@@ -421,7 +499,7 @@ fn configured_list_failures_do_not_repair_registry_metadata() {
 #[test]
 fn configured_read_failures_do_not_repair_registry_metadata() {
     let fixture = mail_list_fixture(9, false);
-    let directory = fixture.0.join("config/omamail");
+    let directory = config_root(&fixture.0).join("omamail");
     let registry = directory.join("accounts.json");
     let before = (
         metadata(&directory),
@@ -466,7 +544,7 @@ fn configured_read_failures_do_not_repair_registry_metadata() {
 #[test]
 fn imap_and_outlook_destination_previews_require_readonly_credentials() {
     let fixture = mail_list_fixture(9, false);
-    let directory = fixture.0.join("config/omamail");
+    let directory = config_root(&fixture.0).join("omamail");
     let registry = directory.join("accounts.json");
     let before = (
         metadata(&directory),
@@ -494,9 +572,7 @@ fn imap_and_outlook_destination_previews_require_readonly_credentials() {
                 ),
                 before
             );
-            for name in ["cache", "state", "home"] {
-                assert!(!fixture.0.join(name).exists());
-            }
+            assert_no_runtime_storage(&fixture.0);
         }
     }
 }
@@ -525,6 +601,8 @@ async fn imap_adapter_lists_first_page_without_request_token() {
                 b"O1 OK selected\r\n".as_slice()
             } else if line == b"O1 UID FETCH 1:* (UID)\r\n" {
                 b"* 1 FETCH (UID 7)\r\nO1 OK snapshot\r\n".as_slice()
+            } else if line == b"O1 UID FETCH 7 (UID INTERNALDATE)\r\n" {
+                b"* 1 FETCH (UID 7 INTERNALDATE \"11-Sep-2026 12:00:00 +0000\")\r\nO1 OK snapshot\r\n".as_slice()
             } else if line.starts_with(b"O1 UID FETCH 7 (UID FLAGS ") {
                 b"* 7 FETCH (UID 7 FLAGS () INTERNALDATE \"11-Sep-2026 12:00:00 +0000\" RFC822.SIZE 54 BODY[HEADER.FIELDS (FROM SUBJECT)] {54}\r\nFrom: Test <test@example.org>\r\nSubject: First page\r\n\r\n)\r\nO1 OK fetched\r\n".as_slice()
             } else {
@@ -706,13 +784,21 @@ fn root_mail(root: &Path, args: &[&str], body: &[u8]) -> Output {
         .env("XDG_STATE_HOME", root.join("state"))
         .env("HOME", root.join("home"))
         .env("PATH", root.join("bin"))
+        .env(
+            "OMAMAIL_INTEGRATION_CREDENTIAL_FILE",
+            root.join("integration-credential"),
+        )
+        .env(
+            "OMAMAIL_INTEGRATION_CREDENTIAL_TRACE",
+            root.join("credential-touched"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     if args.contains(&"send") {
-        let argv = fs::read(format!("/proc/{}/cmdline", child.id())).unwrap();
+        let argv = process_argv(child.id());
         assert!(
             !argv
                 .windows(b"private body".len())
@@ -727,6 +813,30 @@ fn root_mail(root: &Path, args: &[&str], body: &[u8]) -> Output {
     let _ = child.stdin.take().unwrap().write_all(body);
     child.wait_with_output().unwrap()
 }
+
+#[cfg(target_os = "linux")]
+fn process_argv(pid: u32) -> Vec<u8> {
+    fs::read(format!("/proc/{pid}/cmdline")).unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn process_argv(pid: u32) -> Vec<u8> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    output.stdout
+}
+
+#[cfg(target_os = "windows")]
+fn process_argv(pid: u32) -> Vec<u8> {
+    windows_process::process_argv(pid)
+}
+
+#[cfg(target_os = "windows")]
+#[path = "support/windows_process.rs"]
+mod windows_process;
 
 #[test]
 fn task_commands_have_only_the_approved_vocabulary_and_execute_switch() {
@@ -763,7 +873,7 @@ fn task_commands_have_only_the_approved_vocabulary_and_execute_switch() {
 #[test]
 fn root_mutations_preview_exact_intent_and_never_touch_storage_or_credentials() {
     let fixture = mail_list_fixture(9, false);
-    let config = fixture.0.join("config/omamail/accounts.json");
+    let config = config_root(&fixture.0).join("omamail/accounts.json");
     let before = (metadata(&config), fs::read(&config).unwrap());
     let sentinel = fixture.0.join("credential-touched");
     fs::write(
@@ -801,9 +911,7 @@ fn root_mutations_preview_exact_intent_and_never_touch_storage_or_credentials() 
     }
     assert_eq!((metadata(&config), fs::read(&config).unwrap()), before);
     assert!(!sentinel.exists());
-    for name in ["cache", "state", "home"] {
-        assert!(!fixture.0.join(name).exists());
-    }
+    assert_no_runtime_storage(&fixture.0);
 }
 
 #[test]
@@ -892,11 +1000,10 @@ fn send_previews_repeatable_inputs_and_strict_bounded_utf8_without_writes() {
         );
         assert!(output.stderr.is_empty());
     }
-    for name in ["cache", "state", "home"] {
-        assert!(!fixture.0.join(name).exists());
-    }
+    assert_no_runtime_storage(&fixture.0);
 }
 
+#[cfg(unix)]
 #[test]
 fn invalid_send_inputs_never_reach_credentials_or_outbox_even_with_execute() {
     use std::os::unix::fs::symlink;
@@ -949,9 +1056,7 @@ fn invalid_send_inputs_never_reach_credentials_or_outbox_even_with_execute() {
         }
     }
     assert!(!sentinel.exists());
-    for name in ["cache", "state", "home"] {
-        assert!(!fixture.0.join(name).exists());
-    }
+    assert_no_runtime_storage(&fixture.0);
 }
 
 #[test]
@@ -970,6 +1075,14 @@ fn only_send_consumes_stdin_and_human_previews_escape_untrusted_text() {
             .env("XDG_CONFIG_HOME", fixture.0.join("config"))
             .env("HOME", fixture.0.join("home"))
             .env("PATH", fixture.0.join("bin"))
+            .env(
+                "OMAMAIL_INTEGRATION_CREDENTIAL_FILE",
+                fixture.0.join("integration-credential"),
+            )
+            .env(
+                "OMAMAIL_INTEGRATION_CREDENTIAL_TRACE",
+                fixture.0.join("credential-touched"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1059,7 +1172,7 @@ async fn real_smtp_send(generic: bool, acknowledge: bool, owner: bool, crash: bo
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fixture = mail_list_fixture(9, true);
-    let config = fixture.0.join("config/omamail/accounts.json");
+    let config = config_root(&fixture.0).join("omamail/accounts.json");
     let mut registry: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     registry["accounts"][1]["imap"]["smtpHost"] = serde_json::json!("127.0.0.1");
     registry["accounts"][1]["imap"]["smtpPort"] =
@@ -1073,6 +1186,14 @@ async fn real_smtp_send(generic: bool, acknowledge: bool, owner: bool, crash: bo
             .env("XDG_CACHE_HOME", fixture.0.join("cache"))
             .env("HOME", fixture.0.join("home"))
             .env("PATH", fixture.0.join("bin"))
+            .env(
+                "OMAMAIL_INTEGRATION_CREDENTIAL_FILE",
+                fixture.0.join("integration-credential"),
+            )
+            .env(
+                "OMAMAIL_INTEGRATION_CREDENTIAL_TRACE",
+                fixture.0.join("credential-touched"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1205,9 +1326,10 @@ async fn real_smtp_send(generic: bool, acknowledge: bool, owner: bool, crash: bo
     if !acknowledge {
         assert_eq!(value["error"]["code"], "outbox_delivery_unknown");
     }
-    let durable: Value =
-        serde_json::from_slice(&fs::read(fixture.0.join("state/omamail/outbox.json")).unwrap())
-            .unwrap();
+    let durable: Value = serde_json::from_slice(
+        &fs::read(state_root(&fixture.0).join("omamail/outbox.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(durable.as_array().unwrap().len(), 1);
     assert_eq!(
         durable[0]["state"],
@@ -1313,7 +1435,7 @@ async fn imap_action_preview_requires_discovered_destinations_and_execution_uses
         for available in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let fixture = mail_list_fixture(listener.local_addr().unwrap().port(), true);
-            let config = fixture.0.join("config/omamail/accounts.json");
+            let config = config_root(&fixture.0).join("omamail/accounts.json");
             let before = (
                 metadata(&config),
                 fs::read(&config).unwrap(),
@@ -1415,9 +1537,7 @@ async fn imap_action_preview_requires_discovered_destinations_and_execution_uses
                         ),
                         before
                     );
-                    for name in ["cache", "state", "home"] {
-                        assert!(!fixture.0.join(name).exists());
-                    }
+                    assert_no_runtime_storage(&fixture.0);
                 }
             }
             peer.await.unwrap();
@@ -1531,7 +1651,7 @@ async fn root_list_and_read_use_active_account_and_safe_provider_results() {
     for read in [false, true] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let fixture = mail_list_fixture(listener.local_addr().unwrap().port(), true);
-        let config = fixture.0.join("config/omamail/accounts.json");
+        let config = config_root(&fixture.0).join("omamail/accounts.json");
         let mut registry: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         registry["activeId"] = serde_json::json!("imap:imap@example.org");
         fs::write(&config, registry.to_string()).unwrap();
@@ -1553,10 +1673,21 @@ async fn root_list_and_read_use_active_account_and_safe_provider_results() {
                     "O1 OK selected\r\n".into()
                 } else if line == "O1 UID FETCH 1:* (UID)\r\n" {
                     "* 1 FETCH (UID 7)\r\nO1 OK snapshot\r\n".into()
+                } else if line == "O1 UID FETCH 7 (UID INTERNALDATE)\r\n" {
+                    "* 1 FETCH (UID 7 INTERNALDATE \"11-Sep-2026 12:00:00 +0000\")\r\nO1 OK snapshot\r\n".into()
                 } else if line.starts_with("O1 UID FETCH 7 (UID FLAGS ") {
                     assert!(line.contains("BODY.PEEK["));
                     assert_eq!(line.contains("BODY.PEEK[]"), read);
-                    let raw = "From: Writer <writer@example.org>\r\nSubject: Safe root result\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nsafe body 工";
+                    let raw = concat!(
+                        "From: Writer <writer@example.org>\r\nSubject: Safe root result\r\n",
+                        "List-Unsubscribe: <https://news.example.org/leave>,\r\n <mailto:leave@example.org>\r\n",
+                        "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+                        "Content-Type: multipart/alternative; boundary=parts\r\n\r\n",
+                        "--parts\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nsafe body 工\r\n",
+                        "--parts\r\nContent-Type: text/html; charset=utf-8\r\n\r\n",
+                        "<p>safe body 工</p><a href=\"https://news.example.org/leave?a=1&amp;b=2\">Unsubscribe</a>",
+                        "<img src=\"https://tracker.example/pixel\"><a href=\"javascript:bad\">Bad</a>\r\n--parts--\r\n"
+                    );
                     format!(
                         "* 7 FETCH (UID 7 FLAGS () INTERNALDATE \"11-Sep-2026 12:00:00 +0000\" RFC822.SIZE {} BODY[] {{{}}}\r\n{}\r\n)\r\nO1 OK fetched\r\n",
                         raw.len(),
@@ -1596,6 +1727,20 @@ async fn root_list_and_read_use_active_account_and_safe_provider_results() {
                 value["result"]["message"]["nativeContent"]["body"]["text"],
                 "safe body 工"
             );
+            assert_eq!(
+                value["result"]["message"]["links"],
+                serde_json::json!([
+                    {"text":"Unsubscribe","url":"https://news.example.org/leave?a=1&b=2"}
+                ])
+            );
+            assert_eq!(
+                value["result"]["message"]["unsubscribe"],
+                serde_json::json!({
+                    "urls":["https://news.example.org/leave","mailto:leave@example.org"],"oneClick":true
+                })
+            );
+            assert!(!value.to_string().contains("tracker.example"));
+            assert!(!value.to_string().contains("javascript:"));
         } else {
             assert_eq!(value["result"]["messages"][0]["id"], "7:INBOX");
             assert_eq!(value["result"]["mailbox"], "inbox");
@@ -1603,5 +1748,41 @@ async fn root_list_and_read_use_active_account_and_safe_provider_results() {
         }
         assert!(output.stderr.is_empty());
         peer.await.unwrap();
+    }
+}
+
+#[cfg(not(all(feature = "agent", unix)))]
+#[test]
+fn agent_disabled_build_has_no_worker_or_agent_rpc() {
+    let worker = omamail(&["agent-worker", "synthetic-job"]);
+    assert!(!worker.status.success());
+    assert!(String::from_utf8_lossy(&worker.stderr).contains("unrecognized subcommand"));
+    let info = omamail(&["info", "--json"]);
+    assert!(info.status.success());
+    let info: Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(info["capabilities"]["agent"], false);
+    assert!(
+        info["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|method| !method.as_str().unwrap().starts_with("agent."))
+    );
+    for method in [
+        "agent.context",
+        "agent.contextCancel",
+        "agent.jobsList",
+        "agent.jobsProjection",
+        "agent.jobStart",
+        "agent.jobShow",
+        "agent.jobCancel",
+        "agent.jobForget",
+    ] {
+        let output = omamail(&["call", method, "--json"]);
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"]["code"],
+            "unknown_method"
+        );
     }
 }

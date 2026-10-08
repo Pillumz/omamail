@@ -6,6 +6,7 @@ import re
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from html import escape
 
 
 def paint(element, color):
@@ -16,6 +17,9 @@ def paint(element, color):
 
 
 def main(args):
+    calendar = bool(args and args[0] == '--calendar')
+    if calendar:
+        args = args[1:]
     if (len(args) != 5 or args[2] != '--'
             or any(not re.fullmatch(r'#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?', c)
                    for c in args[:2])):
@@ -40,8 +44,14 @@ def main(args):
         if temporary and os.path.exists(temporary):
             os.unlink(temporary)
     # Preserve notify-send's stdout action and lifetime for the QML waiter.
-    os.execvp('notify-send', ['notify-send', '-a', 'Omamail', '-i', str(path),
-                            '--action=default=Read...', '--', title, body])
+    # notify-send treats these arguments as markup. Escape sender-authored text
+    # at the last boundary so native notification APIs still receive plain text.
+    title = escape(title, quote=False)
+    body = escape(body, quote=False)
+    actions = (['--action=default=Open event...', '--action=snooze=Snooze', '--action=dismiss=Dismiss']
+               if calendar else ['--action=default=Read...'])
+    os.execvp('notify-send', ['notify-send', '-a', 'Omamail', '-i', str(path)]
+              + actions + ['--', title, body])
 
 
 if __name__ == '__main__':

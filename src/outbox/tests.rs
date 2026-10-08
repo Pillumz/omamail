@@ -19,7 +19,9 @@ async fn owner_submission_ack_loss_replays_one_durable_id_without_another_delive
         .await
         .unwrap();
     let params = enqueue("lost-reply", "a@example.org", 0);
-    let mut socket = tokio::net::UnixStream::connect(dir.0.join("omamail/outbox.sock"))
+    let mut socket = crate::platform::ipc::LocalEndpoint::outbox(&dir.0)
+        .unwrap()
+        .connect()
         .await
         .unwrap();
     let bytes = json!({"method":"outbox.enqueue","params":params})
@@ -27,9 +29,12 @@ async fn owner_submission_ack_loss_replays_one_durable_id_without_another_delive
         .into_bytes();
     socket.write_u32(bytes.len() as u32).await.unwrap();
     socket.write_all(&bytes).await.unwrap();
-    // Deliberately abandon the IPC acknowledgement after writing the request.
-    drop(socket);
+    // Never consume the acknowledgement. Keep the peer alive until accept has
+    // authenticated it: Darwin cannot recover peer credentials after both ends
+    // have been closed. Shutting the write side still sends the complete frame.
+    socket.shutdown().await.unwrap();
     wait_state(&owner, "lost-reply", "a@example.org", "unknown").await;
+    drop(socket);
     let submitter = Outbox::with_root(
         Arc::new(|_| Box::pin(async { panic!("submitter must never deliver") })),
         Some(dir.0.clone()),
@@ -93,7 +98,9 @@ async fn owner_bridge_rejects_unbounded_frames_unkeyed_mutations_and_payload_rea
         );
     }
     for (length, bytes) in [(u32::MAX, b"".as_slice()), (1, b"{".as_slice())] {
-        let mut socket = tokio::net::UnixStream::connect(dir.0.join("omamail/outbox.sock"))
+        let mut socket = crate::platform::ipc::LocalEndpoint::outbox(&dir.0)
+            .unwrap()
+            .connect()
             .await
             .unwrap();
         socket.write_u32(length).await.unwrap();
@@ -110,6 +117,7 @@ async fn owner_bridge_rejects_unbounded_frames_unkeyed_mutations_and_payload_rea
     assert_eq!(storage::read(&dir.0).unwrap(), before);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn owner_socket_refuses_symlinks_and_non_socket_entries_without_removing_them() {
     use std::os::unix::fs::symlink;
@@ -269,7 +277,9 @@ async fn mail_send_preview_is_write_free_and_execute_keeps_one_durable_job() {
 }
 struct Temp(PathBuf);
 
+#[cfg(unix)]
 struct ForkedDescriptors(i32, std::os::unix::net::UnixStream);
+#[cfg(unix)]
 impl ForkedDescriptors {
     fn new() -> Self {
         use std::io::Read;
@@ -293,6 +303,7 @@ impl ForkedDescriptors {
         Self(pid, parent)
     }
 }
+#[cfg(unix)]
 impl Drop for ForkedDescriptors {
     fn drop(&mut self) {
         use std::io::Write;
@@ -303,6 +314,7 @@ impl Drop for ForkedDescriptors {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn forked_child_drop_cannot_unlock_its_parent_lease() {
     use std::io::Read;
@@ -339,6 +351,7 @@ fn forked_child_drop_cannot_unlock_its_parent_lease() {
     assert!(storage::lease(&dir.0).is_ok());
 }
 
+#[cfg(unix)]
 #[test]
 fn forked_child_descriptor_cannot_extend_the_last_owner_lease() {
     use std::os::fd::AsRawFd;
@@ -353,9 +366,12 @@ fn forked_child_descriptor_cannot_extend_the_last_owner_lease() {
         unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
         0
     );
-    let child = ForkedDescriptors::new();
-    let inherited = format!("/proc/{}/fd/{fd}", child.0);
+    let _child = ForkedDescriptors::new();
+    #[cfg(target_os = "linux")]
+    let inherited = format!("/proc/{}/fd/{fd}", _child.0);
+    #[cfg(target_os = "linux")]
     let lock_path = dir.0.join("omamail/outbox.lock");
+    #[cfg(target_os = "linux")]
     assert_eq!(std::fs::read_link(&inherited).unwrap(), lock_path);
     drop(lease);
     assert!(
@@ -363,10 +379,12 @@ fn forked_child_descriptor_cannot_extend_the_last_owner_lease() {
         "an active writer must retain exclusivity"
     );
     drop(writer);
-    assert!(
-        std::fs::read_link(format!("/proc/self/fd/{fd}")).is_err(),
-        "the parent closed its final descriptor"
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_GETFD) },
+        -1,
+        "parent closed its final descriptor"
     );
+    #[cfg(target_os = "linux")]
     assert_eq!(
         std::fs::read_link(&inherited).unwrap(),
         lock_path,
@@ -453,13 +471,14 @@ impl Temp {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        Self::create(std::env::temp_dir().join(format!(
+        Self::create(std::env::temp_dir().canonicalize().unwrap().join(format!(
             "omamail-outbox-{}-{stamp}-{}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
         )))
     }
     fn create(base: PathBuf) -> Self {
+        #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt;
         for attempt in 0..1024 {
             let path = if attempt == 0 {
@@ -467,7 +486,10 @@ impl Temp {
             } else {
                 base.with_extension(attempt.to_string())
             };
-            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path) {
                 Ok(()) => return Self(path),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("could not create private test directory: {error}"),
@@ -674,6 +696,7 @@ async fn uncertain_delivery_is_not_retried_and_restart_recovers_unsent() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn unsafe_storage_and_invalid_requests_cannot_send() {
     use std::os::unix::fs::symlink;
@@ -727,8 +750,10 @@ async fn rust_timer_delivers_without_any_ui_flush_or_poll_command() {
     assert!(start.elapsed() >= Duration::from_millis(900));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn shutdown_marks_wire_inflight_unknown_and_refuses_new_sends() {
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     if crate::mail::tests::isolated() {
         return;
@@ -748,6 +773,7 @@ async fn shutdown_marks_wire_inflight_unknown_and_refuses_new_sends() {
         .await
         .unwrap();
     wait_state(&outbox, "inflight", "a@example.org", "sending").await;
+    #[cfg(target_os = "linux")]
     let lease_fd = outbox
         .inner
         .lease
@@ -756,9 +782,12 @@ async fn shutdown_marks_wire_inflight_unknown_and_refuses_new_sends() {
         .as_ref()
         .unwrap()
         .as_raw_fd();
-    let child = ForkedDescriptors::new();
-    let inherited = format!("/proc/{}/fd/{lease_fd}", child.0);
+    let _child = ForkedDescriptors::new();
+    #[cfg(target_os = "linux")]
+    let inherited = format!("/proc/{}/fd/{lease_fd}", _child.0);
+    #[cfg(target_os = "linux")]
     let lock_path = dir.0.join("omamail/outbox.lock");
+    #[cfg(target_os = "linux")]
     assert_eq!(std::fs::read_link(&inherited).unwrap(), lock_path);
     outbox.shutdown().await.unwrap();
     assert_eq!(state(&outbox, "inflight", "a@example.org").await, "unknown");
@@ -769,6 +798,7 @@ async fn shutdown_marks_wire_inflight_unknown_and_refuses_new_sends() {
         Err("outbox_stopping")
     );
     drop(outbox);
+    #[cfg(target_os = "linux")]
     assert_eq!(
         std::fs::read_link(&inherited).unwrap(),
         lock_path,
@@ -897,6 +927,85 @@ async fn successful_receipts_are_compact_and_do_not_fill_the_active_queue() {
 }
 
 #[tokio::test]
+async fn acknowledged_proposal_failures_release_capacity_and_keep_restart_deduplication() {
+    for terminal_state in ["cancelled", "failed"] {
+        let dir = Temp::new();
+        let id = "agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0";
+        let params = enqueue(id, "a@example.org", 60);
+        let entries: Vec<_> = (0..MAX_RECOVERABLE)
+            .map(|i| {
+                json!({"id":format!("agent-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{i}"),
+                    "accountId":"a@example.org","provider":"gmail",
+                    "payload":params["payload"],"digest":digest(&params["payload"]),
+                    "state":terminal_state})
+            })
+            .collect();
+        storage::write(&dir.0, &json!(entries)).unwrap();
+        let executor: Executor = Arc::new(|_| Box::pin(async { panic!("must never deliver") }));
+        let outbox = Outbox::with_root(executor.clone(), Some(dir.0.clone()));
+        let fresh = enqueue("fresh", "a@example.org", 60);
+        assert_eq!(
+            outbox.call("outbox.enqueue", &fresh).await,
+            Err("outbox_full")
+        );
+        outbox
+            .call(
+                "outbox.forget",
+                &json!({"accountId":"a@example.org","sendId":id}),
+            )
+            .await
+            .unwrap();
+        let stored = storage::read(&dir.0).unwrap();
+        let stored = stored.as_array().unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|entry| entry.get("payload").is_some())
+                .count(),
+            MAX_RECOVERABLE - 1
+        );
+        let receipt = stored.iter().find(|entry| entry["id"] == id).unwrap();
+        assert_eq!(receipt["acknowledged"], true);
+        assert_eq!(receipt["digest"], digest(&params["payload"]));
+        outbox.shutdown().await.unwrap();
+        drop(outbox);
+
+        let restarted = Outbox::with_root(executor, Some(dir.0.clone()));
+        let snapshot = restarted
+            .call("outbox.snapshot", &json!({"accountId":"a@example.org"}))
+            .await
+            .unwrap();
+        assert!(
+            snapshot["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["id"] != id),
+            "acknowledged failures must not resurface after restart"
+        );
+        assert_eq!(
+            restarted.call("outbox.enqueue", &params).await.unwrap()["duplicate"],
+            true
+        );
+        let mut conflicting = params;
+        conflicting["payload"]["raw"] = json!("changed proposal");
+        assert_eq!(
+            restarted.call("outbox.enqueue", &conflicting).await,
+            Err("outbox_send_id_conflict")
+        );
+        restarted.call("outbox.enqueue", &fresh).await.unwrap();
+        restarted
+            .call(
+                "outbox.undo",
+                &json!({"accountId":"a@example.org","sendId":"fresh"}),
+            )
+            .await
+            .unwrap();
+        restarted.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn queue_preserves_large_composed_payload_without_the_old_sixteen_megabyte_cutoff() {
     let dir = Temp::new();
     let outbox = Outbox::with_root(
@@ -924,6 +1033,7 @@ async fn queue_preserves_large_composed_payload_without_the_old_sixteen_megabyte
     outbox.shutdown().await.unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn test_directories_retry_collisions_without_reusing_or_removing_existing_data() {
     use std::os::unix::fs::PermissionsExt;

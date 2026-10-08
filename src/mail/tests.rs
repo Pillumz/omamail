@@ -2,11 +2,14 @@ use super::{
     ActRequest, ListRequest, Mailbox, Mark, Provider, ReadRequest, SendRequest, resolve_account,
 };
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::{
     env,
     ffi::OsString,
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
     sync::{
         Mutex, MutexGuard,
@@ -27,6 +30,7 @@ pub(crate) fn isolated() -> bool {
     let output = std::process::Command::new(env::current_exe().unwrap())
         .args(["--exact", &name, "--test-threads=1", "--nocapture"])
         .env("OMAMAIL_ACTION_TEST_CHILD", name)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -40,18 +44,34 @@ pub(crate) fn isolated() -> bool {
 
 pub(crate) struct AccountFixture {
     _environment: MutexGuard<'static, ()>,
+    dirs_override: Option<crate::platform::dirs::TestAppDirsOverride>,
     previous: Option<OsString>,
     previous_cache: Option<OsString>,
     previous_state: Option<OsString>,
     previous_home: Option<OsString>,
     pub(crate) root: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) cache: PathBuf,
+    pub(crate) state: PathBuf,
+    pub(crate) home: PathBuf,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct MetadataState {
+    #[cfg(unix)]
     mode: u32,
+    #[cfg(unix)]
     modified: (i64, i64),
+    #[cfg(unix)]
     changed: (i64, i64),
+    #[cfg(windows)]
+    attributes: u32,
+    #[cfg(windows)]
+    modified: u64,
+    #[cfg(windows)]
+    created: u64,
+    #[cfg(windows)]
+    size: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -63,15 +83,27 @@ struct RegistryState {
 
 fn metadata_state(path: &std::path::Path) -> MetadataState {
     let metadata = fs::metadata(path).unwrap();
-    MetadataState {
-        mode: metadata.mode(),
-        modified: (metadata.mtime(), metadata.mtime_nsec()),
-        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    #[cfg(unix)]
+    {
+        return MetadataState {
+            mode: metadata.mode(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        };
+    }
+    #[cfg(windows)]
+    {
+        MetadataState {
+            attributes: metadata.file_attributes(),
+            modified: metadata.last_write_time(),
+            created: metadata.creation_time(),
+            size: metadata.file_size(),
+        }
     }
 }
 
 fn registry_state(fixture: &AccountFixture) -> RegistryState {
-    let directory = fixture.root.join("omamail");
+    let directory = fixture.config.join("omamail");
     let registry = directory.join("accounts.json");
     RegistryState {
         directory: metadata_state(&directory),
@@ -115,6 +147,7 @@ pub(crate) fn fixture_tree(root: &std::path::Path) -> Vec<(PathBuf, MetadataStat
 
 impl Drop for AccountFixture {
     fn drop(&mut self) {
+        drop(self.dirs_override.take());
         unsafe {
             if let Some(previous) = &self.previous {
                 env::set_var("XDG_CONFIG_HOME", previous);
@@ -149,34 +182,55 @@ pub(crate) fn account_fixture(registry: Value) -> AccountFixture {
     let environment = ENVIRONMENT
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let root = env::temp_dir().join(format!(
+    let root = env::temp_dir().canonicalize().unwrap().join(format!(
         "omamail-mail-tests-{}-{}",
         std::process::id(),
         FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir_all(root.join("omamail")).unwrap();
-    fs::write(root.join("omamail/accounts.json"), registry.to_string()).unwrap();
-    fs::set_permissions(root.join("omamail"), fs::Permissions::from_mode(0o700)).unwrap();
-    fs::set_permissions(
-        root.join("omamail/accounts.json"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
     let previous = env::var_os("XDG_CONFIG_HOME");
     let previous_cache = env::var_os("XDG_CACHE_HOME");
     let previous_state = env::var_os("XDG_STATE_HOME");
     let previous_home = env::var_os("HOME");
-    unsafe { env::set_var("XDG_CONFIG_HOME", &root) };
+    let home = root.join("home");
+    let dirs = crate::platform::dirs::AppDirs::from_roots(
+        root.join("config"),
+        root.join("cache"),
+        root.join("state"),
+        root.join("runtime"),
+        root.join("downloads"),
+    )
+    .unwrap();
+    let dirs_override =
+        crate::platform::dirs::install_test_override(dirs.clone(), home.clone()).unwrap();
+    unsafe { env::set_var("XDG_CONFIG_HOME", root.join("config")) };
     unsafe { env::set_var("XDG_CACHE_HOME", root.join("cache")) };
     unsafe { env::set_var("XDG_STATE_HOME", root.join("state")) };
-    unsafe { env::set_var("HOME", root.join("home")) };
+    unsafe { env::set_var("HOME", &home) };
+    let config = crate::platform::private_fs::directories(
+        &dirs.config,
+        &[crate::platform::dirs::APP_DIRECTORY],
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    crate::platform::private_fs::atomic_replace(
+        &config,
+        "accounts.json",
+        registry.to_string().as_bytes(),
+    )
+    .unwrap();
     AccountFixture {
         _environment: environment,
+        dirs_override: Some(dirs_override),
         previous,
         previous_cache,
         previous_state,
         previous_home,
         root,
+        config: dirs.config,
+        cache: dirs.cache,
+        state: dirs.state,
+        home,
     }
 }
 
