@@ -6,6 +6,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../ui"
 
 fail() { printf 'test_source.sh: %s\n' "$1" >&2; exit 1; }
 
+# Arch keeps the digest in `sha256sum`; macOS and Perl ship `shasum -a 256`.
+# Use whichever is present so the checksum gate runs on either without changing
+# which digest it checks: both print the same SHA-256 hex.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    fail "neither sha256sum nor shasum is installed to verify $1"
+  fi
+}
+
 # Enumerated rather than globbed: the layout groups by module, and a module
 # with no QML in it (message/, today) turns a literal glob into a grep error
 # that hides whatever the check was meant to say.
@@ -1087,7 +1100,7 @@ fi
 font_provenance=app/assets/fonts/NerdFonts-PROVENANCE.md
 [ -f "../$font_provenance" ] || fail "bundled fonts must record their provenance"
 while read -r expected file; do
-  actual=$(cd .. && shasum -a 256 "$file" | awk '{print $1}')
+  actual=$(cd .. && sha256_of "$file")
   [ "$actual" = "$expected" ] || fail "$file does not match its reviewed upstream checksum"
   grep -q "$expected" "../$font_provenance" \
     || fail "$file checksum is missing from its shipped provenance"
@@ -1105,7 +1118,7 @@ mac_icon=app/resources/macos/omamail.icns
 [ "$(cd .. && wc -c < "$mac_icon")" -eq 111809 ] \
   || fail "$mac_icon does not match its reviewed byte size"
 mac_icon_checksum=bd29ce1e72aa9db37ed5b1cb930956d2d933dc4426e7cea7f1b8baf2edb9262d
-actual_mac_icon_checksum=$(cd .. && shasum -a 256 "$mac_icon" | awk '{print $1}')
+actual_mac_icon_checksum=$(cd .. && sha256_of "$mac_icon")
 [ "$actual_mac_icon_checksum" = "$mac_icon_checksum" ] \
   || fail "$mac_icon does not match its reviewed checksum"
 grep -q "$mac_icon_checksum" "../$icon_provenance" \
@@ -1114,7 +1127,7 @@ grep -q '1277a2cf247b275a15961fb20175420abb5dfc5489acb95313f4f604c09b6e78' "../$
   || fail "the macOS icon source checksum is missing from its shipped provenance"
 windows_icon=app/resources/windows/omamail.ico
 windows_icon_checksum=2562966adb272711ae0274f7eade7ef2680781bb4405182280a310658752131d
-actual_windows_icon_checksum=$(cd .. && shasum -a 256 "$windows_icon" | awk '{print $1}')
+actual_windows_icon_checksum=$(cd .. && sha256_of "$windows_icon")
 [ "$actual_windows_icon_checksum" = "$windows_icon_checksum" ] \
   || fail "$windows_icon does not match its reviewed checksum"
 grep -q "$windows_icon_checksum" "../$icon_provenance" \

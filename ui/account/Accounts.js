@@ -504,8 +504,26 @@ function discardDraftAt(list, index) {
 // Empty is not a name and clears it, which is what puts the address back:
 // `label()` falls through to the local part, so there is no state in which a
 // mailbox has nothing to be called.
+// QML 6.12 can hand a value that crossed a signal or `var` boundary back as a
+// V4Sequence: not an Array, but a sequence with an integral length and the
+// sequence methods (including `slice`). Read one by index into a plain JS
+// array. A JSON object can carry a numeric `length` but can never carry a
+// function, so an arbitrary object stays rejected, as it was when only
+// Array.isArray was accepted; a genuine sequence is the only non-Array that
+// gets through. Copy by index rather than enumerating keys, so an own
+// "__proto__" is never run as a setter.
+function plainList(value) {
+  if (Array.isArray(value)) return value
+  if (!value || typeof value !== "object" || typeof value.slice !== "function"
+      || typeof value.length !== "number" || !isFinite(value.length)
+      || value.length < 0 || Math.floor(value.length) !== value.length) return []
+  var out = []
+  for (var i = 0; i < value.length; i++) out.push(value[i])
+  return out
+}
+
 function idList(value) {
-  var list = Array.isArray(value) ? value : []
+  var list = plainList(value)
   var out = []
   for (var i = 0; i < list.length; i++) {
     var item = trimmed(list[i])
