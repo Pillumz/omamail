@@ -853,6 +853,22 @@ assert.strictEqual(frozen(accounts.replaceAt(cidActive, -1, account("x@example.c
     "and it is written to disk and read back")
 }
 
+// The watch list reads a real sequence by index, but must not widen into
+// accepting any object that merely carries a numeric length: only a sequence
+// (Array or the Qt sequence the shell hands back) has the sequence methods. A
+// malformed entry must not turn its keys into watch ids, and an unbounded
+// length must not be walked.
+deepEqual(accounts.idList({ length: 3, 0: "a", 1: "b", 2: "c" }), [],
+  "a plain object with a length is not a sequence")
+deepEqual(accounts.idList({ length: 1e100 }), [], "an unbounded length is refused")
+deepEqual(accounts.idList({ length: Infinity, 0: "a" }), [], "an infinite length is refused")
+deepEqual(accounts.idList({ length: -1, 0: "a" }), [], "a negative length is refused")
+deepEqual(accounts.idList({ length: 1.5, 0: "a" }), [], "a fractional length is refused")
+deepEqual(accounts.idList("Work"), [], "a string is not a sequence")
+deepEqual(accounts.idList(null), [], "null is not a sequence")
+deepEqual(accounts.idList([" Label_7 ", "Label_7", "", "  "]), ["Label_7"],
+  "trimming and de-duplication are preserved for a real sequence")
+
 
 // An HTML signature sits beside the plain one and survives its edits.
 {
