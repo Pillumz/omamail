@@ -13,7 +13,7 @@ printf '%s\n' "$*" >>"$PUBLISH_TEST_LOG"
 case "$1 $2" in
   "auth status") exit 0 ;;
   "api --paginate") exit "${PUBLISH_TEST_API_FAIL:-0}" ;;
-  "pr create") echo https://github.com/huacnlee/omamail/pull/123 ;;
+  "pr create") echo https://github.com/Pillumz/omamail/pull/123 ;;
   "run list") echo 4242 ;;
   "run watch") exit 0 ;;
   *) exit 2 ;;
@@ -72,7 +72,7 @@ test "$(git -C "$root/clone" branch --show-current)" = release/0.2.0
 test -z "$(git -C "$root/clone" status --porcelain)"
 grep -F 'run watch 4242 --exit-status' "$PUBLISH_TEST_LOG" >/dev/null
 ! grep -q 'workflow run' "$PUBLISH_TEST_LOG"
-grep -F 'https://github.com/huacnlee/omamail/releases/tag/v0.2.0' "$root/out" >/dev/null
+grep -F 'https://github.com/Pillumz/omamail/releases/tag/v0.2.0' "$root/out" >/dev/null
 grep -F 'pull/123' "$root/out" >/dev/null
 
 # No argument prepares the next patch release.

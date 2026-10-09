@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repository="huacnlee/omamail"
+repository="Pillumz/omamail"
 version="latest"
 uninstall=0
 archive_path="${OMAMAIL_BUNDLE_PATH:-}"

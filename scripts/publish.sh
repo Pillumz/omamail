@@ -4,7 +4,7 @@ set -euo pipefail
 fail() { printf 'publish: %s\n' "$1" >&2; exit 1; }
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
-export GH_REPO="${GH_REPOSITORY:-huacnlee/omamail}"
+export GH_REPO="${GH_REPOSITORY:-Pillumz/omamail}"
 repository="$GH_REPO"
 gh auth status >/dev/null 2>&1 || fail "gh is not authenticated; run: gh auth login"
 current_branch="$(git rev-parse --abbrev-ref HEAD)"

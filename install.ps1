@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$Repository = "huacnlee/omamail"
+$Repository = "Pillumz/omamail"
 $Asset = "omamail-app-windows-x86_64.zip"
 $ExpectedTarget = "windows-x86_64"
 $AppUserModelId = "com.omamail.app"
