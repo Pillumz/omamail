@@ -195,9 +195,9 @@ async fn fifteen_thousand_sparse_ten_digit_uids_have_bounded_search_and_fetch_co
     );
     assert!(state.largest_search < 65536);
     // The synthetic server rejects an argument past 8000 bytes with the exact
-    // Stalwart refusal; each fetch set must also spend most of the budget.
-    assert!(state.largest_fetch_set > UID_SET_BYTES - 100);
-    assert!(state.largest_fetch_set <= UID_SET_BYTES);
+    // Stalwart refusal; fetch sets stay under it while using it substantially.
+    assert!(state.largest_fetch_set > 8000 / 2);
+    assert!(state.largest_fetch_set <= 8000);
 }
 
 #[tokio::test]

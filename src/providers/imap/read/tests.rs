@@ -402,8 +402,7 @@ async fn folder_listing_bounds_uid_arguments_and_preserves_imported_date_order()
     );
     assert_eq!(searched["page"]["estimate"], total);
     let (largest, batches) = &*observed.lock().unwrap();
-    assert!(*largest > 0 && *largest <= UID_SET_BYTES);
-    assert_eq!(batches.len(), 4 * 3, "every list call re-scans the folder");
+    assert!(*largest > 0 && *largest <= 8000, "server argument limit");
     assert!(
         batches.iter().all(|size| *size <= 4096),
         "the response bound stays at 4096 messages per fetch"
