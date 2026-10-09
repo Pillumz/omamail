@@ -2,6 +2,21 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 mod paging;
 
+/// Expand a wire sequence set (`1:3,7`) into exactly the UIDs it names.
+fn expand(set: &str) -> Vec<u32> {
+    set.split(',')
+        .flat_map(|token| match token.split_once(':') {
+            Some((first, last)) => {
+                first.parse::<u32>().unwrap()..=last.parse::<u32>().unwrap()
+            }
+            None => {
+                let uid = token.parse::<u32>().unwrap();
+                uid..=uid
+            }
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct Counts {
     searches: AtomicUsize,
@@ -66,7 +81,7 @@ async fn peer(socket: TcpStream, counts: Arc<Counts>) {
         } else if let Some(rest) = cmd.strip_prefix("O1 UID FETCH ") {
             if rest.ends_with(" (UID)\r\n") {
                 counts.verifications.fetch_add(1, Ordering::SeqCst);
-                for uid in rest.split_once(' ').unwrap().0.split(',') {
+                for uid in expand(rest.split_once(' ').unwrap().0) {
                     data.push_str(&format!("* 1 FETCH (UID {uid})\r\n"));
                 }
                 data.push_str("O1 OK done\r\n");
@@ -75,8 +90,8 @@ async fn peer(socket: TcpStream, counts: Arc<Counts>) {
             }
             counts.fetches.fetch_add(1, Ordering::SeqCst);
             assert!(rest.ends_with(" (UID INTERNALDATE)\r\n"));
-            for uid in rest.split_once(' ').unwrap().0.split(',') {
-                let day = if uid == "1" { 28 } else { 20 };
+            for uid in expand(rest.split_once(' ').unwrap().0) {
+                let day = if uid == 1 { 28 } else { 20 };
                 data.push_str(&format!(
                     "* 1 FETCH (UID {uid} INTERNALDATE \"{day}-Sep-2026 12:00:00 +0000\")\r\n"
                 ));
@@ -264,7 +279,7 @@ async fn generic_peer(socket: TcpStream, selected: Arc<std::sync::Mutex<Vec<Stri
                         .map(|m| m.1)
                         .collect()
                 } else {
-                    set.split(',').map(|uid| uid.parse().unwrap()).collect()
+                    expand(set)
                 };
                 for (_, uid, _, _) in GENERIC
                     .iter()
@@ -276,8 +291,7 @@ async fn generic_peer(socket: TcpStream, selected: Arc<std::sync::Mutex<Vec<Stri
                 write(&mut wire, data.as_bytes()).await.unwrap();
                 continue;
             }
-            for uid in set.split(',') {
-                let uid = uid.parse::<u32>().unwrap();
+            for uid in expand(set) {
                 let (_, _, day, raw) = GENERIC
                     .iter()
                     .find(|m| m.0 == folder && m.1 == uid)
