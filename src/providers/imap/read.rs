@@ -407,6 +407,49 @@ fn query(query: &str) -> Result<(String, String)> {
     }
     Ok((folder, criteria))
 }
+/// Longest UID sequence set sent as one command argument, in bytes. Stalwart
+/// rejects an argument past 8000 bytes (`BAD [PARSE] Argument exceeds maximum
+/// length of 8000 bytes`), and other servers bound whole command lines, so the
+/// framed set plus its command wrapper must stay far below that. Adjacent UIDs
+/// frame as one `first:last` token, so dense folders keep large batches while
+/// fully sparse ten-digit UIDs still fit hundreds per command.
+const UID_SET_BYTES: usize = 4096;
+
+/// Split sorted, deduplicated UIDs into batches of at most `max_items` (the
+/// response bound, kept separate from the command bound) whose framed sequence
+/// set stays within `UID_SET_BYTES`. A `first:last` token only spans UIDs
+/// present in `uids`, so a range gap can never fetch an unknown ID.
+fn uid_batches(uids: &[u32], max_items: usize) -> Vec<(&[u32], String)> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < uids.len() {
+        let mut set = String::new();
+        let mut end = start;
+        while end < uids.len() && end - start < max_items {
+            let cap = (start + max_items).min(uids.len());
+            let mut run = end + 1;
+            while run < cap && uids[run] as u64 == uids[run - 1] as u64 + 1 {
+                run += 1;
+            }
+            let token = if run == end + 1 {
+                uids[end].to_string()
+            } else {
+                format!("{}:{}", uids[end], uids[run - 1])
+            };
+            if end > start && set.len() + 1 + token.len() > UID_SET_BYTES {
+                break;
+            }
+            if !set.is_empty() {
+                set.push(',');
+            }
+            set.push_str(&token);
+            end = run;
+        }
+        batches.push((&uids[start..end], set));
+        start = end;
+    }
+    batches
+}
 fn search_uids(data: &[u8]) -> Result<Vec<u32>> {
     let mut out = BTreeSet::new();
     for row in nodes(data)? {
@@ -534,12 +577,7 @@ async fn list(w: &mut Wire, p: &Value, boxes: &Mailboxes) -> Result<Value> {
             .into_keys()
             .collect();
         let mut dates = BTreeMap::new();
-        for window in snapshot.chunks(4096) {
-            let set = window
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
+        for (window, set) in uid_batches(&snapshot, 4096) {
             let fetched =
                 fetched_dates(&command(w, &format!("UID FETCH {set} (UID INTERNALDATE)")).await?)?;
             // Ignore unsolicited updates outside this batch (including arrivals

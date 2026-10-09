@@ -318,11 +318,6 @@ async fn step(
             release(wire, key).await;
             return Ok(());
         }
-        let set = window
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
         let field = match identity {
             Identity::FolderUid => "",
             Identity::Content => " BODY.PEEK[]",
@@ -330,23 +325,28 @@ async fn step(
             Identity::GmailId => " X-GM-MSGID",
             Identity::Candidate => " RFC822.SIZE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]",
         };
-        let data = command(
-            &mut wire,
-            &format!("UID FETCH {set} (UID INTERNALDATE{field})"),
-        )
-        .await?;
-        let messages = fetched(&data, window, identity)?;
-        if identity == Identity::Content {
-            for message in messages {
-                if let Ok(index) = folder
-                    .messages
-                    .binary_search_by_key(&message.uid, |m| m.uid)
-                {
-                    folder.messages[index].identity = message.identity;
+        // The explicit set names only matched UIDs, so it is also bound by
+        // command bytes: a window of sparse ten-digit UIDs otherwise exceeds
+        // the server's argument limit (Stalwart: 8000 bytes).
+        for (batch, set) in uid_batches(window, BATCH) {
+            let data = command(
+                &mut wire,
+                &format!("UID FETCH {set} (UID INTERNALDATE{field})"),
+            )
+            .await?;
+            let messages = fetched(&data, batch, identity)?;
+            if identity == Identity::Content {
+                for message in messages {
+                    if let Ok(index) = folder
+                        .messages
+                        .binary_search_by_key(&message.uid, |m| m.uid)
+                    {
+                        folder.messages[index].identity = message.identity;
+                    }
                 }
+            } else {
+                folder.messages.extend(messages);
             }
-        } else {
-            folder.messages.extend(messages);
         }
         folder.fetched = end;
     }

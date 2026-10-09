@@ -1,4 +1,54 @@
 use super::*;
+/// Expand a wire sequence set (`1:3,7`) into exactly the UIDs it names.
+fn expand(set: &str) -> Vec<u32> {
+    set.split(',')
+        .flat_map(|token| match token.split_once(':') {
+            Some((first, last)) => {
+                first.parse::<u32>().unwrap()..=last.parse::<u32>().unwrap()
+            }
+            None => {
+                let uid = token.parse::<u32>().unwrap();
+                uid..=uid
+            }
+        })
+        .collect()
+}
+#[test]
+fn uid_batches_frame_adjacent_ranges_within_command_and_response_bounds() {
+    let dense: Vec<u32> = (1..=9000).collect();
+    let batches = uid_batches(&dense, 4096);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|(_, set)| set.as_str())
+            .collect::<Vec<_>>(),
+        ["1:4096", "4097:8192", "8193:9000"]
+    );
+    assert_eq!(uid_batches(&[5, 6, 7, 9], 4096)[0].1, "5:7,9");
+    // Sparse ten-digit UIDs chunk by command bytes; no range may span a gap.
+    let sparse: Vec<u32> = (0..1000).map(|i| 3_000_000_000 + i * 1000).collect();
+    let batches = uid_batches(&sparse, 4096);
+    assert!(batches.len() >= 2);
+    for (window, set) in &batches {
+        assert!(set.len() <= UID_SET_BYTES);
+        assert!(window.len() <= 4096);
+        assert_eq!(&expand(set), window, "a set must name exactly its batch");
+    }
+    assert_eq!(
+        batches
+            .iter()
+            .flat_map(|(window, _)| window.iter().copied())
+            .collect::<Vec<_>>(),
+        sparse
+    );
+    // Adjacency at the u32::MAX edge must not overflow.
+    assert_eq!(
+        uid_batches(&[u32::MAX - 1, u32::MAX], 4096)[0].1,
+        "4294967294:4294967295"
+    );
+    assert_eq!(uid_batches(&[u32::MAX], 4096)[0].1, "4294967295");
+    assert!(uid_batches(&[], 4096).is_empty());
+}
 #[test]
 fn octet_literals_do_not_create_responses_or_fetch_fields() {
     let raw = b"Subject: test\r\n\r\n* 8 FETCH (UID 999)\r\n\xc3\xa9";
@@ -145,7 +195,7 @@ async fn multi_window_dates_settle_before_paging_and_ignore_unsolicited_flags() 
                 let ids: Vec<u32> = if set == "1:*" {
                     (1..=4100).collect()
                 } else {
-                    set.split(',').map(|s| s.parse().unwrap()).collect()
+                    expand(set)
                 };
                 let dated = fields.contains("INTERNALDATE");
                 if dated {
@@ -239,6 +289,126 @@ async fn native_metadata_fetch_and_mime_parse_stay_in_backend() {
         "Message 7"
     );
     peer.await.unwrap();
+}
+#[tokio::test]
+async fn folder_listing_bounds_uid_arguments_and_preserves_imported_date_order() {
+    // Production root cause: a Stalwart server rejects a UID FETCH whose
+    // sequence-set argument exceeds 8000 bytes, so a shared Sent Items folder
+    // of ~8810 messages failed listing and only a stale cache was shown.
+    let uids: Vec<u32> = (1..=8810)
+        .chain([3_000_000_000])
+        .chain(u32::MAX - 5..=u32::MAX)
+        .collect();
+    let total = uids.len();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let observed = Arc::new(std::sync::Mutex::new((0usize, Vec::new())));
+    let seen = observed.clone();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut w: Wire = BufReader::new(Box::new(stream));
+        write(&mut w, b"* OK ready\r\n").await.unwrap();
+        assert!(line(&mut w).await.unwrap().starts_with(b"O1 LOGIN"));
+        write(&mut w, b"O1 OK login\r\n").await.unwrap();
+        for _ in 0..2 {
+            assert_eq!(line(&mut w).await.unwrap(), b"O1 CAPABILITY\r\n");
+            write(&mut w, b"* CAPABILITY IMAP4rev1\r\nO1 OK caps\r\n")
+                .await
+                .unwrap();
+        }
+        assert_eq!(line(&mut w).await.unwrap(), b"O1 LIST \"\" \"*\"\r\n");
+        write(&mut w, b"* LIST (\\Sent) \"/\" {10}\r\nSent Items\r\nO1 OK folders\r\n")
+            .await
+            .unwrap();
+        loop {
+            let request = String::from_utf8(line(&mut w).await.unwrap()).unwrap();
+            let mut response = String::new();
+            if request == "O1 SELECT \"Sent Items\"\r\n" {
+                response.push_str("O1 OK selected\r\n");
+            } else if request == "O1 UID FETCH 1:* (UID)\r\n" {
+                for uid in &uids {
+                    response.push_str(&format!("* 1 FETCH (UID {uid})\r\n"));
+                }
+                response.push_str("O1 OK snapshot\r\n");
+            } else if let Some(rest) = request.strip_prefix("O1 UID FETCH ") {
+                let (set, fields) = rest.split_once(' ').unwrap();
+                assert_eq!(fields, "(UID INTERNALDATE)\r\n");
+                if set.len() > 8000 {
+                    // Stalwart's exact refusal for an over-long argument.
+                    write(
+                        &mut w,
+                        b"O1 BAD [PARSE] Argument exceeds maximum length of 8000 bytes\r\n",
+                    )
+                    .await
+                    .unwrap();
+                    continue;
+                }
+                let batch = expand(set);
+                let mut seen = seen.lock().unwrap();
+                seen.0 = seen.0.max(set.len());
+                seen.1.push(batch.len());
+                drop(seen);
+                for uid in batch {
+                    // Imported reverse date order: the higher the UID, the
+                    // older the message, so paging must follow dates, not UIDs.
+                    let date = chrono::DateTime::from_timestamp(5_000_000_000 - uid as i64, 0)
+                        .unwrap();
+                    response.push_str(&format!(
+                        "* 1 FETCH (UID {uid} INTERNALDATE \"{}\")\r\n",
+                        date.format("%d-%b-%Y %H:%M:%S %z")
+                    ));
+                }
+                response.push_str("O1 OK fetched\r\n");
+            } else if let Some(rest) = request.strip_prefix("O1 UID SEARCH UID ") {
+                let (range, criteria) = rest.split_once(' ').unwrap();
+                assert_eq!(criteria, "UNSEEN\r\n");
+                let (first, last) = range.split_once(':').unwrap();
+                let (first, last) = (first.parse::<u32>().unwrap(), last.parse::<u32>().unwrap());
+                response.push_str("* SEARCH");
+                for uid in uids.iter().filter(|uid| **uid >= first && **uid <= last) {
+                    response.push_str(&format!(" {uid}"));
+                }
+                response.push_str("\r\nO1 OK searched\r\n");
+            } else {
+                panic!("unexpected command: {request}");
+            }
+            write(&mut w, response.as_bytes()).await.unwrap();
+        }
+    });
+    let mut p = params(port);
+    p["query"] = json!("folder:\"Sent Items\"");
+    p["limit"] = json!(2);
+    let first = super::super::call("imap.list", &p).await.unwrap();
+    assert_eq!(first["page"]["ids"], json!(["1:Sent Items", "2:Sent Items"]));
+    assert_eq!(first["page"]["estimate"], total);
+    p["pageToken"] = first["page"]["nextPageToken"].clone();
+    let second = super::super::call("imap.list", &p).await.unwrap();
+    assert_eq!(second["page"]["ids"], json!(["3:Sent Items", "4:Sent Items"]));
+    // The last page holds the u32::MAX run, oldest under imported ordering.
+    p["pageToken"] = json!((total - 2).to_string());
+    let last = super::super::call("imap.list", &p).await.unwrap();
+    assert_eq!(
+        last["page"]["ids"],
+        json!(["4294967294:Sent Items", "4294967295:Sent Items"])
+    );
+    assert_eq!(last["page"]["nextPageToken"], "");
+    // A criteria round exercises the bounded SEARCH windows on the same folder.
+    p["query"] = json!("folder:\"Sent Items\" UNSEEN");
+    p["pageToken"] = json!("");
+    let searched = super::super::call("imap.list", &p).await.unwrap();
+    assert_eq!(
+        searched["page"]["ids"],
+        json!(["1:Sent Items", "2:Sent Items"])
+    );
+    assert_eq!(searched["page"]["estimate"], total);
+    let (largest, batches) = &*observed.lock().unwrap();
+    assert!(*largest > 0 && *largest <= UID_SET_BYTES);
+    assert_eq!(batches.len(), 4 * 3, "every list call re-scans the folder");
+    assert!(
+        batches.iter().all(|size| *size <= 4096),
+        "the response bound stays at 4096 messages per fetch"
+    );
+    peer.abort();
 }
 #[tokio::test]
 async fn original_query_controls_are_rejected_before_connecting() {
