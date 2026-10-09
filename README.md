@@ -11,7 +11,7 @@ Omamail is a native email and calendar app with multiple accounts and keyboard n
 The plugin requires **Omarchy 4** and follows the active Omarchy theme. It includes the bar widget, `mailto:` integration, and AI assistance through the configured Omarchy agent.
 
 ```bash
-omarchy plugin add https://github.com/huacnlee/omamail.git --enable
+omarchy plugin add https://github.com/Pillumz/omamail.git --enable
 ```
 
 Update it with:
@@ -20,9 +20,11 @@ Update it with:
 omarchy plugin update omamail
 ```
 
-Click the envelope in the bar, install the pinned backend when prompted, and add your mailbox. Prebuilt plugin backends are available for Linux x86_64 and aarch64.
+This fork builds its plugin backend from the installed Git checkout and requires Rust (`cargo`). Click the envelope in the bar, choose Install backend when prompted, and add your mailbox. For a cold build or after updating this checkout, run `make install-backend-local` from the plugin directory, then disable and enable the plugin to reconnect. No fork releases are needed; accounts, settings and keyring entries are preserved.
 
 ### Standalone desktop app
+
+The packaged installation instructions below are for the original upstream app, not this fork's changes. This fork currently uses source builds; use [Run from source](#run-from-source) for its standalone host.
 
 The standalone app includes mail, calendar, and native desktop notifications. It has no system tray, AI assistance, or operating-system `mailto:` registration in this release.
 
