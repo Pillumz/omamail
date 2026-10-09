@@ -169,11 +169,13 @@ touch linked
 root = pathlib.Path.cwd()
 args = sys.argv[1:]
 assert args[:3] == ['build', '--locked', '--release']
-assert args[args.index('--target-dir') + 1] == str(root / 'target')
+target = pathlib.Path(args[args.index('--target-dir') + 1])
+assert not target.is_relative_to(root)
 assert args[args.index('--bin') + 1] == 'omamail'
-(root / 'build-invoked').write_text('yes')
+(target.parent / 'build-invoked').write_text('yes')
 if os.environ.get('BUILD_FAIL'): sys.exit(1)
-source = root / 'target/release/omamail'
+source = target / 'release/omamail'
+source.parent.mkdir(parents=True, exist_ok=True)
 source.write_text("#!/bin/sh\\nprintf 'omamail 0.9.0\\\\n'\\n")
 source.chmod(0o700)
 ''')
@@ -181,10 +183,12 @@ source.chmod(0o700)
         with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.defpath,
                                      "CARGO_TARGET_DIR": str(self.root / "other-target")}):
             with patch.object(self.manager, "download") as download:
+                before = self.plugin_tree()
                 result = self.manager.run("install")
                 self.assertEqual(result["state"], "ready", result)
                 self.assertEqual(result["installedVersion"], "0.9.0")
-                self.assertTrue((self.root / "build-invoked").exists())
+                self.assertTrue((self.data / "build-invoked").exists())
+                self.assertEqual(self.plugin_tree(), before)
                 download.assert_not_called()
                 previous = self.binary.read_bytes()
                 marker = (self.data / "local-build.json").read_bytes()

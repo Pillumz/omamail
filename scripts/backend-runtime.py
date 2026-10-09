@@ -292,9 +292,12 @@ def install(required, architecture):
 def build_local(required):
     """Explicit fork installation builds this checkout, never upstream releases."""
     checkout_version()
+    # Cargo output must not reload the recursively watched plugin checkout.
+    build = DATA_ROOT / "build"
+    safe_path(build, directory=True, create=True)
     try:
         process = subprocess.Popen(
-            ["cargo", "build", "--locked", "--release", "--target-dir", str(ROOT / "target"),
+            ["cargo", "build", "--locked", "--release", "--target-dir", str(build),
              "--bin", "omamail"], cwd=ROOT, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError:
@@ -315,12 +318,12 @@ def build_local(required):
         process.wait()
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    return install_local(required)
+    return install_local(required, build / "release/omamail")
 
 
-def install_local(required):
+def install_local(required, source=None):
     """Install an explicitly built checkout binary, without release downloads."""
-    source = ROOT / "target/release/omamail"
+    source = ROOT / "target/release/omamail" if source is None else source
     safe_path(source)
     require(source.is_file(), "Build the local backend first with make backend.")
     with source.open("rb") as compiled:

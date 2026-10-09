@@ -16,7 +16,7 @@ On a missing or mismatched runtime, the UI explains what is needed. Installation
 is explicit; simply loading the plugin never starts a download. From the plugin
 directory, `scripts/install-backend.sh` requests the same installation and
 `python3 scripts/backend-runtime.py status` reports local state without network
-access. Linux x86_64 and aarch64 are supported. In this fork, explicit installation builds the current Git checkout with `cargo build --locked --release`, verifies the candidate version and atomically replaces the old executable. Rust is required; a failed or timed-out build preserves the installed backend, and there is no fallback to an upstream binary. The installer has a 150-second build deadline inside the existing three-minute UI deadline; use `make install-backend-local` to prepare a cold build that needs longer.
+access. Linux x86_64 and aarch64 are supported. In this fork, explicit installation builds the current Git checkout with `cargo build --locked --release`, placing Cargo output in `${XDG_DATA_HOME:-~/.local/share}/omamail/build` outside the watched plugin tree, verifies the candidate version and atomically replaces the old executable. Rust is required; a failed or timed-out build preserves the installed backend, and there is no fallback to an upstream binary. The installer has a 150-second build deadline inside the existing three-minute UI deadline; use `make install-backend-local` to prepare a cold build that needs longer.
 
 Published release installation remains available explicitly as `python3 scripts/backend-runtime.py install-release`. It downloads only the exact pin from `Pillumz/omamail`, verifies SHA256SUMS and the strict archive layout, and fails without replacing the installed backend if this fork has not published that version. Checksums protect integrity, not against a compromised publisher. Neither source builds nor published installation happen when the plugin merely loads.
 
@@ -290,8 +290,7 @@ published backend assets. Failed builds or version checks preserve the old runti
 Restart the shell afterwards to replace an already running backend process.
 Unset `OMAMAIL_BIN` in the shell's startup environment to use the private runtime.
 The separate `scripts/install-backend.sh` command builds this fork from its Git checkout, just like the UI's explicit installation action. To select a published fork release instead, use `python3 scripts/backend-runtime.py install-release`: it always uses `backend-version`, ignores the local override when selecting a release, and clears the marker after verification as part of installation.
-Uninstall also removes the marker. Local version overrides require Python 3.11
-or newer for Cargo TOML parsing; normal pinned installations do not.
+Uninstall also removes the marker. Source builds and local version overrides require Python 3.11 or newer for Cargo TOML parsing; explicit published installation (`install-release`) does not.
 
 Run `make test-local` on a machine with Rust, Qt 6 test tooling and Quickshell.
 It runs the existing Rust, JavaScript, transport/security and offscreen QML
