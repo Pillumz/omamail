@@ -335,7 +335,12 @@ jobs:
           case "$SOURCE_BRANCH" in
             release/*) python3 scripts/package-backend.py check --require-pin ;;
           esac
-          # Missing bootstrap assets intentionally fail this required check.
+          # This fork inherited the immutable 0.10.8 release/API from upstream.
+          # Verify that exact baseline there, not a nonexistent copy in the fork.
+          # Later pins must use this repository; no missing-release fallback.
+          if [ "$GITHUB_REPOSITORY" = "Pillumz/omamail" ] && [ "$version" = "0.10.8" ]; then
+            export GH_REPO=huacnlee/omamail
+          fi
           test "$(gh release view "v$version" --json isDraft --jq .isDraft)" = false
           mkdir published
           gh release download "v$version" --dir published --pattern 'omamail-linux-*.tar.gz' --pattern SHA256SUMS --pattern backend-api.json

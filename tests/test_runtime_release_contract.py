@@ -41,7 +41,7 @@ class RuntimeReleaseContract(unittest.TestCase):
             requested = []
 
             def fetch(url, limit):
-                prefix = "https://github.com/huacnlee/omamail/releases/download/v0.8.2/"
+                prefix = "https://github.com/Pillumz/omamail/releases/download/v0.8.2/"
                 self.assertTrue(url.startswith(prefix), url)
                 name = url[len(prefix):]
                 requested.append(name)
@@ -60,12 +60,12 @@ class RuntimeReleaseContract(unittest.TestCase):
                     patch.object(runtime.platform, "machine", return_value="x86_64"), \
                     patch.dict(runtime.os.environ, {"OMAMAIL_BIN": ""}), \
                     patch.object(runtime, "download", side_effect=fetch):
-                result = runtime.run("install")
+                result = runtime.run("install-release")
                 self.assertEqual(result["state"], "ready", result)
                 self.assertEqual(installed.read_bytes(), payload)
                 self.assertEqual(requested, ["SHA256SUMS", "omamail-linux-x86_64.tar.gz"])
                 assets["omamail-linux-x86_64.tar.gz"] += b"corruption"
-                result = runtime.run("install")
+                result = runtime.run("install-release")
                 self.assertEqual(result["state"], "error", result)
                 self.assertEqual(installed.read_bytes(), payload)
 

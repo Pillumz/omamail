@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tarfile
 import tempfile
 import unittest
@@ -77,7 +79,7 @@ class RuntimeTests(unittest.TestCase):
     def test_install_and_cli_enable_do_not_write_the_watched_plugin_tree(self):
         self.release(self.archive())
         before = self.plugin_tree()
-        self.assertEqual(self.manager.run("install")["state"], "ready")
+        self.assertEqual(self.manager.run("install-release")["state"], "ready")
         self.assertEqual(self.manager.run("enable-cli")["state"], "ready")
         self.assertEqual(self.plugin_tree(), before)
         self.assertTrue(self.binary.is_file())
@@ -158,6 +160,98 @@ touch linked
         source.chmod(0o700)
         return source
 
+    def test_install_builds_fork_without_release_download_and_failed_build_preserves_runtime(self):
+        self.local_checkout()
+        tools = self.root / "tools"
+        tools.mkdir()
+        cargo = tools / "cargo"
+        cargo.write_text(f"#!{sys.executable}\n" + '''import os, pathlib, sys
+root = pathlib.Path.cwd()
+args = sys.argv[1:]
+assert args[:3] == ['build', '--locked', '--release']
+target = pathlib.Path(args[args.index('--target-dir') + 1])
+assert not target.is_relative_to(root)
+assert args[args.index('--bin') + 1] == 'omamail'
+(target.parent / 'build-invoked').write_text('yes')
+if os.environ.get('BUILD_FAIL'): sys.exit(1)
+source = target / 'release/omamail'
+source.parent.mkdir(parents=True, exist_ok=True)
+source.write_text("#!/bin/sh\\nprintf 'omamail 0.9.0\\\\n'\\n")
+source.chmod(0o700)
+''')
+        cargo.chmod(0o700)
+        with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.defpath,
+                                     "CARGO_TARGET_DIR": str(self.root / "other-target")}):
+            with patch.object(self.manager, "download") as download:
+                before = self.plugin_tree()
+                result = self.manager.run("install")
+                self.assertEqual(result["state"], "ready", result)
+                self.assertEqual(result["installedVersion"], "0.9.0")
+                self.assertTrue((self.data / "build-invoked").exists())
+                self.assertEqual(self.plugin_tree(), before)
+                download.assert_not_called()
+                previous = self.binary.read_bytes()
+                marker = (self.data / "local-build.json").read_bytes()
+                with patch.dict(os.environ, {"BUILD_FAIL": "1"}):
+                    self.assertEqual(self.manager.run("install")["state"], "error")
+                self.assertEqual(self.binary.read_bytes(), previous)
+                self.assertEqual((self.data / "local-build.json").read_bytes(), marker)
+                download.assert_not_called()
+
+    def test_cancelled_source_build_stops_cargo_and_descendants_without_replacing_runtime(self):
+        self.local_checkout()
+        previous = self.old()
+        tools = self.root / "tools"
+        tools.mkdir()
+        cargo = tools / "cargo"
+        cargo.write_text(f"#!{sys.executable}\n" + '''import os, pathlib, subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+pathlib.Path('building-pids').write_text(str(os.getpid()) + ' ' + str(child.pid))
+time.sleep(300)
+''')
+        cargo.chmod(0o700)
+        process = subprocess.Popen([sys.executable, str(self.root / "scripts/backend-runtime.py"), "install"],
+                                   env={"PATH": str(tools) + os.pathsep + os.defpath,
+                                        "XDG_DATA_HOME": str(self.data.parent), "HOME": str(self.home)},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pids = []
+        try:
+            deadline = time.monotonic() + 5
+            marker = self.root / "building-pids"
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "source build did not start")
+            pids = [int(pid) for pid in marker.read_text().split()]
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=5)
+            result = json.loads(stdout)
+            self.assertEqual(result["state"], "error")
+            self.assertIn("cancelled", result["error"])
+            self.assertEqual(self.binary.read_bytes(), previous)
+            for pid in pids:
+                state = Path(f"/proc/{pid}/stat")
+                if state.exists():
+                    self.assertEqual(state.read_text().split()[2], "Z", "build process still running")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            if pids:
+                try:
+                    os.killpg(pids[0], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_install_without_checkout_never_downloads_a_replacement(self):
+        previous = self.old()
+        with patch.object(self.manager, "download") as download:
+            result = self.manager.run("install")
+            self.assertEqual(result["state"], "error", result)
+            self.assertEqual(self.binary.read_bytes(), previous)
+            download.assert_not_called()
+
     def test_local_checkout_can_advance_without_changing_release_pin(self):
         self.local_checkout()
         for command in ("install-local", "status"):
@@ -191,10 +285,10 @@ touch linked
         self.local_checkout()
         self.assertEqual(self.manager.run("install-local")["state"], "ready")
         self.release(self.archive(version="0.9.0"))
-        self.assertEqual(self.manager.run("install")["state"], "error")
+        self.assertEqual(self.manager.run("install-release")["state"], "error")
         self.assertEqual(self.manager.run("status")["state"], "ready")
         self.release(self.archive())
-        result = self.manager.run("install")
+        result = self.manager.run("install-release")
         self.assertEqual(result["state"], "ready", result)
         self.assertEqual(result["requiredVersion"], "0.8.2")
         self.assertFalse((self.data / "local-build.json").exists())
@@ -233,7 +327,7 @@ touch linked
                 raise OSError("synthetic replacement failure")
             return replace(src, dst)
         self.release(self.archive())
-        for command in ("install-local", "install"):
+        for command in ("install-local", "install-release"):
             with patch.object(self.manager.os, "replace", side_effect=fail_binary):
                 self.assertEqual(self.manager.run(command)["state"], "error")
             self.assertEqual(self.binary.read_bytes(), previous)
@@ -259,7 +353,7 @@ touch linked
         digest = "0" * 64 if bad_hash else hashlib.sha256(archive).hexdigest()
         sums = (digest + "  omamail-linux-x86_64.tar.gz\n").encode()
         def download(url, limit):
-            self.assertTrue(url.startswith("https://github.com/huacnlee/omamail/releases/download/v0.8.2/"))
+            self.assertTrue(url.startswith("https://github.com/Pillumz/omamail/releases/download/v0.8.2/"))
             if after:
                 after()
             return sums if url.endswith("SHA256SUMS") else archive
@@ -273,7 +367,7 @@ touch linked
     def test_release_status_uses_only_local_pin_and_api_despite_newer_cargo(self):
         self.local_checkout()
         self.release(self.archive())
-        self.assertEqual(self.manager.run("install")["state"], "ready")
+        self.assertEqual(self.manager.run("install-release")["state"], "ready")
         (self.root / "Cargo.toml").write_text('[package]\nversion = "2.0.0"\n')
         result = self.manager.run("status")
         self.assertEqual(result["state"], "ready")
@@ -347,7 +441,7 @@ touch linked
     def test_exact_install_and_uninstall_preserve_user_data(self):
         self.release(self.archive())
         (self.root / "accounts.json").write_text("keep")
-        result = self.manager.run("install")
+        result = self.manager.run("install-release")
         self.assertEqual(result["state"], "ready", result)
         self.assertEqual(self.binary.stat().st_mode & 0o7777, 0o700)
         self.assertEqual(list(self.binary.parent.iterdir()), [self.binary])
@@ -361,14 +455,14 @@ touch linked
             with self.subTest(case=case):
                 bad_hash = case.pop("bad_hash", False)
                 self.release(self.archive(**case), bad_hash)
-                self.assertEqual(self.manager.run("install")["state"], "error")
+                self.assertEqual(self.manager.run("install-release")["state"], "error")
                 self.assertEqual(self.binary.read_bytes(), old)
                 self.assertFalse((self.root / "outside").exists())
 
     def test_changed_pin_preserves_old_binary(self):
         old = self.old()
         self.release(self.archive(), after=lambda: (self.root / "backend-version").write_text("0.8.3\n"))
-        self.assertEqual(self.manager.run("install")["state"], "error")
+        self.assertEqual(self.manager.run("install-release")["state"], "error")
         self.assertEqual(self.binary.read_bytes(), old)
 
     def test_hidden_archive_headers_are_refused(self):
@@ -384,7 +478,7 @@ touch linked
             entry.size = len(payload)
             archive.addfile(entry, io.BytesIO(payload))
         self.release(stream.getvalue())
-        self.assertEqual(self.manager.run("install")["state"], "error")
+        self.assertEqual(self.manager.run("install-release")["state"], "error")
         self.assertEqual(self.binary.read_bytes(), old)
 
     def test_probe_output_is_bounded_and_diagnostics_are_private(self):
@@ -399,7 +493,7 @@ touch linked
         outside = self.root / "outside"
         self.binary.rename(outside)
         self.binary.symlink_to(outside)
-        for command in ("status", "install", "uninstall"):
+        for command in ("status", "install", "install-release", "uninstall"):
             self.assertEqual(self.manager.run(command)["state"], "error")
             self.assertTrue(self.binary.is_symlink())
             self.assertTrue(outside.exists())
@@ -407,18 +501,18 @@ touch linked
     def test_malformed_and_oversize_archives_preserve_old_binary(self):
         old = self.old()
         self.release(b"not a gzip archive")
-        self.assertEqual(self.manager.run("install")["state"], "error")
+        self.assertEqual(self.manager.run("install-release")["state"], "error")
         self.assertEqual(self.binary.read_bytes(), old)
         self.release(self.archive())
         with patch.object(self.manager, "BINARY_LIMIT", 1):
-            self.assertEqual(self.manager.run("install")["state"], "error")
+            self.assertEqual(self.manager.run("install-release")["state"], "error")
         self.assertEqual(self.binary.read_bytes(), old)
 
     def test_ambiguous_checksum_preserves_old_binary(self):
         old = self.old()
         sums = ("a" * 64 + "  omamail-linux-x86_64.tar.gz\n") * 2
         with patch.object(self.manager, "download", return_value=sums.encode()):
-            self.assertEqual(self.manager.run("install")["state"], "error")
+            self.assertEqual(self.manager.run("install-release")["state"], "error")
         self.assertEqual(self.binary.read_bytes(), old)
 
     def test_untrusted_redirects_are_refused_before_request_creation(self):
@@ -431,7 +525,7 @@ touch linked
     def test_all_development_mutations_refused(self):
         old = self.old()
         with patch.dict(os.environ, {"OMAMAIL_BIN": str(self.binary)}):
-            for command in ("install", "uninstall", "enable-cli", "disable-cli"):
+            for command in ("install", "install-release", "uninstall", "enable-cli", "disable-cli"):
                 self.assertEqual(self.manager.run(command)["state"], "error")
         self.assertEqual(self.binary.read_bytes(), old)
 
@@ -449,7 +543,7 @@ touch linked
                 raise self.manager.Refused("A post-commit check failed")
             return actual(path)
         with patch.object(self.manager, "version_of", side_effect=probe):
-            result = self.manager.run("install")
+            result = self.manager.run("install-release")
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["installedVersion"], "0.8.2")
 
@@ -486,7 +580,7 @@ touch linked
 
     def test_cli_link_never_replaces_unrelated_file(self):
         self.release(self.archive())
-        self.assertEqual(self.manager.run("install")["state"], "ready")
+        self.assertEqual(self.manager.run("install-release")["state"], "ready")
         link = self.home / ".local/bin/omamail"
         link.parent.mkdir(parents=True)
         with patch.object(self.manager.Path, "home", return_value=self.home):
@@ -505,7 +599,7 @@ touch linked
 
     def test_cli_install_replaces_the_owned_legacy_runtime_link(self):
         self.release(self.archive())
-        self.assertEqual(self.manager.run("install")["state"], "ready")
+        self.assertEqual(self.manager.run("install-release")["state"], "ready")
         legacy = self.root / "runtime/bin/omamail"
         legacy.parent.mkdir(parents=True)
         legacy.write_text("old plugin-owned runtime")
@@ -520,7 +614,7 @@ touch linked
 
     def test_cli_install_recognizes_a_previous_omamail_checkout(self):
         self.release(self.archive())
-        self.assertEqual(self.manager.run("install")["state"], "ready")
+        self.assertEqual(self.manager.run("install-release")["state"], "ready")
         previous = Path(self.tmp.name).resolve() / "previous-plugin"
         legacy = previous / "runtime/bin/omamail"
         legacy.parent.mkdir(parents=True)
@@ -541,7 +635,7 @@ touch linked
 
     def test_failed_legacy_cli_migration_preserves_the_owned_link(self):
         self.release(self.archive())
-        self.assertEqual(self.manager.run("install")["state"], "ready")
+        self.assertEqual(self.manager.run("install-release")["state"], "ready")
         legacy = self.root / "runtime/bin/omamail"
         link = self.home / ".local/bin/omamail"
         link.parent.mkdir(parents=True)
@@ -552,7 +646,7 @@ touch linked
 
     def test_cli_status_requires_exact_owned_link_and_valid_private_runtime(self):
         self.release(self.archive())
-        self.assertFalse(self.manager.run("install")["cliInstalled"])
+        self.assertFalse(self.manager.run("install-release")["cliInstalled"])
         link = self.home / ".local/bin/omamail"
         link.parent.mkdir(parents=True)
         foreign = self.root / "foreign"

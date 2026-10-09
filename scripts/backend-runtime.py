@@ -22,6 +22,8 @@ import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
+# This fork owns its backend releases; never fall back to upstream assets.
+RELEASE_REPOSITORY = "Pillumz/omamail"
 DATA_ROOT = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "omamail"
 BINARY = DATA_ROOT / "bin/omamail"
 LEGACY_BINARY = ROOT / "runtime/bin/omamail"
@@ -248,7 +250,7 @@ def install(required, architecture):
     safe_path(BINARY)
     safe_path(LOCAL_BUILD)
     asset = "omamail-linux-" + architecture + ".tar.gz"
-    base = "https://github.com/huacnlee/omamail/releases/download/v" + required + "/"
+    base = "https://github.com/" + RELEASE_REPOSITORY + "/releases/download/v" + required + "/"
     with deadline():
         checksums = download(base + "SHA256SUMS", 64 * 1024).decode("ascii")
         entries = []
@@ -287,9 +289,41 @@ def install(required, architecture):
             replace_runtime(candidate)
 
 
-def install_local(required):
+def build_local(required):
+    """Explicit fork installation builds this checkout, never upstream releases."""
+    checkout_version()
+    # Cargo output must not reload the recursively watched plugin checkout.
+    build = DATA_ROOT / "build"
+    safe_path(build, directory=True, create=True)
+    try:
+        process = subprocess.Popen(
+            ["cargo", "build", "--locked", "--release", "--target-dir", str(build),
+             "--bin", "omamail"], cwd=ROOT, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        raise Refused("Building this fork requires Rust (cargo) on PATH.") from None
+    def cancelled(signum, frame):
+        raise Refused("Fork backend build cancelled; the installed backend was preserved.")
+    previous = {sig: signal.signal(sig, cancelled) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        try:
+            # Finish inside Runtime.qml's existing three-minute deadline.
+            status = process.wait(timeout=150)
+        except subprocess.TimeoutExpired:
+            raise Refused("Fork backend build timed out; the installed backend was preserved.") from None
+        require(status == 0, "Fork backend build failed; the installed backend was preserved.")
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return install_local(required, build / "release/omamail")
+
+
+def install_local(required, source=None):
     """Install an explicitly built checkout binary, without release downloads."""
-    source = ROOT / "target/release/omamail"
+    source = ROOT / "target/release/omamail" if source is None else source
     safe_path(source)
     require(source.is_file(), "Build the local backend first with make backend.")
     with source.open("rb") as compiled:
@@ -382,7 +416,7 @@ def run(command):
         development = os.environ.get("OMAMAIL_BIN", "")
         executable = Path(development) if development else BINARY
         result["executable"] = str(executable)
-        require(command in ("status", "install", "install-local", "uninstall", "enable-cli", "disable-cli"), "Unknown backend operation.")
+        require(command in ("status", "install", "install-local", "install-release", "uninstall", "enable-cli", "disable-cli"), "Unknown backend operation.")
         if command != "status":
             require(not development, "Unset OMAMAIL_BIN before managing the installed backend.")
         architecture = {"x86_64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine())
@@ -400,6 +434,9 @@ def run(command):
         if command != "status":
             with locked():
                 if command == "install":
+                    required = build_local(required)
+                    result["requiredVersion"] = required
+                elif command == "install-release":
                     install(required, architecture)
                 elif command == "install-local":
                     required = install_local(required)
@@ -417,7 +454,7 @@ def run(command):
                     cli_link(False)
         # The candidate was verified before the atomic commit. A second execution
         # must not turn a completed replacement into a reported install failure.
-        installed = required if command in ("install", "install-local") else version_of(executable)
+        installed = required if command in ("install", "install-local", "install-release") else version_of(executable)
         result["installedVersion"] = installed
         result["state"] = "missing" if not installed else "ready" if installed == required else "mismatch"
         result["cliInstalled"] = not development and result["state"] == "ready" and cli_installed()
