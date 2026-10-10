@@ -21,22 +21,27 @@ Item {
       return
     }
     if (Number(backend.apiVersion) < 6) {
-      // The published backend still supports Claude through Omarchy's default.
-      // It validates that default at jobStart; providerStatus is API-6 only.
+      // The pinned published backend resolves its own agent at jobStart.
+      // providerStatus, and the retired-Claude checks, are API-6 only.
       resolvedProvider = ""
       providerAvailable = selectedAgent === "System default" && selectedModel === ""
       availabilityError = providerAvailable ? ""
-        : "Update the mail backend to choose an AI agent or model (API 6 required)."
+        : selectedAgent === "Claude"
+          ? "Claude is no longer supported. Update the mail backend or choose OpenCode or Codex."
+          : "Update the mail backend to choose an AI agent or model (API 6 required)."
       return
     }
+    var requested = Options.provider(selectedAgent)
     if (!providerAvailable) availabilityError = "Checking the selected AI agent..."
-    request("agent.providerStatus", {provider: Options.provider(selectedAgent)}, function(result, error) {
+    request("agent.providerStatus", {provider: requested}, function(result, error) {
       if (serial !== root.availabilitySerial) return
       root.resolvedProvider = !error && result ? String(result.provider || "") : ""
       root.providerAvailable = !error && !!result && result.available === true
       root.availabilityError = root.providerAvailable ? "" : error
         ? "Could not check the selected AI agent."
-        : "Your system-default agent is not supported. Choose Claude, Codex or OpenCode in Settings → AI."
+        : requested === "claude"
+          ? "Claude is no longer supported. Choose OpenCode or Codex in Settings → AI."
+          : "Your system-default agent is not supported. Choose OpenCode or Codex in Settings → AI."
     })
   }
   property int selectionRevision: 0
@@ -50,6 +55,7 @@ Item {
   function canContinueSelection(job) {
     if (!job) return false
     var provider = Options.provider(selectedAgent) || resolvedProvider
+    // Jobs saved before provider metadata were Claude; they stay read-only.
     if (provider !== "" && provider !== String(job.provider || "claude")) return false
     if (String(job.model || "") !== selectedModel) return false
     if (selectionJobs[String(job.id)] === selectionRevision) return true
@@ -228,11 +234,13 @@ Item {
           root.startRefused(String(error && error.message ? error.message : error))
         } else {
           var code = String(error && error.message ? error.message : "")
-          root.lastError = code === "agent_choose_claude"
-            ? (Number(root.backend.apiVersion) >= 6
-              ? "Choose OpenCode, Codex or Claude in Settings → AI, or select one as Omarchy's default."
-              : "This backend supports Claude only. Select Claude as Omarchy's default AI agent.")
-            : "Could not confirm AI started. Check the conversation before retrying."
+          root.lastError = code === "agent_provider_retired"
+            ? "Claude chats are no longer supported. Choose OpenCode or Codex in Settings → AI, or start a new chat."
+            : code === "agent_choose_claude"
+              ? (Number(root.backend.apiVersion) >= 6
+                ? "Choose OpenCode or Codex in Settings → AI, or select one as Omarchy's default."
+                : "This backend does not support the selected AI agent. Update the mail backend.")
+              : "Could not confirm AI started. Check the conversation before retrying."
           root.failed(root.lastError)
         }
         root.refresh()

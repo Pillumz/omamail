@@ -53,56 +53,50 @@ fn model_arguments_cannot_be_options_or_shell_input() {
 
 #[test]
 fn commands_use_stdin_exact_continuations_and_noninteractive_permissions() {
-    for provider in [Provider::Claude, Provider::Codex] {
-        let resume = if provider == Provider::OpenCode {
-            "ses_test"
-        } else {
-            "11111111-2222-3333-4444-555555555555"
-        };
-        let command = provider
-            .command(Path::new("/private"), resume, "chosen-model")
-            .unwrap();
-        let args = command
-            .get_args()
-            .map(|s| s.to_str().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            Path::new(command.get_program()).file_name().unwrap(),
-            provider.name()
-        );
-        assert_eq!(
-            args[args.iter().position(|s| *s == "--model").unwrap() + 1],
-            "chosen-model"
-        );
-        assert!(args.contains(&resume));
-        assert!(!args.contains(&"--last"));
-        match provider {
-            Provider::Claude => {
-                assert!(args.contains(&"--resume"));
-                assert!(!args.contains(&"--fork-session"));
-                assert!(args.contains(&"dontAsk"));
-            }
-            Provider::OpenCode => unreachable!("OpenCode uses its owned broker"),
-            Provider::Codex => {
-                assert!(args.contains(&"resume"));
-                assert!(!args.contains(&"fork"));
-                assert!(args.contains(&"read-only"));
-                assert!(args.contains(&"approval_policy=\"never\""));
-                assert!(args.contains(&"-"));
-            }
-        }
-        assert!(
-            provider
-                .command(Path::new("/private"), "../../evil", "")
-                .is_err()
-        );
-        let default = provider.command(Path::new("/private"), "", "").unwrap();
-        assert!(!default.get_args().any(|arg| arg == "--model"));
-    }
+    let provider = Provider::Codex;
+    let resume = "11111111-2222-3333-4444-555555555555";
+    let command = provider
+        .command(Path::new("/private"), resume, "chosen-model")
+        .unwrap();
+    let args = command
+        .get_args()
+        .map(|s| s.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        Path::new(command.get_program()).file_name().unwrap(),
+        provider.name()
+    );
+    assert_eq!(
+        args[args.iter().position(|s| *s == "--model").unwrap() + 1],
+        "chosen-model"
+    );
+    assert!(args.contains(&resume));
+    assert!(!args.contains(&"--last"));
+    assert!(args.contains(&"resume"));
+    assert!(!args.contains(&"fork"));
+    assert!(args.contains(&"read-only"));
+    assert!(args.contains(&"approval_policy=\"never\""));
+    assert!(args.contains(&"-"));
+    assert!(
+        provider
+            .command(Path::new("/private"), "../../evil", "")
+            .is_err()
+    );
+    let default = provider.command(Path::new("/private"), "", "").unwrap();
+    assert!(!default.get_args().any(|arg| arg == "--model"));
     assert_eq!(
         Provider::OpenCode
             .command(Path::new("/private"), "", "")
             .unwrap_err(),
         "agent_server_required"
     );
+    // Retired Claude config never falls back to another provider.
+    assert_eq!(
+        Provider::Claude
+            .command(Path::new("/private"), resume, "")
+            .unwrap_err(),
+        "agent_provider_retired"
+    );
+    assert_eq!(Provider::Claude.runnable(), false);
+    assert!(Provider::Codex.runnable() && Provider::OpenCode.runnable());
 }

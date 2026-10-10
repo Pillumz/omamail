@@ -45,25 +45,7 @@ class LocalModel(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.end_headers()
-        if self.path.startswith('/v1/messages'):
-            messages=request.get('messages',[])
-            last_user=next((m.get('content',[]) for m in reversed(messages) if m.get('role')=='user'),[])
-            tool_result=isinstance(last_user,list) and any(m.get('type')=='tool_result' for m in last_user)
-            propose=self.server.propose and not tool_result
-            content=({'type':'tool_use','id':'tool_proposal_'+str(len(self.server.requests)),'name':'mcp__omamail__propose_draft','input':{}} if propose
-                     else {'type':'text','text':''})
-            delta=({'type':'input_json_delta','partial_json':json.dumps({'subject':'Re: Synthetic','body':'The exact proposed body.'})} if propose
-                   else {'type':'text_delta','text':'Synthetic answer مرحبا'})
-            for event in [
-                {'type':'message_start','message':{'id':'msg_fixture','type':'message','role':'assistant','model':request['model'],'content':[], 'stop_reason':None,'usage':{'input_tokens':5,'output_tokens':0}}},
-                {'type':'content_block_start','index':0,'content_block':content},
-                {'type':'content_block_delta','index':0,'delta':delta},
-                {'type':'content_block_stop','index':0},
-                {'type':'message_delta','delta':{'stop_reason':'tool_use' if propose else 'end_turn','stop_sequence':None},'usage':{'output_tokens':3}},
-                {'type':'message_stop'},
-            ]:
-                self.wfile.write(('event: '+event['type']+'\ndata: '+json.dumps(event)+'\n\n').encode())
-        elif self.path == '/v1/chat/completions':
+        if self.path == '/v1/chat/completions':
             tools=[t['function']['name'] for t in request.get('tools',[])]
             messages=request.get('messages',[])
             last_user=max((i for i,m in enumerate(messages) if m.get('role')=='user'),default=-1)
@@ -149,13 +131,6 @@ sys.exit(result.returncode)
                 (toolbin/provider).chmod(0o700)
             else:
                 (toolbin/provider).symlink_to(Path(executable).resolve())
-            if provider == 'claude' and sys.platform == 'darwin':
-                # A synthetic HOME alone does not isolate macOS Keychain.
-                # Bare mode explicitly prevents reading its OAuth credentials.
-                tool=toolbin/provider
-                tool.unlink()
-                tool.write_text('#!/usr/bin/python3\nimport os,sys\nos.execv('+repr(str(Path(executable).resolve()))+', ['+repr(str(Path(executable).resolve()))+', "--bare"]+sys.argv[1:])\n')
-                tool.chmod(0o700)
             if provider == 'codex':
                 tool = toolbin/provider
                 tool.unlink()
@@ -223,12 +198,6 @@ args = [{json.dumps(str(forbidden))}]
                    'XDG_CONFIG_HOME':str(root/'config'),'XDG_DATA_HOME':str(root/'data'),
                    'XDG_STATE_HOME':str(root/'state'),'XDG_CACHE_HOME':str(root/'cache'),
                    'TMPDIR':str(root),'CODEX_HOME':str(codex)}
-            if provider == 'claude':
-                env.update(ANTHROPIC_API_KEY='synthetic', ANTHROPIC_BASE_URL=base.removesuffix('/v1'),
-                           ANTHROPIC_MODEL='configured-default', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1')
-                settings=root/'.claude'; settings.mkdir()
-                (settings/'settings.json').write_text(json.dumps({'hooks':{'SessionStart':[{'hooks':[{'type':'command','command':'touch '+str(forbidden)}]}]}}))
-                (root/'.claude.json').write_text(json.dumps({'mcpServers':{'unrelated':{'command':'/usr/bin/touch','args':[str(forbidden)]}}}))
             broker = None
             def call(method, params):
                 if sys.platform == 'darwin' and method == 'agent.jobStart' and not params.get('payload',{}).get('parent'):
@@ -243,7 +212,6 @@ args = [{json.dumps(str(forbidden))}]
                     result = call('agent.jobShow',{'id':ident})
                     if result['job']['state'] not in ('queued','running'):
                         if result['job']['state'] != 'done':
-                            if provider == 'claude': print('SYNTHETIC CLAUDE REQUESTS',server.requests[-2:])
                             for log in root.glob('synthetic-cli-*.log'): print(log.name,log.read_text()[-4000:])
                             if broker and broker.poll() is not None: print('BROKER ERROR',broker.stderr.read().decode())
                             for log in root.rglob('opencode.log'):
@@ -260,8 +228,6 @@ args = [{json.dumps(str(forbidden))}]
             try:
                 initial = wait(first)
                 self.assertFalse(forbidden.exists(), 'Unrelated configured MCP/plugin must never start')
-                if provider == 'claude':
-                    self.assertTrue(all([tool['name'] for tool in request.get('tools',[])] == ['mcp__omamail__propose_draft'] for request in server.requests))
                 if provider == 'codex':
                     self.assertNotIn('synthetic-header-secret',(root/'synthetic-cli-argv.json').read_text())
                     self.assertTrue(any(any(key.lower()=='x-synthetic-auth' and value=='synthetic-header-secret' for key,value in headers.items()) for headers in server.headers))
@@ -415,10 +381,6 @@ args = [{json.dumps(str(forbidden))}]
         for model in ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna']:
             with self.subTest(model=model):
                 self.exercise('codex',os.environ['OMAMAIL_TEST_CODEX'],proposals=True,code_mode_model=model)
-
-    @unittest.skipUnless(os.environ.get('OMAMAIL_TEST_CLAUDE'), 'set OMAMAIL_TEST_CLAUDE for isolated CLI fixture')
-    def test_claude_proposal(self):
-        self.exercise('claude',os.environ['OMAMAIL_TEST_CLAUDE'],proposals=True)
 
 
 if __name__ == '__main__':

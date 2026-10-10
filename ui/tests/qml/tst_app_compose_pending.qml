@@ -29,7 +29,7 @@ Item {
 
     property bool hasAgent: true
     property bool agentAvailable: true
-    property string agentUnavailableReason: "Your system-default agent is not supported. Choose Claude, Codex or OpenCode in Settings → AI."
+    property string agentUnavailableReason: "Your system-default agent is not supported. Choose OpenCode or Codex in Settings → AI."
     property bool agentStarting: false
     property string agentError: ""
     property string agentShownId: ""

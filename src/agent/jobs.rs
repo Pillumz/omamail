@@ -400,7 +400,8 @@ fn process_handle(v: &Value) -> Option<OwnedFd> {
 }
 // Upgrade compatibility only: recognize an already-running worker from this
 // checkout or this installed plugin. Never launch Python and never accept an
-// executable/script path supplied by job metadata.
+// executable/script path supplied by job metadata. Retained so an update can
+// still identify and cancel jobs started by the previous bridge.
 fn legacy_worker_args(args: &[u8], executable: &std::path::Path, id: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
     let mut candidates =
@@ -458,8 +459,11 @@ pub(super) fn refresh(store: &Store, id: &str) -> Result<Value> {
         && !display["output"].as_str().unwrap_or("").trim().is_empty()
         && display["sessionId"] == job["sessionId"];
     job["resultReady"] = json!(ready);
+    // A retired provider's saved turn is readable history, not a resumable chat.
+    let runnable = Provider::of_job(&job)?.runnable();
     job["canContinue"] = json!(
-        !active(&job)
+        runnable
+            && !active(&job)
             && job["stopUnconfirmed"] != true
             && !display["transcript"].as_array().unwrap().is_empty()
             && (job["sessionId"].as_str().unwrap_or("").is_empty()
@@ -546,8 +550,13 @@ async fn default_provider() -> Result<Provider> {
     if !out.success {
         return Err("agent_choose_claude");
     }
-    Provider::parse(std::str::from_utf8(&out.stdout).unwrap_or("").trim())
-        .ok_or("agent_choose_claude")
+    match Provider::parse(std::str::from_utf8(&out.stdout).unwrap_or("").trim()) {
+        Some(provider) if provider.runnable() => Ok(provider),
+        // A saved default of Claude is a clear configuration error, never a
+        // fallback to another provider and never a launch of the executable.
+        Some(_) => Err("agent_provider_retired"),
+        None => Err("agent_choose_claude"),
+    }
 }
 fn new_job(context: Value, mut provider: Provider, mut model: String) -> Result<Value> {
     let store = Store::open()?;
@@ -583,6 +592,9 @@ fn new_job(context: Value, mut provider: Provider, mut model: String) -> Result<
             return Err("agent_parent_not_latest");
         }
         provider = Provider::of_job(&job)?;
+        if !provider.runnable() {
+            return Err("agent_provider_retired");
+        }
         model = job["model"].as_str().unwrap_or("").to_owned();
         if job["canContinue"] != true {
             return Err("agent_parent_not_ready");
@@ -805,7 +817,11 @@ pub async fn call(method: &str, params: &Value) -> Result<Value> {
         let provider = if selected.is_empty() {
             default_provider().await.ok()
         } else {
-            Some(Provider::parse(selected).ok_or("agent_invalid_provider")?)
+            match Provider::parse(selected) {
+                Some(provider) if provider.runnable() => Some(provider),
+                Some(_) => None,
+                None => return Err("agent_invalid_provider"),
+            }
         };
         return Ok(
             json!({"available":provider.is_some(),"provider":provider.map(Provider::name).unwrap_or("")}),
@@ -823,7 +839,11 @@ pub async fn call(method: &str, params: &Value) -> Result<Value> {
         let selected = if selected.is_empty() {
             None
         } else {
-            Some(Provider::parse(selected).ok_or("agent_invalid_provider")?)
+            match Provider::parse(selected) {
+                Some(provider) if provider.runnable() => Some(provider),
+                Some(_) => return Err("agent_provider_retired"),
+                None => return Err("agent_invalid_provider"),
+            }
         };
         let model = params
             .get("model")
@@ -855,6 +875,8 @@ pub async fn call(method: &str, params: &Value) -> Result<Value> {
             if selected.is_some() || !model.is_empty() {
                 return Err("agent_continuation_override");
             }
+            // Overwritten from the parent job under the store lock; this value
+            // is never launched.
             Provider::Claude
         }; // new_job reads the parent's provider under the store lock.
         return tokio::task::spawn_blocking(move || new_job(context, provider, model))

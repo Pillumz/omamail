@@ -4,7 +4,7 @@ const options = load('agent/Options.js')
 const copy = x => JSON.parse(JSON.stringify(x))
 const payload = {messageId:'synthetic',prompt:'Question'}
 assert.deepEqual(copy(options.startOptions(payload,'System default','',5)), {params:{payload}})
-for (const [label,provider] of [['OpenCode','opencode'],['Codex','codex'],['Claude','claude']]) {
+for (const [label,provider] of [['OpenCode','opencode'],['Codex','codex']]) {
   assert.deepEqual(copy(options.startOptions(payload,label,'test/model#variant',6)), {params:{payload,provider,model:'test/model#variant'}})
   assert(options.startOptions(payload,label,'',5).error)
 }
@@ -16,6 +16,11 @@ const parent = {parent:'11111111111111111111111111111111',prompt:'Follow-up'}
 for (const input of [parent,JSON.stringify(parent)]) {
   assert.deepEqual(copy(options.startOptions(input,'Codex','new-model',5)), {params:{payload:input}})
 }
+// A saved Claude choice stays visible and resolves to the retired provider so
+// the backend refuses it, instead of silently switching to another agent.
+assert.equal(options.agent('Claude'), 'Claude')
+assert.equal(options.provider('Claude'), 'claude')
+assert.equal(options.provider('System default'), '')
 const manifest = require('../../manifest.json')
 assert.equal(manifest.barWidget.defaults.aiAgent,'System default')
 assert.equal(manifest.barWidget.defaults.aiModel,'')

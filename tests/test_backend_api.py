@@ -166,7 +166,7 @@ function storageSnapshot(directory = process.env.HOME) {
         const job = {id:id(index),conversationId:id(0),accountId:'contract-account',messageId:'mail',
           messageIds:['mail'],draftKey:'',draftFingerprint:'',subject:'Synthetic',kind:'message',
           state:'done',created:1,createdOrder:index+1,updated:1,resultReady:true,displayVersion:2,
-          sessionId:'11111111-2222-3333-4444-555555555555',provider:'claude'};
+          sessionId:'11111111-2222-3333-4444-555555555555',provider:'codex'};
         const display = {transcript:[{role:'user',text:'question-'+index},{role:'assistant',text:'answer-'+index}],
           output:'answer-'+index,complete:true,sessionId:job.sessionId};
         const context = {accountId:job.accountId,prompt:'question-'+index,...(index ? {parent:id(index-1)} : {})};

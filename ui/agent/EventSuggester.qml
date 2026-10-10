@@ -67,7 +67,8 @@ Item {
     function onStartingChanged() { if (!root.runner.starting) root.drain() }
     function onEventLooksChanged() { root.drain() }
     function onStartRefused(code) {
-      if (String(code) === "agent_choose_claude") { root.unavailable = true; root.waiting = [] }
+      var refused = String(code)
+      if (refused === "agent_choose_claude" || refused === "agent_provider_retired") { root.unavailable = true; root.waiting = [] }
       root.started = []
     }
   }

@@ -1,8 +1,12 @@
 .pragma library
 
-function agents() { return ["System default", "OpenCode", "Codex", "Claude"] }
+function agents() { return ["System default", "OpenCode", "Codex"] }
 function agent(value) {
   var text = String(value || "System default")
+  // Claude was retired. Keep a saved value visible so Settings shows the
+  // exact stale choice and the backend can refuse it instead of silently
+  // switching the owner to another agent.
+  if (text === "Claude") return "Claude"
   return agents().indexOf(text) >= 0 ? text : "System default"
 }
 function provider(value) {

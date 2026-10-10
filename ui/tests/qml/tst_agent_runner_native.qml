@@ -171,7 +171,23 @@ Item {
     function test_unsupported_default_explains_available_agents_without_raw_output() {
       verify(runner.start({prompt:"Question"}))
       bridge.finish(0, null, {message:"agent_choose_claude"})
-      verify(runner.lastError.indexOf("OpenCode, Codex or Claude") >= 0)
+      verify(runner.lastError.indexOf("OpenCode or Codex") >= 0)
+    }
+    function test_retired_claude_chat_explains_the_replacement() {
+      verify(runner.start({prompt:"Question"}))
+      bridge.finish(0, null, {message:"agent_provider_retired"})
+      verify(runner.lastError.indexOf("Claude chats are no longer supported") >= 0)
+    }
+    function test_retired_claude_setting_is_unavailable_and_blocks_dispatch() {
+      bridge.holdStatus = true
+      runner.selectedAgent = "Claude"
+      var held = bridge.statuses[bridge.statuses.length - 1]
+      compare(held.params.provider, "claude")
+      held.callback({available:false,provider:""}, "")
+      verify(!runner.providerAvailable)
+      verify(runner.availabilityError.indexOf("Claude is no longer supported") >= 0)
+      verify(!runner.start({prompt:"Must not start"}))
+      compare(bridge.requests.length, 0)
     }
     function test_selection_cutoff_survives_reload_without_losing_new_chats() {
       runner.selectedAgent = "Codex"

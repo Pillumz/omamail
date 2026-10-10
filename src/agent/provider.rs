@@ -10,6 +10,11 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// Whether this build starts new work for this provider. Historical Claude
+    /// jobs stay readable, but this build never launches or continues them.
+    pub fn runnable(self) -> bool {
+        self != Self::Claude
+    }
     pub(super) fn executable(self) -> std::ffi::OsString {
         use std::os::unix::fs::PermissionsExt;
         let name = self.name();
@@ -52,18 +57,9 @@ impl Provider {
         let exe = std::env::current_exe().map_err(|_| "agent_worker_unavailable")?;
         let mut command = self.command(path, resume, model)?;
         match self {
-            Self::Claude => {
-                command.args(["--tools", "", "--strict-mcp-config"]);
-                let servers = if proposals {
-                    command.args(["--allowedTools", "mcp__omamail__propose_draft"]);
-                    json!({"omamail":{"type":"stdio","command":exe,"args":["agent-mcp",id]}})
-                } else {
-                    json!({})
-                };
-                command.args(["--mcp-config", &json!({"mcpServers":servers}).to_string()]);
-                command.args(["--system-prompt", super::worker::MAIL_ROLE]);
-                super::config::claude(&mut command, id)?;
-            }
+            // command() already refuses Claude; keep this explicit so a future
+            // caller cannot reach the Codex branch with a retired provider.
+            Self::Claude => return Err("agent_provider_retired"),
             Self::Codex => {
                 // Auth remains in CODEX_HOME; user tool/plugin customizations do
                 // not become authority to act on mail-supplied instructions.
@@ -146,20 +142,9 @@ impl Provider {
         let mut command = Command::new(self.executable());
         command.current_dir(path);
         match self {
-            Self::Claude => {
-                command.args([
-                    "-p",
-                    "--verbose",
-                    "--output-format",
-                    "stream-json",
-                    "--include-partial-messages",
-                    "--permission-mode",
-                    "dontAsk",
-                ]);
-                if !resume.is_empty() {
-                    command.args(["--resume", resume]);
-                }
-            }
+            // Claude support was retired: refuse, never fall back to another
+            // provider and never run or install the missing executable.
+            Self::Claude => return Err("agent_provider_retired"),
             Self::OpenCode => {
                 return Err("agent_server_required");
             }

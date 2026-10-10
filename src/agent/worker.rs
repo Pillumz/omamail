@@ -100,8 +100,6 @@ pub async fn run(id: &str) -> Result<(), &'static str> {
     let resume_id = job["resume"].as_str().unwrap_or("").to_owned();
     let resume = resume_id.as_str();
     let model = job["model"].as_str().unwrap_or("");
-    let _claude_settings = (provider == Provider::Claude)
-        .then(|| super::config::ClaudeSettings(path.join(id).join("claude-settings.json")));
     let turn_path = path.join(id);
     let cancelled = async {
         #[cfg(target_os = "linux")]

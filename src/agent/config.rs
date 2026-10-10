@@ -66,61 +66,6 @@ fn provider_settings(source: &Value) -> Value {
     selected
 }
 
-pub(super) fn claude(command: &mut std::process::Command, id: &str) -> Result<(), &'static str> {
-    let home = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude")))
-        .ok_or("agent_config_unavailable")?;
-    let source = read(&home.join("settings.json"))?;
-    let mut selected = json!({"disableAllHooks":true,"enabledPlugins":{}});
-    for key in [
-        "model",
-        "effortLevel",
-        "apiKeyHelper",
-        "awsAuthRefresh",
-        "awsCredentialExport",
-        "forceLoginMethod",
-        "forceLoginOrgUUID",
-    ] {
-        if let Some(value) = source.get(key) {
-            selected[key] = value.clone();
-        }
-    }
-    if let Some(env) = source["env"].as_object() {
-        let mut keep = json!({});
-        for (key, value) in env {
-            if key.starts_with("ANTHROPIC_")
-                || key.starts_with("AWS_")
-                || key.starts_with("GOOGLE_")
-                || key.starts_with("VERTEX_")
-                || key.starts_with("CLAUDE_CODE_USE_")
-            {
-                keep[key] = value.clone();
-            }
-        }
-        selected["env"] = keep;
-    }
-    let store = super::storage::Store::open()?;
-    store.write_json(id, "claude-settings.json", &selected)?;
-    command
-        .args([
-            "--setting-sources",
-            "",
-            "--disable-slash-commands",
-            "--no-chrome",
-            "--settings",
-        ])
-        .arg(store.path().join(id).join("claude-settings.json"));
-    Ok(())
-}
-
-pub(super) struct ClaudeSettings(pub PathBuf);
-impl Drop for ClaudeSettings {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

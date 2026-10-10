@@ -52,7 +52,6 @@ fn filename(name: &str) -> Result<CString> {
             | "cancel.json"
             | "next.json"
             | "bootstrap.json"
-            | "claude-settings.json"
     ) {
         return Err("agent_invalid_filename");
     }
