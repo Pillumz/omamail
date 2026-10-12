@@ -192,6 +192,29 @@ fn vcards_parse_names_addresses_folding_and_escapes() {
 }
 
 #[test]
+fn grouped_vcard_properties_keep_their_names_and_addresses() {
+    // The standard grouped spelling (RFC 6350 3.3): `item1.FN` and
+    // `item2.EMAIL` are the same FN and EMAIL with a group prefix, not
+    // unknown properties to drop.
+    let contacts = card(
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nitem1.FN:Иван Петров\r\nitem2.EMAIL;TYPE=work:ivan@example.org\r\nitem2.EMAIL;TYPE=home:ivan.petrov@example.org\r\nEND:VCARD\r\n",
+    );
+    assert_eq!(
+        json!(contacts),
+        json!([
+            {"name": "Иван Петров", "email": "ivan@example.org"},
+            {"name": "Иван Петров", "email": "ivan.petrov@example.org"}
+        ])
+    );
+    // A folded grouped line still folds; the group prefix does not disturb
+    // the continuation join.
+    let folded = card(
+        "BEGIN:VCARD\nVERSION:4.0\nitem1.FN:Grouped\n  Name\nitem1.EMAIL:g@example.org\nEND:VCARD\n",
+    );
+    assert_eq!(folded[0]["name"], "Grouped Name");
+}
+
+#[test]
 fn v3_quoted_printable_and_charset_decode() {
     let contacts = card(
         "BEGIN:VCARD\r\nVERSION:3.0\r\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=D0=98=D0=B2=D0=B0=D0=BD\r\nEMAIL:ivan@example.org\r\nEND:VCARD\r\n",

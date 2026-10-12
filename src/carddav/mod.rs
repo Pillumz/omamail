@@ -641,7 +641,11 @@ fn card_contacts(
         let Some((head, value)) = split_property(line) else {
             continue;
         };
-        let property = head.split(";").next().unwrap_or("");
+        // Grouped properties (RFC 6350 3.3: `item1.EMAIL`, `item1.FN`) carry
+        // the real name after the group prefix; the group is dropped, not
+        // the property with it.
+        let property = head.split(';').next().unwrap_or("");
+        let property = property.rsplit_once('.').map_or(property, |(_, name)| name);
         if property.eq_ignore_ascii_case("FN") {
             if name.is_empty() {
                 name = decode_value(head, value.trim());
