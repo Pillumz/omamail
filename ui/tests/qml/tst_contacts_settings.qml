@@ -58,24 +58,41 @@ Item {
     name: "ContactsSettings"
     when: windowShown
 
-    function sourceRow() {
-      var found = null
-      var stack = [settings]
+    function findByName(item, name) {
+      var stack = [item]
       while (stack.length > 0) {
-        var item = stack.pop()
-        if (item.objectName === "carddav-source") found = item
-        for (var i = 0; i < item.children.length; i++) stack.push(item.children[i])
+        var it = stack.pop()
+        if (it.objectName === name) return it
+        for (var i = 0; i < it.children.length; i++) stack.push(it.children[i])
       }
-      return found
+      return null
+    }
+
+    function sourceRow() {
+      return findByName(settings, "carddav-source")
     }
 
     function test_the_row_counts_contacts_through_the_repeater() {
+      controller.store = { version: 1, sources: [] }
       controller.loaded = true
       controller.connect({ url: "https://dav.example.org/", username: "u", collection: "", accountId: "" }, "secret")
       tryCompare(controller, "busy", false, 4000)
       var row = sourceRow()
       verify(row !== null, "the connected source has a row")
       tryCompare(row, "detail", "All accounts · 3 contacts", 2000)
+    }
+    function test_the_connect_form_keeps_the_chosen_account() {
+      settings.adding = true
+      findByName(settings, "carddav-url").text = "https://dav.example.org/"
+      findByName(settings, "carddav-username").text = "u"
+      findByName(settings, "carddav-password").text = "secret"
+      // The Dropdown stub only emits the choice, like the real control.
+      findByName(settings, "carddav-account").changed("imap:work@example.com")
+      controller.loaded = true
+      findByName(settings, "carddav-connect").clicked()
+      tryCompare(controller, "busy", false, 4000)
+      compare(controller.store.sources[0].accountId, "imap:work@example.com")
+      compare(controller.store.sources[0].books.length, 2)
     }
   }
 }

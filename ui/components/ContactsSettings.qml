@@ -18,6 +18,7 @@ Column {
   required property string panelFontFamily
   property bool adding: false
   property string formError: ""
+  property string pendingAccountId: ""
 
   readonly property var sources: root.controller && root.controller.loaded
     && root.controller.store && Array.isArray(root.controller.store.sources)
@@ -279,10 +280,13 @@ Column {
         width: Style.space(200)
         showLabel: false
         options: root.accountOptions()
-        value: ""
+        value: root.pendingAccountId
         foreground: root.textColor
         accent: root.accentColor
         fontFamily: root.panelFontFamily
+        // The standalone Dropdown reports a choice through `changed`; it
+        // never assigns its own `value`, so the form tracks the choice.
+        onChanged: function(next) { root.pendingAccountId = next }
       }
     }
 
@@ -325,7 +329,7 @@ Column {
     var started = root.controller.connect({
       url: sourceUrl.text,
       username: sourceUsername.text,
-      accountId: String(sourceAccount.value || ""),
+      accountId: root.pendingAccountId,
       collection: sourceCollection.text
     }, sourcePassword.text)
     sourcePassword.text = ""
@@ -341,7 +345,7 @@ Column {
       sourceUrl.text = ""
       sourceUsername.text = ""
       sourceCollection.text = ""
-      sourceAccount.value = ""
+      root.pendingAccountId = ""
     }
   }
 }
