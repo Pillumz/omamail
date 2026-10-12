@@ -85,6 +85,9 @@ Item {
       controller.busySourceId = ""
       controller.localBook = []
       controller.loaded = true
+      // The controller's own FileView answer (absent or leftover test file)
+      // must not start anything during a test: each test drives startup itself.
+      controller.startupStarted = true
     }
 
     function connectWork() {
@@ -234,6 +237,87 @@ Item {
       compare(merged.length, 2)
       var ivan = merged.filter(function(c) { return c.email === "ivan@example.org" })[0]
       compare(ivan.name, "Иван Петров", "the remote name completes a bare local address")
+    }
+
+    // The controller reads its config through a watched FileView; the test
+    // mock's signals stand in for the file's answers, driving the same
+    // handlers the real file does.
+    function configFileView() {
+      for (var i = 0; i < controller.resources.length; i++) {
+        var child = controller.resources[i]
+        if (child && String(child).indexOf("FileView") !== -1) return child
+      }
+      return null
+    }
+
+    function test_a_config_reload_updates_settings_without_a_new_cycle() {
+      var view = configFileView()
+      verify(!!view, "the controller reads its config through a watched FileView")
+      controller.store = CarddavSources.add(controller.store, {
+        id: staffId, url: "https://dav.example.org/dav/card/", username: "employee@example.org",
+        accountId: "imap:work@example.com", enabled: true,
+        books: [{ href: "https://dav.example.org/dav/card/directory%40example.org/staff/",
+          name: "CDM Staff", enabled: true }]
+      })
+      controller.startupStarted = true
+      mailService.discoverError = { code: -32000, message: "carddav_network_failed" }
+      mailService.refreshError = { code: -32000, message: "carddav_network_failed" }
+      // A later answer from the watched file — an external edit, or the
+      // write this controller's own saveStore just made. The store follows
+      // the file, and no second snapshot/refresh cycle is stacked on top of
+      // the targeted refresh the saving action already performed.
+      var revision = controller.contactsRevision
+      view.loaded()
+      compare(controller.store.sources.length, 0,
+        "the reload's settings answer replaces the store")
+      verify(controller.contactsRevision > revision,
+        "account-scoped bindings republish")
+      compare(mailService.backendCalls.length, 0,
+        "a config reload must not restart the pipeline")
+      compare(controller.busy, false)
+      // Hearing that the file is absent is not a change either: the store
+      // resets and nothing runs.
+      controller.store = CarddavSources.add(controller.store, {
+        id: staffId, url: "https://dav.example.org/dav/card/", username: "employee@example.org",
+        accountId: "", enabled: true, books: []
+      })
+      view.loadFailed()
+      compare(controller.store.sources.length, 0)
+      compare(mailService.backendCalls.length, 0,
+        "an absent-file answer after startup runs nothing")
+      compare(controller.loaded, true)
+    }
+
+    function test_the_initial_config_answer_starts_the_pipeline_once() {
+      var view = configFileView()
+      verify(!!view)
+      mailService.localResult = [{ name: "Local", email: "local@example.org" }]
+      // Nothing has answered yet: the file's first answer — loaded or
+      // failed — is what starts the local book and the pipeline.
+      controller.store = CarddavSources.emptyStore()
+      controller.loaded = false
+      controller.startupStarted = false
+      view.loaded()
+      compare(controller.loaded, true)
+      compare(JSON.stringify(mailService.backendCalls.map(function(call) { return call.method })),
+        JSON.stringify(["contacts.suggest"]),
+        "the initial answer starts the one startup cycle")
+      // The answer that follows must not start another.
+      mailService.backendCalls = []
+      view.loaded()
+      view.loadFailed()
+      compare(mailService.backendCalls.length, 0)
+      // A first start whose file cannot be read still starts: the failed
+      // answer marks the store known and begins the same flow.
+      controller.loaded = false
+      controller.startupStarted = false
+      mailService.backendCalls = []
+      view.loadFailed()
+      compare(controller.loaded, true)
+      compare(JSON.stringify(mailService.backendCalls.map(function(call) { return call.method })),
+        JSON.stringify(["contacts.suggest"]),
+        "an absent config still permits the local/start flow")
+      compare(controller.mergedForAccount("imap:work@example.com").length, 1)
     }
   }
 }

@@ -32,6 +32,8 @@ Item {
     ? service.configPath("carddav.json") : ""
   property var store: CarddavSources.emptyStore()
   property bool loaded: false
+  // The full startup cycle runs once; see beginStartup().
+  property bool startupStarted: false
   // sourceId -> { book href -> [ { name, email } ] }; always the backend's last
   // complete answer, never a partially read book.
   property var snapshots: ({})
@@ -393,23 +395,44 @@ Item {
     root.refreshSource(id)
   }
 
+  // The full snapshot/refresh cycle runs once per start, from whichever
+  // comes last: the first config answer or the backend becoming ready. A
+  // later config reload — including the ones this controller's own saves
+  // cause — only updates the store; the action that saved did its targeted
+  // work already.
+  function beginStartup() {
+    if (root.startupStarted) return
+    root.startupStarted = true
+    root.start()
+  }
+
   onRefreshFinished: function(_id, _ok, _error) { root.refreshNext() }
 
   FileView {
     path: root.configPath
     watchChanges: true
     printErrors: false
+    // Only the initial load starts the pipeline. Later reloads — external
+    // edits, or the write this controller itself just made — update the
+    // store and republish through contactsRevision without another full
+    // snapshot/refresh cycle on top of the targeted refresh that caused
+    // them.
     onLoaded: {
       root.store = CarddavSources.load(text())
       root.loaded = true
       root.contactsRevision += 1
-      root.start()
+      root.beginStartup()
     }
     onFileChanged: reload()
+    // A first start with no config file is a normal start: an empty store
+    // still loads the local book and runs the pipeline.
     onLoadFailed: {
-      if (!root.store || !Array.isArray(root.store.sources) || root.store.sources.length > 0)
+      if (!root.store || !Array.isArray(root.store.sources) || root.store.sources.length > 0) {
         root.store = CarddavSources.emptyStore()
+        root.contactsRevision += 1
+      }
       root.loaded = true
+      root.beginStartup()
     }
   }
 
