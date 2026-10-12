@@ -269,7 +269,7 @@ def main():
                         help='check standalone capabilities, including native agents on Linux/macOS')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
-    contract = json.loads((ROOT / 'backend-api.json').read_text())
+    contract = json.loads((ROOT / 'backend-api.json').read_text(encoding='utf-8'))
     if (type(contract.get('apiVersion')) is not int or contract['apiVersion'] < 1
             or type(contract.get('protocolVersion')) is not int
             or not isinstance(contract.get('methods'), list)
