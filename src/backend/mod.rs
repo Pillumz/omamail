@@ -259,6 +259,9 @@ impl Session {
                 .await
                 .map_err(|_| "worker_failed")?;
         }
+        if method.starts_with("carddav.") {
+            return Box::pin(crate::carddav::call(method, params)).await;
+        }
         if matches!(method, "public.image" | "public.unsubscribe") {
             let fields = params.as_object().ok_or("invalid_params")?;
             if fields.len() != 1 {
@@ -479,7 +482,7 @@ pub fn dispatch(method: &str, params: &Value) -> Result<Value, &'static str> {
     match method {
         "system.info" => Ok(json!({
             "name": "omamail", "version": env!("CARGO_PKG_VERSION"),
-            "protocol": 1, "apiVersion": 6, "methods": methods::available(),
+            "protocol": 1, "apiVersion": 7, "methods": methods::available(),
             "capabilities": {"agent": cfg!(all(feature = "agent", unix))}
         })),
         "system.quit" => Ok(json!({"quitReady": true})),

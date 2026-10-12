@@ -25,6 +25,7 @@ Item {
       ({ name: "Second Person", email: "second@example.com" }),
       ({ name: "Third Person", email: "third@example.com" })
     ]
+    property var carddavController: null
     property var sendAsAliases: []
     property var sendIdentities: []
     property string accountEmail: "me@example.com"
@@ -293,6 +294,27 @@ Item {
       picker.contactChosen({ name: "Bob", email: "bob@example.com" }, "cc")
       compare(compose.ccVisible, true)
       compare(named(compose, "compose-cc-field").text, "Bob <bob@example.com>")
+    }
+
+    function test_carddav_sources_publish_into_the_drafts_book() {
+      var asked = []
+      mailService.carddavController = ({
+        mergedForAccount: function(accountId) {
+          asked.push(String(accountId))
+          return [{ name: "Иван Петров", email: "ivan@example.org" }]
+        }
+      })
+      compose.begin("new", null, "", [])
+      var book = compose.contactBook
+      compare(book.length, 1)
+      compare(book[0].name, "Иван Петров")
+      verify(asked.indexOf("me@example.com") !== -1,
+        "the book is asked for the draft's own mailbox: " + asked.join(","))
+      var picker = named(compose, "compose-contacts-picker")
+      compare(picker.contacts.length, 1, "the picker reads the same account-scoped book")
+      compare(picker.contacts[0].email, "ivan@example.org")
+      mailService.carddavController = null
+      compare(compose.contactBook.length, 3, "without a controller the local book is the fallback")
     }
   }
 }

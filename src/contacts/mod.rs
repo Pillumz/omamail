@@ -13,7 +13,7 @@ const MAX_FILE: u64 = 16 * 1024 * 1024;
 const MAX_CONTACTS: usize = 10000;
 type Book = BTreeMap<String, Value>;
 
-fn address(s: &str) -> bool {
+pub(crate) fn address(s: &str) -> bool {
     let Some((local, domain)) = s.split_once('@') else {
         return false;
     };

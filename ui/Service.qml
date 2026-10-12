@@ -6,6 +6,7 @@ import qs.Commons
 import qs.Commons as Commons
 import "account"
 import "calendar"
+import "contacts"
 import "agent"
 import "backend"
 import "diagnostics"
@@ -59,7 +60,7 @@ Item {
     pluginDir: root.pluginDir
     bundledExecutable: root.standalone ? String(root.platform.backendPath || "") : ""
     bundledVersion: root.standalone ? root.version : ""
-    bundledApiVersion: root.standalone ? 5 : 0
+    bundledApiVersion: root.standalone ? 6 : 0
     bundledMode: root.standalone
     developmentExecutable: root.standalone ? "" : (Quickshell.env("OMAMAIL_BIN") || "")
     onValidated: Qt.callLater(rustBackend.reconcileProcess)
@@ -104,6 +105,8 @@ Item {
   readonly property bool backendCanCheckMicrosoftConnection: backend.ready && backend.apiVersion >= 5
   readonly property bool backendCanDiscoverCalendars: backend.ready && backend.apiVersion >= 5
   readonly property bool backendCanGoogleCalendars: backend.ready && backend.apiVersion >= 6
+  // CardDAV address books require API 7 regardless of when that API is released.
+  readonly property bool backendCanCarddav: backend.ready && backend.apiVersion >= 7
   readonly property bool calendarRemindersEnabled: !settings || settings.calendarRemindersEnabled !== false
   readonly property int calendarSnoozeMinutes: Math.max(1, Math.min(1440,
     Math.floor(Number(settings && settings.calendarSnoozeMinutes) || 5)))
@@ -438,20 +441,10 @@ Item {
   // be what takes the icon away.
   readonly property bool showBarIcon: !settings || settings.showBarIcon !== false
 
-  // Thunderbird and Betterbird keep both explicit and learned addresses in
-  // their local profile. The helper reads those databases without modifying
-  // them. Nothing is copied into Omamail's settings or cache.
-  property var recipientContacts: []
-  property bool contactsLoading: false
-
-  function refreshRecipientContacts() {
-    if (contactsLoading || !backend || !backend.ready) return
-    contactsLoading = true
-    backend.call("contacts.suggest", {}, function(result, error) {
-      root.contactsLoading = false
-      if (!error && Array.isArray(result)) root.recipientContacts = result
-    })
-  }
+  // The contacts controller owns the local book and connected CardDAV sources.
+  readonly property alias recipientContacts: carddavContacts.localBook
+  readonly property alias carddavController: carddavContacts
+  function refreshRecipientContacts() { carddavContacts.refreshLocalContacts() }
 
   function registerMailtoHandler() {
     if (!hasMailto || pluginDir === "" || mailtoInstaller.running) return
@@ -517,7 +510,7 @@ Item {
   }
 
   function writeConfig(name, text, callback) {
-    var allowed = ["credentials.json", "window.json", "calendars.json"]
+    var allowed = ["credentials.json", "window.json", "calendars.json", "carddav.json"]
     if (allowed.indexOf(String(name || "")) < 0) {
       if (typeof callback === "function") callback(false, "Invalid configuration file")
       return false
@@ -2630,6 +2623,11 @@ Item {
     Component.onCompleted: Qt.callLater(root.refreshCalendarPreview)
   }
 
+  CarddavController {
+    id: carddavContacts
+    service: root
+  }
+
   Loader {
     id: calendarReminderLoader
     active: root.backendCanGoogleCalendars && root.calendarRemindersEnabled
@@ -2901,9 +2899,8 @@ Item {
       if (root.backend.ready) {
         if (root.accountsSaveQueued) root.saveAccounts(root.accountsSaveQueuedAllowDrop ? { allowDrop: true } : undefined)
         else root.restoreAccountRegistry()
-        root.refreshRecipientContacts()
+        carddavContacts.start()
       }
-      else root.contactsLoading = false
     }
   }
 
@@ -2942,7 +2939,7 @@ Item {
       function() { root.refresh() },
       function() { root.refreshCalendarPreview() })
     Qt.callLater(root.restoreAccountRegistry)
-    Qt.callLater(root.refreshRecipientContacts)
+    Qt.callLater(carddavContacts.start)
     Qt.callLater(root.registerMailtoHandler)
     Qt.callLater(root.refreshDefaultMailClient)
   }

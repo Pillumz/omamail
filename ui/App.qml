@@ -2368,6 +2368,7 @@ Item {
               width: settingsArea.pageWidth
               service: root.service
               calendarController: root.service ? root.service.calendarController : null
+              carddavController: root.service ? root.service.carddavController : null
               textColor: root.foreground
               dimColor: root.dim
               accentColor: root.accent
