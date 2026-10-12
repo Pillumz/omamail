@@ -132,6 +132,23 @@ fn refresh_params(hrefs: &[&str]) -> Value {
     params
 }
 
+/// A REPORT answer of `cards` contacts whose names sit at the per-contact
+/// bound: every book stays inside the per-book limits, and only the
+/// aggregate budgets can refuse the total.
+fn heavy_book_xml(cards: usize) -> String {
+    let name = "n".repeat(MAX_NAME_BYTES);
+    let mut xml = String::from(
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">"#,
+    );
+    for index in 0..cards {
+        xml.push_str(&format!(
+            "<d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:{name}\nEMAIL:n{index}@example.org\nEND:VCARD</c:address-data></d:prop></d:propstat></d:response>"
+        ));
+    }
+    xml.push_str("</d:multistatus>");
+    xml
+}
+
 #[tokio::test]
 async fn standard_discovery_finds_own_and_shared_books() {
     let mut peer = Peer::new();
@@ -205,9 +222,10 @@ async fn refresh_reads_cards_and_keeps_failed_books_previous_snapshot() {
     let root = snapshot_test_root();
     // One book answers; the other refuses. The refusal must not lose the
     // contacts an earlier complete refresh stored.
+    let prior_books = json!([{"href": OWN_BOOK, "contacts": [{"name": "Earlier", "email": "earlier@example.org"}]}]);
     snapshot_write(
         &derive_source_id("https://dav.example.org/dav/card/", "employee@example.org").unwrap(),
-        &json!([{"href": OWN_BOOK, "contacts": [{"name": "Earlier", "email": "earlier@example.org"}]}]),
+        prior_books.as_array().unwrap(),
     )
     .unwrap();
     let mut peer = Peer::new();
@@ -255,6 +273,98 @@ async fn refresh_reads_cards_and_keeps_failed_books_previous_snapshot() {
             "no image or media resource is ever requested"
         );
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn aggregate_overflow_is_refused_whole_and_keeps_the_last_snapshot() {
+    let _guard = snapshot_test_lock();
+    let root = snapshot_test_root();
+    let id = derive_source_id("https://dav.example.org/dav/card/", "employee@example.org").unwrap();
+    let good = json!([
+        {"href": OWN_BOOK, "contacts": [{"name": "Earlier", "email": "earlier@example.org"}]}
+    ]);
+    snapshot_write(&id, good.as_array().unwrap()).unwrap();
+
+    // Three books, each inside every per-book limit (fewer than MAX_CARDS
+    // cards, well under BOOK_LIMIT bytes), whose names make every book
+    // serialize to about 8.8 MB: the second already passes the snapshot
+    // byte budget that used to be checked only after the whole ~1 GB-scale
+    // answer had been accumulated and encoded. The refresh must refuse with
+    // the bounded aggregate error, stop fetching the rest, and leave the
+    // stored snapshot exactly as it was.
+    let hrefs: Vec<String> = (0..3)
+        .map(|index| format!("https://dav.example.org/dav/card/heavy{index}/"))
+        .collect();
+    let refs: Vec<&str> = hrefs.iter().map(|href| href.as_str()).collect();
+    let mut peer = Peer::new();
+    peer.responses(json!([
+        {"status": 207, "body": heavy_book_xml(8_200)},
+        {"status": 207, "body": heavy_book_xml(8_200)},
+        {"status": 207, "body": heavy_book_xml(8_200)},
+    ]));
+    assert_eq!(
+        refresh_on(&peer.client, &refresh_params(&refs), synthetic_lookup).await,
+        Err("carddav_total_too_large"),
+        "no giant reply and no stored:false — a resource overflow is a refusal"
+    );
+    assert_eq!(
+        peer.requests().len(),
+        2,
+        "the loop stops at the book that crosses the budget"
+    );
+    let stored = snapshot(&json!({"sourceId": id})).unwrap();
+    assert_eq!(stored["books"].as_array().unwrap().len(), 1);
+    assert_eq!(stored["books"][0]["contacts"][0]["email"], "earlier@example.org");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn retained_books_count_against_the_aggregate_budget() {
+    let _guard = snapshot_test_lock();
+    let root = snapshot_test_root();
+    let id = derive_source_id("https://dav.example.org/dav/card/", "employee@example.org").unwrap();
+    let name = "n".repeat(MAX_NAME_BYTES);
+    let heavy = |start: usize| {
+        (start..start + 7_000)
+            .map(|index| json!({"name": name, "email": format!("n{index}@example.org")}))
+            .collect::<Vec<_>>()
+    };
+    // A stored snapshot near the byte cap: two retained books totalling
+    // about 15 MB, each inside the per-book contact limit.
+    let prior = json!([
+        {"href": "https://dav.example.org/dav/card/a/", "contacts": heavy(0)},
+        {"href": "https://dav.example.org/dav/card/b/", "contacts": heavy(7_000)},
+    ]);
+    snapshot_write(&id, prior.as_array().unwrap()).unwrap();
+
+    // Both stored books now fail and must be retained; the fresh book would
+    // fit alone, but not beside them. The whole refresh refuses instead of
+    // writing a snapshot past the cap or losing the retained contacts.
+    let mut peer = Peer::new();
+    peer.responses(json!([
+        {"status": 403},
+        {"status": 403},
+        {"status": 207, "body": heavy_book_xml(3_000)},
+    ]));
+    assert_eq!(
+        refresh_on(
+            &peer.client,
+            &refresh_params(&[
+                "https://dav.example.org/dav/card/a/",
+                "https://dav.example.org/dav/card/b/",
+                "https://dav.example.org/dav/card/c/",
+            ]),
+            synthetic_lookup
+        )
+        .await,
+        Err("carddav_total_too_large")
+    );
+    let stored = snapshot(&json!({"sourceId": id})).unwrap();
+    let books = stored["books"].as_array().unwrap();
+    assert_eq!(books.len(), 2, "the retained books survive untouched");
+    assert_eq!(books[0]["contacts"].as_array().unwrap().len(), 7_000);
+    assert_eq!(books[1]["contacts"].as_array().unwrap().len(), 7_000);
     std::fs::remove_dir_all(root).unwrap();
 }
 

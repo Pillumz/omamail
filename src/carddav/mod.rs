@@ -33,6 +33,9 @@ const MAX_NAME_BYTES: usize = 1024;
 const MAX_EMAIL_BYTES: usize = 254;
 const MAX_XML_DEPTH: usize = 64;
 const MAX_SNAPSHOT_CONTACTS: usize = 50_000;
+// The fixed JSON around the books array of a snapshot file; the serialized
+// book bytes are budgeted against the snapshot limit minus this envelope.
+const SNAPSHOT_ENVELOPE: usize = 128;
 
 static CLIENT: OnceLock<Result<reqwest::Client, &'static str>> = OnceLock::new();
 
@@ -638,7 +641,7 @@ fn card_contacts(
         let Some((head, value)) = split_property(line) else {
             continue;
         };
-        let property = head.split(';').next().unwrap_or("");
+        let property = head.split(";").next().unwrap_or("");
         if property.eq_ignore_ascii_case("FN") {
             if name.is_empty() {
                 name = decode_value(head, value.trim());
@@ -849,26 +852,96 @@ fn snapshot_books(raw: &Value) -> Result<Vec<Value>, &'static str> {
     Ok(books)
 }
 
-fn snapshot_write(source_id: &str, books: &Value) -> Result<(), &'static str> {
-    let bytes = serde_json::to_vec(&json!({
-        "version": 1, "source": source_id, "books": books,
-    }))
-    .map_err(|_| "carddav_snapshot_unavailable")?;
-    if bytes.len() > SNAPSHOT_LIMIT {
-        return Err("carddav_snapshot_unavailable");
-    }
-    let dir = snapshot_dir(true)?.ok_or("carddav_snapshot_unavailable")?;
-    crate::platform::private_fs::atomic_replace(&dir, &snapshot_name(source_id), &bytes)
-        .map_err(|_| "carddav_snapshot_unavailable")?;
-    crate::platform::private_fs::sync_dir(&dir).map_err(|_| "carddav_snapshot_unavailable")
-}
-
 fn snapshot_forget(source_id: &str) -> Result<(), &'static str> {
     if let Some(dir) = snapshot_dir(false)? {
         crate::platform::private_fs::remove_owned(&dir, &snapshot_name(source_id))
             .map_err(|_| "carddav_snapshot_unavailable")?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bounded serialization. A snapshot is capped by SNAPSHOT_LIMIT, but the
+// per-book limits alone would let dozens of books accumulate and encode to
+// hundreds of megabytes before that cap refused the finished buffer. Both
+// writers below stop at `limit`, so an over-budget answer is refused mid-way
+// instead of being materialized whole first; the counter does not allocate.
+
+struct BoundedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedBuffer {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if chunk.len() > self.limit - self.bytes.len() {
+            return Err(std::io::Error::other("carddav_total_too_large"));
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedCounter {
+    count: usize,
+    limit: usize,
+}
+
+impl std::io::Write for BoundedCounter {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        self.count = self.count.saturating_add(chunk.len());
+        if self.count > self.limit {
+            return Err(std::io::Error::other("carddav_total_too_large"));
+        }
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The serialized size of `value`, refusing once it would pass `limit`.
+fn serialized_within(value: &Value, limit: usize) -> Result<usize, &'static str> {
+    let mut writer = BoundedCounter {
+        count: 0,
+        limit,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| "carddav_total_too_large")?;
+    Ok(writer.count)
+}
+
+#[derive(serde::Serialize)]
+struct SnapshotFile<'a> {
+    version: u8,
+    source: &'a str,
+    books: &'a [Value],
+}
+
+fn snapshot_write(source_id: &str, books: &[Value]) -> Result<(), &'static str> {
+    let mut buffer = BoundedBuffer {
+        bytes: Vec::new(),
+        limit: SNAPSHOT_LIMIT,
+    };
+    serde_json::to_writer(
+        &mut buffer,
+        &SnapshotFile {
+            version: 1,
+            source: source_id,
+            books,
+        },
+    )
+    // A Value can only fail the writer, and this writer only fails its cap.
+    .map_err(|_| "carddav_total_too_large")?;
+    let bytes = buffer.bytes;
+    let dir = snapshot_dir(true)?.ok_or("carddav_snapshot_unavailable")?;
+    crate::platform::private_fs::atomic_replace(&dir, &snapshot_name(source_id), &bytes)
+        .map_err(|_| "carddav_snapshot_unavailable")?;
+    crate::platform::private_fs::sync_dir(&dir).map_err(|_| "carddav_snapshot_unavailable")
 }
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1130,15 @@ where
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut books = Vec::new();
         let mut errors = Vec::new();
+        // The per-book limits bound one answer; these budgets bound the
+        // refresh as a whole. Sixty-four books of ten thousand long-named
+        // contacts would otherwise accumulate and serialize close to a
+        // gigabyte before the snapshot cap refused the finished buffer.
+        // Crossing either budget fails the refresh whole — the last complete
+        // snapshot is never replaced by a partial one — and stops the loop
+        // instead of fetching the rest.
+        let mut fresh_contacts = 0usize;
+        let mut fresh_bytes = 0usize;
         for target in &targets {
             let result = if std::time::Instant::now() >= deadline {
                 Err("carddav_timeout")
@@ -1078,7 +1160,17 @@ where
                 }
             };
             match result {
-                Ok(contacts) => books.push(json!({"href": target.as_str(), "contacts": contacts})),
+                Ok(contacts) => {
+                    fresh_contacts += contacts.len();
+                    let book = json!({"href": target.as_str(), "contacts": contacts});
+                    fresh_bytes += serialized_within(&book, SNAPSHOT_LIMIT)? + 1;
+                    if fresh_contacts > MAX_SNAPSHOT_CONTACTS
+                        || fresh_bytes + SNAPSHOT_ENVELOPE > SNAPSHOT_LIMIT
+                    {
+                        return Err("carddav_total_too_large");
+                    }
+                    books.push(book);
+                }
                 Err(error) => errors.push(json!({"href": target.as_str(), "error": error})),
             }
         }
@@ -1096,8 +1188,27 @@ where
                     && errors.iter().any(|entry| entry["href"].as_str() == Some(href))
             })
             .collect();
+        // Retained books count toward the same budgets: what is stored is
+        // the fresh answer plus every stale book being kept for a failure.
+        let mut total_contacts = fresh_contacts;
+        let mut total_bytes = fresh_bytes;
+        for book in &merged {
+            total_contacts += book["contacts"].as_array().map_or(0, |list| list.len());
+            total_bytes += serialized_within(book, SNAPSHOT_LIMIT)? + 1;
+            if total_contacts > MAX_SNAPSHOT_CONTACTS
+                || total_bytes + SNAPSHOT_ENVELOPE > SNAPSHOT_LIMIT
+            {
+                return Err("carddav_total_too_large");
+            }
+        }
         merged.extend(books.iter().cloned());
-        let stored = snapshot_write(&source_id, &json!(merged)).is_ok();
+        let stored = match snapshot_write(&source_id, &merged) {
+            Ok(()) => true,
+            // Size is a resource overflow, not a persistence failure: report
+            // the refusal instead of hiding it behind `stored:false`.
+            Err("carddav_total_too_large") => return Err("carddav_total_too_large"),
+            Err(_) => false,
+        };
         Ok(json!({"books": books, "errors": errors, "stored": stored}))
     };
     tokio::time::timeout(Duration::from_secs(22), run)

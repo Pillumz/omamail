@@ -132,6 +132,8 @@ assert.strictEqual(merged[0].name, "Local", "sorted by name, local names kept")
 
 assert.ok(carddav.describeError("carddav_auth_refused").length > 0)
 assert.ok(carddav.describeError("carddav_snapshot_unavailable").indexOf("until the app restarts") !== -1)
+assert.ok(carddav.describeError("carddav_total_too_large").indexOf("disable some of them") !== -1,
+  "an aggregate overflow is said as something the user can act on")
 assert.ok(carddav.describeError("unlisted-code") === "unlisted-code")
 
 console.log("test_carddav_sources ok")

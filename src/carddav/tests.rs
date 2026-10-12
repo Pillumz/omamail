@@ -266,6 +266,28 @@ fn oversized_books_are_refused_not_truncated() {
     assert!(matches!(book_contacts(&xml), Err("carddav_too_many_contacts")));
 }
 
+#[test]
+fn oversize_snapshots_are_refused_whole_by_a_bounded_encoding() {
+    let _guard = snapshot_test_lock();
+    let root = snapshot_test_root();
+    let id = derive_source_id("https://dav.example.org/", "ann").unwrap();
+    // Every contact is valid and the per-book limits never ran; only the
+    // whole file passes the snapshot cap. The encoder must refuse mid-way
+    // with the aggregate error and leave no file behind — a last good
+    // answer cannot be replaced by a refused one.
+    let name = "n".repeat(MAX_NAME_BYTES);
+    let contacts: Vec<Value> = (0..SNAPSHOT_LIMIT / MAX_NAME_BYTES + 2)
+        .map(|index| json!({"name": name, "email": format!("n{index}@example.org")}))
+        .collect();
+    let books = json!([{"href": "https://dav.example.org/big/", "contacts": contacts}]);
+    assert!(matches!(
+        snapshot_write(&id, books.as_array().unwrap()),
+        Err("carddav_total_too_large")
+    ));
+    assert_eq!(snapshot_read(&id).unwrap(), json!({"books": []}));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn colliding_spellings_keep_separate_credentials_and_snapshots() {
     let _guard = snapshot_test_lock();
@@ -284,7 +306,8 @@ async fn colliding_spellings_keep_separate_credentials_and_snapshots() {
         .await;
         assert_eq!(seen.into_inner(), expected);
     }
-    snapshot_write(&a, &json!([{"href": "https://a.b/x/", "contacts": []}])).unwrap();
+    let seeded = json!([{"href": "https://a.b/x/", "contacts": []}]);
+    snapshot_write(&a, seeded.as_array().unwrap()).unwrap();
     assert_eq!(json!(snapshot_read(&b).unwrap()), json!({"books": []}));
     assert_eq!(snapshot_read(&a).unwrap()["books"].as_array().unwrap().len(), 1);
 }

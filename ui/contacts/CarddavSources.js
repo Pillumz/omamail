@@ -319,6 +319,7 @@ function describeError(code) {
   if (text === "carddav_discovery_failed") return "The server did not name an address book home; enter the address book URL directly"
   if (text === "carddav_too_many_books") return "The server listed more address books than supported"
   if (text === "carddav_too_many_contacts") return "An address book is larger than supported"
+  if (text === "carddav_total_too_large") return "The enabled address books are together larger than supported; disable some of them and refresh again"
   if (text === "carddav_response_too_large") return "The server's answer is larger than supported"
   if (text === "carddav_timeout" || text === "carddav_network_failed") return "The server could not be reached"
   if (text === "carddav_invalid_response") return "The server's answer could not be read"
