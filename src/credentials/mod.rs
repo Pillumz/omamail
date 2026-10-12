@@ -28,6 +28,7 @@ pub enum CredentialKind {
     ImapPassword,
     JmapSecret,
     CalendarPassword,
+    CarddavPassword,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +155,7 @@ impl CredentialKey {
             CredentialKind::ImapPassword => ("imap", "imap-password"),
             CredentialKind::JmapSecret => ("jmap", "jmap-secret"),
             CredentialKind::CalendarPassword => ("caldav", "calendar-password"),
+            CredentialKind::CarddavPassword => ("carddav", "carddav-password"),
         };
         if self.provider != provider {
             return Err(Error::InvalidKey);
@@ -162,7 +164,7 @@ impl CredentialKey {
             ("service".into(), "omamail".into()),
             ("kind".into(), kind.into()),
         ]);
-        if provider == "caldav" {
+        if provider == "caldav" || provider == "carddav" {
             attrs.insert("source".into(), self.account_id.clone());
         } else {
             if self.account_id.chars().any(char::is_whitespace)

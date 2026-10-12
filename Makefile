@@ -73,6 +73,7 @@ QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryContr
 	ui/components/SetupPage.qml \
 	ui/components/ShortcutHelp.qml \
 	ui/calendar/CalendarController.qml ui/calendar/CalendarCache.qml ui/calendar/CalendarReminders.qml ui/calendar/CalendarReminderInbox.qml \
+	ui/contacts/CarddavController.qml ui/components/ContactsSettings.qml \
 	ui/components/CalendarView.qml \
 	ui/components/WeekCalendarView.qml \
 	ui/components/WindowMoveArea.qml \
@@ -145,6 +146,7 @@ test-js:
 	node ui/tests/test_calendar_sources.js
 	node ui/tests/test_calendar_reminders.js
 	node ui/tests/test_calendar_palette.js
+	node ui/tests/test_carddav_sources.js
 	node ui/tests/test_bar_preview.js
 	node ui/tests/test_unsubscribe.js
 	node ui/tests/test_mailto.js

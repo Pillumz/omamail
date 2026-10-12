@@ -1,5 +1,5 @@
 {
-  "apiVersion": 6,
+  "apiVersion": 7,
   "releasedApiVersion": 6,
   "protocolVersion": 1,
   "methods": [
@@ -89,6 +89,10 @@
     "cache.calendarRead",
     "cache.calendarPut",
     "contacts.suggest",
+    "carddav.discover",
+    "carddav.refresh",
+    "carddav.snapshot",
+    "carddav.forget",
     "attachment.read",
     "attachment.store",
     "attachment.storeUpload",
@@ -512,7 +516,7 @@
           "recipient@example.org"
         ],
         "subject": "Contract preview",
-        "body": "Hello \u5408\u6210\nSecond line"
+        "body": "Hello 合成\nSecond line"
       },
       "equals": {
         "dryRun": true,
@@ -523,7 +527,7 @@
           "recipient@example.org"
         ],
         "subject": "Contract preview",
-        "body": "Hello \u5408\u6210\nSecond line",
+        "body": "Hello 合成\nSecond line",
         "attachments": []
       }
     },
@@ -788,7 +792,7 @@
         "now": 1700000000000
       },
       "equals": {
-        "body.text": "Hello \u5408\u6210",
+        "body.text": "Hello 合成",
         "summary.subject": "API fixture",
         "summary.id": "fixture"
       },
@@ -1263,10 +1267,158 @@
       "types": {
         "ticket": "string"
       }
+    },
+    {
+      "name": "CardDAV discovery rejects unknown fields before credentials",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org",
+          "token": "x"
+        }
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV source id commits to the endpoint",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://other.example.org/",
+          "username": "employee@example.org"
+        }
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV source id commits to the username",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "anna"
+        }
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV discovery refuses a plain-HTTP collection before credentials",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "collection": "http://dav.example.org/card/"
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "carddav_invalid_url"
+      }
+    },
+    {
+      "name": "CardDAV discovery pins an explicit collection to the source origin",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "collection": "https://other.example.org/card/"
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "carddav_origin_refused"
+      }
+    },
+    {
+      "name": "CardDAV refresh rejects unknown book fields before credentials",
+      "method": "carddav.refresh",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "books": [
+          {
+            "href": "/book/",
+            "etag": "1"
+          }
+        ]
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV refresh pins every book href to the source origin",
+      "method": "carddav.refresh",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "books": [
+          {
+            "href": "https://other.example.org/book/"
+          }
+        ]
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV snapshot rejects a foreign source identity",
+      "method": "carddav.snapshot",
+      "params": {
+        "sourceId": "imap:a@example.org"
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV snapshot reads an absent store as empty",
+      "method": "carddav.snapshot",
+      "params": {
+        "sourceId": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5"
+      },
+      "equals": {
+        "books": []
+      }
+    },
+    {
+      "name": "CardDAV forget is idempotent",
+      "method": "carddav.forget",
+      "params": {
+        "sourceId": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5"
+      },
+      "equals": {
+        "forgotten": true
+      }
     }
   ],
   "unreleased": {
-    "methods": [],
-    "cases": []
+    "methods": [
+      "carddav.discover",
+      "carddav.refresh",
+      "carddav.snapshot",
+      "carddav.forget"
+    ],
+    "cases": [
+      "CardDAV discovery rejects unknown fields before credentials",
+      "CardDAV source id commits to the endpoint",
+      "CardDAV source id commits to the username",
+      "CardDAV discovery refuses a plain-HTTP collection before credentials",
+      "CardDAV discovery pins an explicit collection to the source origin",
+      "CardDAV refresh rejects unknown book fields before credentials",
+      "CardDAV refresh pins every book href to the source origin",
+      "CardDAV snapshot rejects a foreign source identity",
+      "CardDAV snapshot reads an absent store as empty",
+      "CardDAV forget is idempotent"
+    ]
   }
 }
