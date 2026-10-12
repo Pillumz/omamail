@@ -76,7 +76,10 @@ Item {
   function contactCount(source) {
     var count = 0
     var books = root.snapshots[String(source && source.id || "")] || {}
-    var list = source && Array.isArray(source.books) ? source.books : []
+    // `source` may arrive through a Repeater's modelData, where the books
+    // list is a QVariantList rather than a JavaScript array — Array.isArray
+    // would refuse it and the count would silently stay zero.
+    var list = source && source.books && source.books.length !== undefined ? source.books : []
     for (var i = 0; i < list.length; i++) {
       if (list[i] && list[i].enabled === true && books[list[i].href])
         count += books[list[i].href].length
