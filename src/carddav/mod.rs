@@ -768,12 +768,20 @@ static SNAPSHOT_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
 #[cfg(test)]
 fn snapshot_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap()
+    // A panicking snapshot test would otherwise poison the lock and turn
+    // every later failure into a PoisonError that hides its own cause. The
+    // lock only serializes process-global test roots; there is no shared
+    // data to defend.
+    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 #[cfg(test)]
 fn snapshot_test_root() -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
+    // Canonicalized like every private_fs fixture: the walk from "/" opens
+    // each component with O_NOFOLLOW, and macOS hands out a temp dir under
+    // the /var symlink. The fixture we create below the real path is ours
+    // and symlink-free.
+    let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
         "omamail-carddav-snapshot-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
