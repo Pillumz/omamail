@@ -938,9 +938,17 @@ fn card_contacts(
     if card.len() > MAX_CARD_BYTES {
         return Err("carddav_too_many_contacts");
     }
+    let lines = logical_lines(card.trim());
+    // A delivered card may legitimately have no email address, but missing
+    // vCard framing means incomplete/foreign data, not an empty contact.
+    if !lines.first().is_some_and(|line| line.trim().eq_ignore_ascii_case("BEGIN:VCARD"))
+        || !lines.last().is_some_and(|line| line.trim().eq_ignore_ascii_case("END:VCARD"))
+    {
+        return Err("carddav_invalid_response");
+    }
     let mut name = String::new();
     let mut emails = Vec::new();
-    for line in logical_lines(card) {
+    for line in lines {
         let line = line.trim();
         let Some((head, value)) = split_property(line) else {
             continue;
@@ -1123,6 +1131,12 @@ fn book_contacts(xml: &str) -> Result<Vec<Value>, &'static str> {
                     (Ns::Dav, b"propstat") => {
                         let code = status_code(&status_text)?;
                         if (200..300).contains(&code) {
+                            // A successful property status cannot make missing
+                            // card data complete. Only a response-free book is
+                            // genuinely empty; empty/whitespace cards fail it.
+                            if pending_data_elements > pending_cards {
+                                return Err("carddav_invalid_response");
+                            }
                             cards += pending_cards;
                             book.append(&mut pending);
                             response_data_elements += pending_data_elements;
