@@ -142,7 +142,7 @@ fn heavy_book_xml(cards: usize) -> String {
     );
     for index in 0..cards {
         xml.push_str(&format!(
-            "<d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:{name}\nEMAIL:n{index}@example.org\nEND:VCARD</c:address-data></d:prop></d:propstat></d:response>"
+            "<d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD\nVERSION:4.0\nFN:{name}\nEMAIL:n{index}@example.org\nEND:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
         ));
     }
     xml.push_str("</d:multistatus>");
@@ -443,4 +443,99 @@ async fn failures_are_refusals_not_silent_answers() {
         discover_on(&peer.client, &discover_params(), synthetic_lookup).await,
         Err("carddav_response_too_large")
     );
+}
+
+#[tokio::test]
+async fn malformed_and_error_answers_keep_the_last_complete_snapshot() {
+    let _guard = snapshot_test_lock();
+    let root = snapshot_test_root();
+    let id = derive_source_id("https://dav.example.org/dav/card/", "employee@example.org").unwrap();
+    let prior = json!([{"href": OWN_BOOK, "contacts": [{"name": "Earlier", "email": "earlier@example.org"}]}]);
+    snapshot_write(&id, prior.as_array().unwrap()).unwrap();
+    let truncated_open = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response>"#;
+    let truncated_after_card = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/dav/card/a.vcf</d:href><d:propstat><d:prop><c:address-data>BEGIN:VCARD
+FN:Half An Answer
+EMAIL:half@example.org
+END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#;
+    let failed_propstat = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/dav/card/a.vcf</d:href><d:propstat><d:prop><c:address-data/></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat></d:response></d:multistatus>"#;
+    for (description, status, body, error) in [
+        ("a 200 login page", 200, "<html><body>Sign in</body></html>", "carddav_request_failed"),
+        ("a truncated opening multistatus", 207, truncated_open, "carddav_invalid_response"),
+        ("a truncation after one card", 207, truncated_after_card, "carddav_invalid_response"),
+        ("a 503 propstat", 207, failed_propstat, "carddav_invalid_response"),
+    ] {
+        let mut peer = Peer::new();
+        peer.responses(json!([{ "status": status, "body": body }]));
+        let result = refresh_on(&peer.client, &refresh_params(&[OWN_BOOK]), synthetic_lookup)
+            .await
+            .unwrap();
+        assert_eq!(
+            result["errors"][0]["error"], error,
+            "{description}: the failed book is reported, not emptied"
+        );
+        assert_eq!(result["books"].as_array().unwrap().len(), 0, "{description}");
+        let stored = snapshot(&json!({"sourceId": id})).unwrap();
+        let books = stored["books"].as_array().unwrap();
+        assert_eq!(books.len(), 1, "{description}: the prior book is retained");
+        assert_eq!(
+            books[0]["contacts"][0]["email"], "earlier@example.org",
+            "{description}: the last complete contacts survive untouched"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn strict_peer_serves_the_directory_through_discovery_and_refresh() {
+    let _guard = snapshot_test_lock();
+    let root = snapshot_test_root();
+    let mut peer = Peer::new();
+    peer.command(json!({"serve": true}));
+    // The serve-mode layout: /dav/ is the source URL, /dav/personal/ and
+    // /dav/directory/ its address books.
+    let id = derive_source_id("https://dav.example.org/dav/", "employee@example.org").unwrap();
+    let mut params = json!({"source": {
+        "id": id,
+        "url": "https://dav.example.org/dav/",
+        "username": "employee@example.org",
+    }});
+    let books = discover_on(&peer.client, &params, synthetic_lookup)
+        .await
+        .unwrap()["books"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(books.len(), 2);
+    assert_eq!(books[0]["name"], "Personal contacts");
+    assert_eq!(books[1]["name"], "Справочник компании");
+    params["books"] = json!(books
+        .iter()
+        .map(|book| json!({"href": book["href"]}))
+        .collect::<Vec<_>>());
+    let result = refresh_on(&peer.client, &params, synthetic_lookup)
+        .await
+        .unwrap();
+    assert_eq!(result["errors"].as_array().unwrap().len(), 0);
+    assert_eq!(result["stored"], true);
+    let fresh = result["books"].as_array().unwrap();
+    assert_eq!(fresh.len(), 2);
+    let personal = &fresh[0]["contacts"];
+    assert_eq!(personal.as_array().unwrap().len(), 4, "two rows for Иван's two addresses");
+    assert_eq!(personal[0]["name"], "Иван Петров");
+    assert_eq!(personal[0]["email"], "ivan.petrov@example.org");
+    assert_eq!(fresh[1]["contacts"].as_array().unwrap().len(), 4);
+    // The peer refuses an addressbook-query without the RFC 6352 filter, so
+    // the refresh succeeding is itself the filter's proof; the captured
+    // bodies say it plainly.
+    for request in peer.requests() {
+        if request["method"] == "REPORT" {
+            assert!(
+                request["body"].as_str().unwrap().contains("filter"),
+                "the production query carries the mandatory filter"
+            );
+        }
+    }
+    let stored = snapshot(&json!({"sourceId": id})).unwrap();
+    assert_eq!(stored["books"].as_array().unwrap().len(), 2);
+    std::fs::remove_dir_all(root).unwrap();
 }
