@@ -2899,7 +2899,6 @@ Item {
       if (root.backend.ready) {
         if (root.accountsSaveQueued) root.saveAccounts(root.accountsSaveQueuedAllowDrop ? { allowDrop: true } : undefined)
         else root.restoreAccountRegistry()
-        carddavContacts.start()
       }
     }
   }
@@ -2939,7 +2938,6 @@ Item {
       function() { root.refresh() },
       function() { root.refreshCalendarPreview() })
     Qt.callLater(root.restoreAccountRegistry)
-    Qt.callLater(carddavContacts.start)
     Qt.callLater(root.registerMailtoHandler)
     Qt.callLater(root.refreshDefaultMailClient)
   }

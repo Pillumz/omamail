@@ -29,12 +29,14 @@ Item {
         ]
       }, null); return }
       if (method === "carddav.snapshot") { callback({ books: [] }, null); return }
+      if (method === "carddav.forget") { callback({ forgotten: true }, null); return }
       callback(null, { code: -32601, message: "unknown_method" })
     } })
+    property string credentialDeleteError: ""
     function configPath(name) { return "/tmp/omamail-test/" + name }
     function writeConfig(name, payload, callback) { callback(true, "") }
     function credentialPut(kind, accountId, label, secret, callback) { callback(true, "") }
-    function credentialDelete(kind, accountId, label, callback) { callback(true, "") }
+    function credentialDelete(kind, accountId, label, callback) { callback(credentialDeleteError === "", credentialDeleteError) }
   }
 
   Contacts.CarddavController {
@@ -81,6 +83,29 @@ Item {
       verify(row !== null, "the connected source has a row")
       tryCompare(row, "detail", "All accounts · 3 contacts", 2000)
     }
+    function test_a_failed_removal_keeps_the_row_and_shows_the_error() {
+      controller.store = { version: 1, sources: [] }
+      controller.loaded = true
+      controller.connect({ url: "https://dav.example.org/", username: "u", collection: "", accountId: "" }, "secret")
+      tryCompare(controller, "busy", false, 4000)
+      var row = sourceRow()
+      verify(row !== null, "the connected source has a row")
+      // The credentials API keeps the source configured when the keyring
+      // refuses; the UI must not claim a removal that did not happen.
+      mailService.credentialDeleteError = "credential_store_unavailable"
+      findByName(settings, "carddav-source-remove").clicked()
+      tryCompare(controller, "busy", false, 2000)
+      compare(controller.store.sources.length, 1, "the failed removal still names the source")
+      verify(sourceRow() !== null, "the retryable row stays visible")
+      tryCompare(row, "detail", "All accounts · 3 contacts · The system keyring is unavailable", 2000)
+      // A retry once the keyring answers finishes the removal.
+      mailService.credentialDeleteError = ""
+      findByName(settings, "carddav-source-remove").clicked()
+      tryCompare(controller, "busy", false, 2000)
+      compare(controller.store.sources.length, 0, "the retry makes the removal durable")
+      tryVerify(function() { return sourceRow() === null }, 2000)
+    }
+
     function test_the_connect_form_keeps_the_chosen_account() {
       settings.adding = true
       findByName(settings, "carddav-url").text = "https://dav.example.org/"

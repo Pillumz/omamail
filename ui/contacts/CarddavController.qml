@@ -43,6 +43,12 @@ Item {
   property string busySourceId: ""
   property var lastErrors: ({})
   property var pendingQueue: []
+  // The startup cycle: one serialized run of every stored snapshot, then
+  // every enabled source's refresh. `cycleRunning` refuses a second trigger
+  // while answers are still in flight; `cycleGeneration` separates answers
+  // of the current run from those of a backend life that already ended.
+  property bool cycleRunning: false
+  property int cycleGeneration: 0
 
   signal connectFinished(bool ok, string error)
   signal refreshFinished(string sourceId, bool ok, string error)
@@ -89,19 +95,39 @@ Item {
     return count
   }
 
-  function saveStore(next, after) {
+  function saveStore(next, after, token) {
     var text = CarddavSources.serialize(next)
     if (!root.service || typeof root.service.writeConfig !== "function") {
       if (typeof after === "function") after(false, "Configuration storage is unavailable")
       return
     }
     root.service.writeConfig("carddav.json", text, function(ok, error) {
-      if (ok) {
+      // A write already on its way when the backend life ended must not
+      // publish the store it was built from.
+      var live = token === undefined || token === root.cycleGeneration
+      if (ok && live) {
         root.store = next
         root.contactsRevision += 1
       }
       if (typeof after === "function")
-        after(ok, ok ? "" : String(error || "The address book list could not be saved"))
+        after(ok && live, ok && live ? "" : (live
+          ? String(error || "The address book list could not be saved")
+          : "The address book list changed while it was saved"))
+    })
+  }
+
+  // A connect that stored a password but could not finish must not leave it
+  // behind unmentioned: delete it, and when even that fails say so, because
+  // connecting the same endpoint again is the retry that removes it.
+  function finishFailedConnect(sourceId, message) {
+    root.service.credentialDelete("carddav-password", sourceId, "", function(removed, cleanupError) {
+      var text = message
+      if (!removed)
+        text += " The stored password could not be removed ("
+          + root.describeError(cleanupError) + "); connect again to retry."
+      root.busy = false
+      root.busySourceId = ""
+      root.connectFinished(false, text)
     })
   }
 
@@ -109,7 +135,7 @@ Item {
   // backend discover (or directly verify an explicit collection). A failed
   // connect removes the password it just stored.
   function connect(draft, secret) {
-    if (root.busy || !root.available) return false
+    if (root.busy || root.cycleRunning || !root.available) return false
     var checked = CarddavSources.validateDraft(draft)
     if (!checked.ok) { root.connectFinished(false, checked.error); return true }
     var password = String(secret || "")
@@ -133,26 +159,21 @@ Item {
       }
       root.discover(checked.source, function(discovered, books) {
         if (!discovered) {
-          root.service.credentialDelete("carddav-password", checked.source.id, "", function(_removed, _error) {})
-          root.busy = false
-          root.busySourceId = ""
-          root.connectFinished(false, books)
+          root.finishFailedConnect(checked.source.id, books)
           return
         }
         var source = checked.source
         source.books = books
         root.saveStore(CarddavSources.add(root.store, source), function(saved, saveError) {
           if (!saved) {
-            root.busy = false
-            root.busySourceId = ""
-            root.connectFinished(false, saveError)
+            root.finishFailedConnect(checked.source.id, saveError)
             return
           }
           root.connectFinished(true, "")
           root.refreshContacts(source.id, function(_ok, _error) {
             root.busy = false
             root.busySourceId = ""
-          })
+          }, root.cycleGeneration)
         })
       })
     })
@@ -184,21 +205,30 @@ Item {
 
   // One source's contacts: the enabled books, each answer complete or the old
   // snapshot kept. A rediscovery first picks up arrived/departed books.
-  function refreshSource(id) {
+  // `done` is the startup cycle's continuation; `token` names the backend
+  // life this refresh belongs to. An answer from a life that already ended
+  // completes the operation — releasing `busy` — without publishing it or
+  // advancing a chain.
+  function refreshSourceInternal(id, done, token) {
     if (root.busy || !root.available) return false
     var source = CarddavSources.find(root.store, id)
     if (!source) return false
     root.busy = true
     root.busySourceId = source.id
+    var finish = function(refreshed, refreshError) {
+      root.busy = false
+      root.busySourceId = ""
+      if (token !== root.cycleGeneration) return
+      root.refreshFinished(source.id, refreshed, refreshed ? "" : refreshError)
+      if (typeof done === "function") done(refreshed, refreshError)
+    }
     root.discover(source, function(ok, books) {
       if (!ok) {
         // Discovery is best-effort during a refresh: the stored book list
         // still names what to sync.
         root.refreshContacts(source.id, function(refreshed, refreshError) {
-          root.busy = false
-          root.busySourceId = ""
-          root.refreshFinished(source.id, refreshed, refreshed ? "" : refreshError)
-        })
+          finish(refreshed, refreshError)
+        }, token)
         return
       }
       var next = CarddavSources.add(root.store, {
@@ -207,32 +237,33 @@ Item {
         collection: source.collection, books: books
       })
       root.saveStore(next, function(saved, saveError) {
-        if (!saved) {
-          root.busy = false
-          root.busySourceId = ""
-          root.refreshFinished(source.id, false, saveError)
-          return
-        }
+        if (!saved) { finish(false, saveError); return }
         root.refreshContacts(source.id, function(refreshed, refreshError) {
-          root.busy = false
-          root.busySourceId = ""
-          root.refreshFinished(source.id, refreshed, refreshed ? "" : refreshError)
-        })
-      })
+          finish(refreshed, refreshError)
+        }, token)
+      }, token)
     })
     return true
   }
 
-  function refreshContacts(id, callback) {
+  // A one-off refresh from Settings. While the startup cycle runs, the cycle
+  // refreshes every enabled source itself, so this waits for it to end.
+  function refreshSource(id) {
+    if (root.cycleRunning) return false
+    return root.refreshSourceInternal(id, undefined, root.cycleGeneration)
+  }
+
+  function refreshContacts(id, callback, token) {
     var source = CarddavSources.find(root.store, id)
     if (!source) { callback(false, ""); return }
+    var live = function() { return token === root.cycleGeneration }
     var books = []
     for (var i = 0; i < source.books.length; i++) {
       if (source.books[i] && source.books[i].enabled === true)
         books.push({ href: source.books[i].href })
     }
     if (books.length === 0) {
-      root.applySnapshot(source.id, ({}))
+      if (live()) root.applySnapshot(source.id, ({}))
       callback(true, "")
       return
     }
@@ -240,6 +271,9 @@ Item {
       source: { id: source.id, url: source.url, username: source.username },
       books: books
     }, function(result, error) {
+      // The backend life this answer belongs to ended; report completion
+      // without publishing.
+      if (!live()) { callback(false, ""); return }
       if (error) {
         root.setError(source.id, root.describeError(error))
         callback(false, root.describeError(error))
@@ -285,14 +319,33 @@ Item {
     root.lastErrors = next
   }
 
+  // Removal requires a ready, current CardDAV backend: the source must leave
+  // the config, its password must be deleted and its cached snapshot must be
+  // forgotten, all three before the row disappears. The config save goes last
+  // so a source can never disappear while its password is still stored. A
+  // failure at any step keeps the row and its contacts, reports the error on
+  // the row, and leaves retry available; a missing password is a successful
+  // delete to the credentials API. While the backend cannot forget the cache,
+  // removal is refused before any durable step — the snapshot that survived
+  // could otherwise come back after a reconnect.
   function removeSource(id) {
     if (root.busy) return false
     var source = CarddavSources.find(root.store, id)
     if (!source) return false
+    if (!root.available) {
+      root.setError(id, "Update or reconnect the mail backend before removing this address book")
+      return false
+    }
     root.busy = true
     root.busySourceId = id
-    var finish = function() {
-      root.saveStore(CarddavSources.remove(root.store, id), function(_ok, _error) {
+    var fail = function(error) {
+      root.setError(id, root.describeError(error))
+      root.busy = false
+      root.busySourceId = ""
+    }
+    var save = function() {
+      root.saveStore(CarddavSources.remove(root.store, id), function(ok, saveError) {
+        if (!ok) { fail(saveError); return }
         var cleared = {}
         for (var key in root.snapshots) if (key !== id) cleared[key] = root.snapshots[key]
         root.snapshots = cleared
@@ -303,11 +356,12 @@ Item {
         root.sourceRemoved(id)
       })
     }
-    root.service.credentialDelete("carddav-password", id, "", function(_removed, _error) {
-      if (root.available)
-        root.service.backend.call("carddav.forget", { sourceId: id }, function(_result, _forgetError) { finish() })
-      else
-        finish()
+    root.service.credentialDelete("carddav-password", id, "", function(ok, error) {
+      if (!ok) { fail(error); return }
+      root.service.backend.call("carddav.forget", { sourceId: id }, function(_result, forgetError) {
+        if (forgetError) { fail(forgetError); return }
+        save()
+      })
     })
     return true
   }
@@ -354,22 +408,31 @@ Item {
   }
 
   // Startup: the local book, every stored snapshot without network, then a
-  // refresh of the enabled sources one at a time. Nothing runs on a timer.
+  // refresh of the enabled sources one at a time. Nothing runs on a timer,
+  // and one cycle is in flight at a time. `start()` is the single entry,
+  // called by the first config answer and by a ready backend, whichever
+  // comes last.
   function start() {
     if (!root.service || !root.service.backend || !root.service.backend.ready) return
-    root.refreshLocalContacts()
-    if (!root.available || !root.loaded || root.pendingQueue.length > 0) return
+    if (root.cycleRunning) return
+    if (root.loaded) root.refreshLocalContacts()
+    if (!root.available || !root.loaded) return
+    root.cycleRunning = true
+    root.cycleGeneration += 1
+    var token = root.cycleGeneration
     var sources = root.store.sources
     var ids = []
     for (var i = 0; i < sources.length; i++) if (sources[i]) ids.push(sources[i].id)
     root.pendingQueue = ids
-    loadNextSnapshot()
+    root.loadNextSnapshot(token)
   }
 
-  function loadNextSnapshot() {
-    if (root.pendingQueue.length === 0) { refreshAll(); return }
+  function loadNextSnapshot(token) {
+    if (token !== root.cycleGeneration) return
+    if (root.pendingQueue.length === 0) { root.refreshAll(token); return }
     var id = root.pendingQueue.shift()
     root.service.backend.call("carddav.snapshot", { sourceId: id }, function(result, error) {
+      if (token !== root.cycleGeneration) return
       if (!error && result && Array.isArray(result.books)) {
         var books = {}
         for (var i = 0; i < result.books.length; i++) {
@@ -377,39 +440,47 @@ Item {
           if (book && book.href && Array.isArray(book.contacts))
             books[String(book.href)] = book.contacts
         }
-        root.applySnapshot(id, books)
+        // A source removed while its answer was in flight must not come back
+        // through this callback.
+        if (CarddavSources.find(root.store, id)) root.applySnapshot(id, books)
       }
-      root.loadNextSnapshot()
+      root.loadNextSnapshot(token)
     })
   }
 
-  function refreshAll() {
+  function refreshAll(token) {
+    if (token !== root.cycleGeneration) return
     var sources = root.store.sources
     for (var i = 0; i < sources.length; i++) {
       if (sources[i] && sources[i].enabled === true)
         root.pendingQueue.push(sources[i].id)
     }
-    refreshNext()
+    root.refreshNext(token)
   }
 
-  function refreshNext() {
-    if (root.pendingQueue.length === 0 || !root.available) return
+  function refreshNext(token) {
+    if (token !== root.cycleGeneration) return
+    if (root.pendingQueue.length === 0 || !root.available) {
+      root.pendingQueue = []
+      root.cycleRunning = false
+      return
+    }
     var id = root.pendingQueue.shift()
-    root.refreshSource(id)
+    var started = root.refreshSourceInternal(id, function(_refreshed, _refreshError) {
+      root.refreshNext(token)
+    }, token)
+    if (!started) root.refreshNext(token)
   }
 
-  // The full snapshot/refresh cycle runs once per start, from whichever
-  // comes last: the first config answer or the backend becoming ready. A
-  // later config reload — including the ones this controller's own saves
-  // cause — only updates the store; the action that saved did its targeted
-  // work already.
+  // The full startup cycle runs once: the first config answer and a ready
+  // backend, whichever comes last. A later config reload — including the
+  // ones this controller's own saves cause — only updates the store; the
+  // action that saved did its targeted work already.
   function beginStartup() {
     if (root.startupStarted) return
     root.startupStarted = true
     root.start()
   }
-
-  onRefreshFinished: function(_id, _ok, _error) { root.refreshNext() }
 
   FileView {
     path: root.configPath
@@ -443,8 +514,15 @@ Item {
     target: root.service ? root.service.backend : null
     function onReadyChanged() {
       var ready = root.service && root.service.backend && root.service.backend.ready
-      if (ready) root.start()
-      else root.contactsLoading = false
+      if (ready) { root.start(); return }
+      // The backend went away. Answers still in flight belong to the life
+      // that ended: retire the cycle so a reconnect starts one fresh cycle,
+      // and leave `busy` to the operation that owns it — its own callback
+      // releases it, including when the answer turns out to be stale.
+      root.cycleGeneration += 1
+      root.cycleRunning = false
+      root.pendingQueue = []
+      root.contactsLoading = false
     }
   }
 }
