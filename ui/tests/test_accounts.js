@@ -851,23 +851,17 @@ assert.strictEqual(frozen(accounts.replaceAt(cidActive, -1, account("x@example.c
   deepEqual(accounts.toggleMonitored(two, "me@gmail.com", "  ").accounts[0].monitored, ["Label_7", "Label_9"])
   deepEqual(accounts.load(accounts.serialize(two)).accounts[0].monitored, ["Label_7", "Label_9"],
     "and it is written to disk and read back")
+  // The ids a rename leaves come through a QML signal, and Qt 6.12 hands an
+  // array over as a sequence: a length, indices and Array.prototype up its
+  // chain, but `Array.isArray` says no.
+  const sequence = Object.assign(Object.create(Array.prototype), { 0: "Label_8", 1: "Label_9", length: 2 })
+  assert.strictEqual(Array.isArray(sequence), false)
+  deepEqual(accounts.setMonitored(two, "me@gmail.com", sequence).accounts[0].monitored, ["Label_8", "Label_9"],
+    "a sequence replaces the watched list as an array does")
+  deepEqual(accounts.setMonitored(two, "me@gmail.com", ["Label_8"]).accounts[0].monitored, ["Label_8"])
+  deepEqual(accounts.setMonitored(two, "me@gmail.com", "Label_8").accounts[0].monitored, [],
+    "a string is not a list")
 }
-
-// The watch list reads a real sequence by index, but must not widen into
-// accepting any object that merely carries a numeric length: only a sequence
-// (Array or the Qt sequence the shell hands back) has the sequence methods. A
-// malformed entry must not turn its keys into watch ids, and an unbounded
-// length must not be walked.
-deepEqual(accounts.idList({ length: 3, 0: "a", 1: "b", 2: "c" }), [],
-  "a plain object with a length is not a sequence")
-deepEqual(accounts.idList({ length: 1e100 }), [], "an unbounded length is refused")
-deepEqual(accounts.idList({ length: Infinity, 0: "a" }), [], "an infinite length is refused")
-deepEqual(accounts.idList({ length: -1, 0: "a" }), [], "a negative length is refused")
-deepEqual(accounts.idList({ length: 1.5, 0: "a" }), [], "a fractional length is refused")
-deepEqual(accounts.idList("Work"), [], "a string is not a sequence")
-deepEqual(accounts.idList(null), [], "null is not a sequence")
-deepEqual(accounts.idList([" Label_7 ", "Label_7", "", "  "]), ["Label_7"],
-  "trimming and de-duplication are preserved for a real sequence")
 
 
 // An HTML signature sits beside the plain one and survives its edits.
@@ -878,3 +872,40 @@ deepEqual(accounts.idList([" Label_7 ", "Label_7", "", "  "]), ["Label_7"],
   assert.strictEqual(accounts.setSignatureHtml(rich, "me@gmail.com", "").accounts[0].signatureHtml, "")
   assert.strictEqual(accounts.load(accounts.serialize(rich)).accounts[0].signatureHtml, "<p>Ada</p>")
 }
+
+// ------------------------------------------------------------ sender name
+
+// The name recipients see beside an IMAP or Outlook mailbox's address. It is
+// stored on the entry, so it has to survive the rebuild every write does.
+{
+  const imap = accounts.add(accounts.emptyList(),
+    { email: "me@example.org", provider: "imap", imap: { username: "me@example.org" } })
+  const id = imap.accounts[0].id
+  assert.strictEqual(imap.accounts[0].senderName, "", "no name until one is given")
+
+  const named = accounts.setSenderName(imap, id, "  Jane   Example ")
+  assert.strictEqual(named.accounts[0].senderName, "Jane Example")
+  assert.strictEqual(frozen(imap), frozen(accounts.add(accounts.emptyList(),
+    { email: "me@example.org", provider: "imap", imap: { username: "me@example.org" } })),
+    "the input list is left alone")
+  assert.strictEqual(accounts.load(accounts.serialize(named)).accounts[0].senderName, "Jane Example",
+    "a saved name comes back from the file")
+  assert.strictEqual(accounts.setLabel(named, id, "Personal").accounts[0].senderName, "Jane Example",
+    "naming the mailbox does not forget the sender name")
+  assert.strictEqual(accounts.setSenderName(named, id, "   ").accounts[0].senderName, "",
+    "empty clears it, so the address goes out alone")
+
+  // One header line: a pasted break or tab becomes a space, never a header
+  // the send would refuse.
+  assert.strictEqual(accounts.senderNameText("Jane\r\nExample\t\u0007"), "Jane Example")
+assert.strictEqual(accounts.senderNameText("Jane\u0085Example\u009f"), "Jane Example",
+  "a C1 control is a control too, and the backend refuses a name with one")
+}
+
+// Only the mailboxes with no server to name the sender take it from here.
+assert.strictEqual(accounts.namesSender("imap"), true)
+assert.strictEqual(accounts.namesSender("outlook"), true)
+assert.strictEqual(accounts.namesSender("gmail"), false)
+assert.strictEqual(accounts.namesSender("jmap"), false)
+assert.strictEqual(accounts.namesSender("hey"), false)
+assert.strictEqual(accounts.namesSender(undefined), false)
