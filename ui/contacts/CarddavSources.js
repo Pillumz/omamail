@@ -317,6 +317,8 @@ function describeError(code) {
   if (text === "carddav_not_found") return "The server has nothing at that address"
   if (text === "carddav_not_addressbook") return "That address is not an address book"
   if (text === "carddav_discovery_failed") return "The server did not name an address book home; enter the address book URL directly"
+  if (text === "carddav_request_failed") return "The server answered the request with an error"
+  if (text === "carddav_too_many_redirects") return "The server redirected too many times"
   if (text === "carddav_too_many_books") return "The server listed more address books than supported"
   if (text === "carddav_too_many_contacts") return "An address book is larger than supported"
   if (text === "carddav_total_too_large") return "The enabled address books are together larger than supported; disable some of them and refresh again"
