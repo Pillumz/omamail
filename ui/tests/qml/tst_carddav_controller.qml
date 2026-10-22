@@ -739,13 +739,14 @@ Item {
     function test_a_failed_forget_keeps_the_source_and_a_retry_removes_it() {
       controller.store = storeWithSource()
       seedContacts()
-      mailService.forgetError = { code: -32000, message: "backend_unavailable" }
+      mailService.forgetError = { code: -32000, message: "carddav_snapshot_unavailable" }
       verify(controller.removeSource(staffId))
       compare(controller.store.sources.length, 1, "the row's source is still configured")
       compare(removedSpy.count, 0, "no removal is claimed")
       verify(controller.snapshots[staffId] !== undefined, "the visible contacts stay")
       compare(mailService.configWrites.length, 0, "the config still names the source")
-      verify(String(controller.lastErrors[staffId] || "").length > 0)
+      verify(String(controller.lastErrors[staffId]).indexOf("could not be removed") >= 0,
+        "a failed removal must not be described as an unpersisted refresh")
       // The password was deleted first; the retry finds it already gone
       // (a successful delete to the credentials API) and finishes the rest.
       mailService.forgetError = null

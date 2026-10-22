@@ -368,7 +368,10 @@ Item {
     root.service.credentialDelete("carddav-password", id, "", function(ok, error) {
       if (!ok) { fail(error); return }
       root.service.backend.call("carddav.forget", { sourceId: id }, function(_result, forgetError) {
-        if (forgetError) { fail(forgetError); return }
+        if (forgetError) {
+          fail("The cached contacts could not be removed; try removing this address book again")
+          return
+        }
         save()
       })
     })
