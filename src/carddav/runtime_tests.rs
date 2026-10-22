@@ -458,11 +458,15 @@ FN:Half An Answer
 EMAIL:half@example.org
 END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"#;
     let failed_propstat = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/dav/card/a.vcf</d:href><d:propstat><d:prop><c:address-data/></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat></d:response></d:multistatus>"#;
+    let empty_response = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response/></d:multistatus>"#;
+    let second_root = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/a.vcf</d:href><d:propstat><d:prop><c:address-data>BEGIN:VCARD&#10;FN:Half An Answer&#10;EMAIL:half@example.org&#10;END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus><d:multistatus xmlns:d="DAV:"/>"#;
     for (description, status, body, error) in [
         ("a 200 login page", 200, "<html><body>Sign in</body></html>", "carddav_request_failed"),
         ("a truncated opening multistatus", 207, truncated_open, "carddav_invalid_response"),
         ("a truncation after one card", 207, truncated_after_card, "carddav_invalid_response"),
         ("a 503 propstat", 207, failed_propstat, "carddav_invalid_response"),
+        ("a self-closing empty response", 207, empty_response, "carddav_invalid_response"),
+        ("a second multistatus root", 207, second_root, "carddav_invalid_response"),
     ] {
         let mut peer = Peer::new();
         peer.responses(json!([{ "status": status, "body": body }]));

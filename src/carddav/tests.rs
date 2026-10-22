@@ -482,3 +482,64 @@ fn a_swapped_snapshot_file_serves_no_foreign_books() {
     assert_eq!(snapshot(&json!({"sourceId": a})).unwrap()["books"].as_array().unwrap().len(), 1);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn framing_closes_the_document_exactly_once() {
+    let base = Url::parse("https://dav.example.org/dav/").unwrap();
+    // A self-closing root completes the document: a second one, of either
+    // spelling, is a second document and refused.
+    for xml in [
+        r#"<d:multistatus xmlns:d="DAV:"/><d:multistatus xmlns:d="DAV:"/>"#,
+        r#"<d:multistatus xmlns:d="DAV:"/><d:multistatus xmlns:d="DAV:"></d:multistatus>"#,
+    ] {
+        assert!(nested_hrefs(xml, Ns::Dav, b"current-user-principal").is_err(), "{xml}");
+        assert!(book_list(xml, &base).is_err(), "{xml}");
+        assert!(book_contacts(xml).is_err(), "{xml}");
+    }
+    // Leading or trailing content around the root is not this document,
+    // whatever spelling carries it: text, CDATA or a reference.
+    for xml in [
+        r#"garbage<d:multistatus xmlns:d="DAV:"/>"#,
+        r#"<d:multistatus xmlns:d="DAV:"/>trailing"#,
+        r#"  <d:multistatus xmlns:d="DAV:"/>  "#,
+        r#"<![CDATA[login]]><d:multistatus xmlns:d="DAV:"/>"#,
+        r#"<d:multistatus xmlns:d="DAV:"/><![CDATA[more]]>"#,
+        r#"&#38;<d:multistatus xmlns:d="DAV:"/>"#,
+    ] {
+        let refused = xml.contains("garbage") || xml.contains("trailing")
+            || xml.contains("CDATA") || xml.contains("&#38;");
+        assert_eq!(book_contacts(xml).is_err(), refused, "{xml}");
+        assert_eq!(book_list(xml, &base).is_err(), refused, "{xml}");
+        if refused {
+            assert!(nested_hrefs(xml, Ns::Dav, b"current-user-principal").is_err(), "{xml}");
+        }
+    }
+}
+
+#[test]
+fn empty_response_and_propstat_elements_match_their_paired_spellings() {
+    let base = Url::parse("https://dav.example.org/dav/").unwrap();
+    // A REPORT answer whose only response delivered nothing is refused in
+    // both spellings; a self-closing propstat beside a valid card too.
+    for xml in [
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response/></d:multistatus>"#,
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response></d:response></d:multistatus>"#,
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD&#10;FN:Ann&#10;EMAIL:a@example.org&#10;END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat/></d:response></d:multistatus>"#,
+        r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD&#10;FN:Ann&#10;EMAIL:a@example.org&#10;END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat></d:propstat></d:response></d:multistatus>"#,
+    ] {
+        assert!(matches!(book_contacts(xml), Err("carddav_invalid_response")), "{xml}");
+    }
+    // A listing skips a member that says nothing, in either spelling, and
+    // refuses a propstat that never carried a status.
+    let skipped = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response/><d:response><d:href>/kept/</d:href><d:propstat><d:prop><d:resourcetype><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+    let books = book_list(skipped, &base).unwrap();
+    assert_eq!(books.len(), 1);
+    assert_eq!(books[0]["href"], "https://dav.example.org/kept/");
+    for xml in [
+        r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat/></d:response></d:multistatus>"#,
+        r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat></d:propstat></d:response></d:multistatus>"#,
+    ] {
+        assert!(nested_hrefs(xml, Ns::Dav, b"current-user-principal").is_err(), "{xml}");
+        assert!(book_list(xml, &base).is_err(), "{xml}");
+    }
+}
