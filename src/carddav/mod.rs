@@ -386,6 +386,12 @@ impl Framing {
                 return Err("carddav_invalid_response");
             }
             self.opened = true;
+            // A self-closing root completes the document exactly as a
+            // closed pair does: nothing may follow it, not even a second
+            // multistatus.
+            if empty {
+                self.closed = true;
+            }
         }
         if !empty {
             self.open += 1;
@@ -404,13 +410,13 @@ impl Framing {
         Ok(())
     }
 
-    /// After the root closes only whitespace may follow.
+    /// Text is content only inside the root element: before it opens, after
+    /// it closes, or around a self-closing root, only whitespace may appear.
     fn content(&self, raw: &[u8]) -> Result<(), &'static str> {
-        if self.closed && !raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+        if (self.closed || !self.opened) && !raw.iter().all(|byte| byte.is_ascii_whitespace()) {
             return Err("carddav_invalid_response");
         }
         Ok(())
-
     }
 
     fn eof(&self) -> Result<(), &'static str> {
@@ -505,6 +511,11 @@ fn nested_hrefs(xml: &str, container: Ns, container_name: &[u8]) -> Result<Vec<S
                 let raw = event.name().as_ref().to_vec();
                 let name = local_name(&raw);
                 framing.open_element(namespace, name, true)?;
+                // A self-closing propstat never carries its required status
+                // line, exactly like its paired spelling.
+                if namespace == Ns::Dav && name == b"propstat" {
+                    return Err("carddav_invalid_response");
+                }
             }
             Event::Text(event) => {
                 let bytes = event.as_ref();
@@ -519,24 +530,30 @@ fn nested_hrefs(xml: &str, container: Ns, container_name: &[u8]) -> Result<Vec<S
                     _ => {}
                 }
             }
-            Event::CData(event) => match stack.last() {
-                Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
-                    href_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+            Event::CData(event) => {
+                framing.content(event.as_ref())?;
+                match stack.last() {
+                    Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
+                        href_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                    }
+                    Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
+                        status_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                    }
+                    _ => {}
                 }
-                Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
-                    status_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+            }
+            Event::GeneralRef(event) => {
+                framing.content(event.as_ref())?;
+                match stack.last() {
+                    Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
+                        append_reference(&mut href_text, &event)?;
+                    }
+                    Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
+                        append_reference(&mut status_text, &event)?;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
-            Event::GeneralRef(event) => match stack.last() {
-                Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
-                    append_reference(&mut href_text, &event)?;
-                }
-                Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
-                    append_reference(&mut status_text, &event)?;
-                }
-                _ => {}
-            },
+            }
             Event::End(event) => {
                 let name = local_name(event.name().as_ref()).to_vec();
                 match (namespace, name.as_slice()) {
@@ -677,6 +694,11 @@ fn book_list(xml: &str, base: &Url) -> Result<Vec<Value>, &'static str> {
                 if namespace == Ns::Carddav && name == b"addressbook" && in_propstat {
                     pending.is_addressbook = true;
                 }
+                // A self-closing propstat is the same malformed answer as
+                // one that never carries its required status line.
+                if namespace == Ns::Dav && name == b"propstat" {
+                    return Err("carddav_invalid_response");
+                }
             }
             Event::Text(event) => {
                 framing.content(event.as_ref())?;
@@ -685,11 +707,13 @@ fn book_list(xml: &str, base: &Url) -> Result<Vec<Value>, &'static str> {
                 }
             }
             Event::CData(event) => {
+                framing.content(event.as_ref())?;
                 if !matches!(capture, Capture::None) {
                     captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
                 }
             }
             Event::GeneralRef(event) => {
+                framing.content(event.as_ref())?;
                 if !matches!(capture, Capture::None) {
                     append_reference(&mut captured, &event)?;
                 }
@@ -1028,6 +1052,13 @@ fn book_contacts(xml: &str) -> Result<Vec<Value>, &'static str> {
                 if namespace == Ns::Carddav && name == b"address-data" && in_propstat {
                     pending_data_elements += 1;
                 }
+                // A self-closing response is a response that delivered no
+                // card, and a self-closing propstat one that never carried
+                // its required status: both are the malformed answers their
+                // paired spellings are, not an empty book.
+                if namespace == Ns::Dav && (name == b"response" || name == b"propstat") {
+                    return Err("carddav_invalid_response");
+                }
             }
             Event::Text(event) => {
                 framing.content(event.as_ref())?;
@@ -1045,6 +1076,7 @@ fn book_contacts(xml: &str) -> Result<Vec<Value>, &'static str> {
                 }
             }
             Event::CData(event) => {
+                framing.content(event.as_ref())?;
                 if in_data {
                     if event.len() > MAX_CARD_BYTES - data.len() {
                         return Err("carddav_too_many_contacts");
@@ -1056,6 +1088,7 @@ fn book_contacts(xml: &str) -> Result<Vec<Value>, &'static str> {
                 }
             }
             Event::GeneralRef(event) => {
+                framing.content(event.as_ref())?;
                 if in_data {
                     append_reference(&mut data, &event)?;
                     pending_had_text = true;
