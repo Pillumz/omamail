@@ -48,6 +48,7 @@ fn key(params: &serde_json::Map<String, Value>) -> Result<CredentialKey, &'stati
         "imap-password" => ("imap", CredentialKind::ImapPassword),
         "jmap-secret" => ("jmap", CredentialKind::JmapSecret),
         "calendar-password" => ("caldav", CredentialKind::CalendarPassword),
+        "carddav-password" => ("carddav", CredentialKind::CarddavPassword),
         _ => return Err("invalid_params"),
     };
     let has_client = params.contains_key("clientId");

@@ -27,8 +27,17 @@ Rectangle {
   property string originalGuestText: ""
   property bool advancedOptionsOpen: false
   readonly property var contactService: controller && controller.service ? controller.service : null
-  readonly property var contactBook: contactService && Array.isArray(contactService.recipientContacts)
-    ? contactService.recipientContacts : []
+  // Guests complete from the calendar account's own book, so a directory
+  // linked to another mailbox stays out of this event.
+  readonly property var contactBook: {
+    if (!contactService) return []
+    var accountId = chosenSource && chosenSource.accountId
+      ? String(chosenSource.accountId) : String(contactService.activeAccountId || "")
+    var carddav = contactService.carddavController
+    if (carddav && typeof carddav.mergedForAccount === "function")
+      return carddav.mergedForAccount(accountId)
+    return Array.isArray(contactService.recipientContacts) ? contactService.recipientContacts : []
+  }
   property bool guestSuggestionsDismissed: false
   readonly property var guestSuggestions: opened && guestsField.visible && guestsField.activeFocus && !guestSuggestionsDismissed
     ? Recipients.suggest(contactBook, guestsField.text, 5) : []

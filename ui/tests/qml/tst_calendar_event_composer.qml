@@ -9,6 +9,7 @@ Item {
   QtObject {
     id: contacts
     property var recipientContacts: []
+    property var carddavController: null
     property bool backendCanGoogleCalendars: true
     property int refreshCalls: 0
     function refreshRecipientContacts() { refreshCalls++ }
@@ -102,6 +103,27 @@ Item {
       composer.writePending = false
       contacts.recipientContacts = []
       contacts.refreshCalls = 0
+    }
+
+    function test_guest_suggestions_follow_the_calendar_accounts_book() {
+      var asked = []
+      contacts.carddavController = ({
+        mergedForAccount: function(accountId) {
+          asked.push(String(accountId))
+          return [{ name: "Ivan Petrov", email: "ivan@example.org" }]
+        }
+      })
+      eventController.writableSourceGroups = [{
+        id: "account:imap:bob@example.com", providerLabel: "CalDAV", accountLabel: "bob@example.com",
+        calendars: [{ id: "caldav:bob-home", name: "Home", colorKey: "accent", accountId: "imap:bob@example.com" }]
+      }]
+      composer.begin()
+      compare(composer.contactBook.length, 1)
+      compare(composer.contactBook[0].email, "ivan@example.org")
+      verify(asked.indexOf("imap:bob@example.com") !== -1,
+        "guests complete from the calendar account's book: " + asked.join(","))
+      contacts.carddavController = null
+      eventController.writableSourceGroups = JSON.parse(JSON.stringify(initialGroups))
     }
 
     function test_microsoft_creation_keeps_basic_fields_without_repetition() {

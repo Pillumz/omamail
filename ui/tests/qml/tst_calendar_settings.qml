@@ -75,6 +75,7 @@ Item {
     width: parent.width
     service: mailService
     calendarController: calendarController
+    carddavController: null
     textColor: Commons.Color.foreground
     dimColor: Commons.Color.foreground
     accentColor: Commons.Color.accent

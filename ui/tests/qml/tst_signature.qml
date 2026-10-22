@@ -126,6 +126,7 @@ Item {
     width: parent.width
     service: mailService
     calendarController: calendars
+    carddavController: null
     textColor: Qt.rgba(1, 1, 1, 1)
     dimColor: Qt.rgba(0.67, 0.67, 0.67, 1)
     accentColor: Qt.rgba(1, 0.5, 0, 1)
