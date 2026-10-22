@@ -114,26 +114,35 @@ fn hrefs_must_stay_on_the_passwords_origin() {
 
 #[test]
 fn principal_and_home_hrefs_are_scoped_to_their_property() {
-    let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/card/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/employee%40example.org/</d:href></d:current-user-principal><d:addressbook-home-set xmlns:c="urn:ietf:params:xml:ns:carddav"><d:href>/dav/card/employee%40example.org/</d:href></d:addressbook-home-set></d:prop></d:propstat></d:response></d:multistatus>"#;
+    let xml = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/card/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/employee%40example.org/</d:href></d:current-user-principal><c:addressbook-home-set xmlns:c="urn:ietf:params:xml:ns:carddav"><d:href>/dav/card/employee%40example.org/</d:href></c:addressbook-home-set></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
     assert_eq!(
-        nested_hrefs(xml, b"current-user-principal").unwrap(),
+        nested_hrefs(xml, Ns::Dav, b"current-user-principal").unwrap(),
         ["/dav/pal/employee%40example.org/"]
     );
     assert_eq!(
-        nested_hrefs(xml, b"addressbook-home-set").unwrap(),
+        nested_hrefs(xml, Ns::Carddav, b"addressbook-home-set").unwrap(),
         ["/dav/card/employee%40example.org/"]
     );
+    // A property under a 404 propstat is absent, not empty-with-a-href.
+    let absent = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/employee%40example.org/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert_eq!(
+        nested_hrefs(absent, Ns::Dav, b"current-user-principal").unwrap(),
+        Vec::<String>::new()
+    );
+    // A home set the server refused to answer is an error, not an empty one.
+    let refused = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><x:addressbook-home-set xmlns:x="urn:ietf:params:xml:ns:carddav"><d:href>/dav/card/</d:href></x:addressbook-home-set></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert!(nested_hrefs(refused, Ns::Carddav, b"addressbook-home-set").is_err());
 }
 
 #[test]
 fn doctype_and_foreign_entities_are_refused() {
     let doctype = r#"<?xml version="1.0"?><!DOCTYPE d:multistatus [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><d:multistatus xmlns:d="DAV:"><d:response><d:href>/a/</d:href><d:propstat><d:prop><d:current-user-principal><d:href>&xxe;</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>"#;
-    assert!(nested_hrefs(doctype, b"current-user-principal").is_err());
-    let entity = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>&madeup;</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>"#;
-    assert!(nested_hrefs(entity, b"current-user-principal").is_err());
-    let escaped = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/a&#37;40b/</d:href></d:current-user-principal></d:prop></d:propstat></d:response></d:multistatus>"#;
+    assert!(nested_hrefs(doctype, Ns::Dav, b"current-user-principal").is_err());
+    let entity = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>&madeup;</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert!(nested_hrefs(entity, Ns::Dav, b"current-user-principal").is_err());
+    let escaped = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>/dav/pal/a&#37;40b/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
     assert_eq!(
-        nested_hrefs(escaped, b"current-user-principal").unwrap(),
+        nested_hrefs(escaped, Ns::Dav, b"current-user-principal").unwrap(),
         ["/dav/pal/a%40b/"]
     );
 }
@@ -159,7 +168,7 @@ fn book_list_keeps_addressbooks_from_split_propstats() {
         "https://dav.example.org/dav/card/directory%40example.org/cdm-staff/"
     );
     // A book href that points off-origin fails the whole answer.
-    let foreign = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>https://evil.example/card/</d:href><d:propstat><d:prop><d:resourcetype><c:addressbook/></d:resourcetype></d:prop></d:propstat></d:response></d:multistatus>"#;
+    let foreign = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>https://evil.example/card/</d:href><d:propstat><d:prop><d:resourcetype><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
     assert!(matches!(
         book_list(foreign, &base),
         Err("carddav_origin_refused")
@@ -266,16 +275,25 @@ fn parsed_fields_stay_inside_the_snapshot_bounds() {
 }
 
 #[test]
-fn empty_address_data_and_bad_addresses_yield_no_contacts() {
-    let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/a.vcf</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><c:address-data/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>"#;
-    assert_eq!(json!(book_contacts(xml).unwrap()), json!([]));
+fn absent_or_undelivered_address_data_is_refused_not_empty() {
+    // A card the query matched whose address-data came back absent or under
+    // an error status makes the answer incomplete: accepting it would store
+    // a thinner book as a complete one.
+    let absent = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/a.vcf</d:href><d:propstat><d:prop><d:getetag>"1"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat><d:propstat><d:prop><c:address-data/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert!(matches!(book_contacts(absent), Err("carddav_invalid_response")));
+    let failed = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/a.vcf</d:href><d:propstat><d:prop><c:address-data>BEGIN:VCARD&#10;FN:Ann&#10;EMAIL:a@example.org&#10;END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert!(matches!(book_contacts(failed), Err("carddav_invalid_response")));
+    // A response whose propstat carries no status line at all is malformed.
+    let unstatused = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD&#10;FN:Ann&#10;EMAIL:a@example.org&#10;END:VCARD</c:address-data></d:prop></d:propstat></d:response></d:multistatus>"#;
+    assert!(matches!(book_contacts(unstatused), Err("carddav_invalid_response")));
+    // A card with no usable address still yields no contact row.
     let contacts = card("BEGIN:VCARD\nFN:No Address\nEMAIL:not-an-address\nEND:VCARD\n");
     assert_eq!(json!(contacts), json!([]));
     // The server's address-data text is escaped like any XML text.
     let escaped = book_contacts(r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD
 FN:Fish &amp; Chips
 EMAIL:fish@example.org
-END:VCARD</c:address-data></d:prop></d:propstat></d:response></d:multistatus>"#).unwrap();
+END:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#).unwrap();
     assert_eq!(escaped[0]["name"], "Fish & Chips");
 }
 
@@ -283,7 +301,7 @@ END:VCARD</c:address-data></d:prop></d:propstat></d:response></d:multistatus>"#)
 fn oversized_books_are_refused_not_truncated() {
     let mut xml = String::from(r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav">"#);
     for index in 0..MAX_CARDS + 1 {
-        xml.push_str(&format!("<d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD\nFN:N\nEMAIL:n{index}@example.org\nEND:VCARD</c:address-data></d:prop></d:propstat></d:response>"));
+        xml.push_str(&format!("<d:response><d:propstat><d:prop><c:address-data>BEGIN:VCARD\nFN:N\nEMAIL:n{index}@example.org\nEND:VCARD</c:address-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
     }
     xml.push_str("</d:multistatus>");
     assert!(matches!(book_contacts(&xml), Err("carddav_too_many_contacts")));
@@ -352,4 +370,115 @@ fn snapshots_round_trip_and_validate() {
     ] {
         assert!(snapshot_books(&bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn status_lines_must_be_http_status_lines() {
+    assert_eq!(status_code("HTTP/1.1 207 Multi-Status").unwrap(), 207);
+    assert_eq!(status_code("  HTTP/1.0 404 Not Found\t").unwrap(), 404);
+    for bad in [
+        "",
+        "200 OK",
+        "HTTP/1.1",
+        "HTTP/1.1 20 OK",
+        "HTTP/1.1 2000 OK",
+        "HTTP/1.1 x00 OK",
+        "HTTP/1.1 099 Low",
+        "FTP/1.1 200 OK",
+        "HTTP 200 OK",
+    ] {
+        assert!(status_code(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn truncated_or_foreign_answers_are_refused_whole() {
+    let base = Url::parse("https://dav.example.org/dav/").unwrap();
+    // A document that never closes its root, or closes it and continues,
+    // is truncated or corrupt, not an answer.
+    for xml in [
+        r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:current-user-principal><d:href>/p/</d:href></d:current-user-principal></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"#,
+        r#"<d:multistatus xmlns:d="DAV:"><d:response></d:multistatus><d:response></d:response>"#,
+        r#"<d:multistatus xmlns:d="DAV:"></d:multistatus><d:response/>"#,
+        r#"<html><body>Please sign in</body></html>"#,
+        r#"<d:multistatus xmlns:x="http://example.org/ns">"#,
+        r#"not xml at all"#,
+    ] {
+        assert!(nested_hrefs(xml, Ns::Dav, b"current-user-principal").is_err(), "{xml}");
+        assert!(book_list(xml, &base).is_err(), "{xml}");
+        assert!(book_contacts(xml).is_err(), "{xml}");
+    }
+    // The root is matched by its namespace binding, never by its spelling:
+    // any prefix bound to DAV: names the same multistatus.
+    let rebound = r#"<x:multistatus xmlns:x="DAV:"></x:multistatus>"#;
+    assert_eq!(json!(book_contacts(rebound).unwrap()), json!([]));
+    // An unbound prefix is refused even when the document is otherwise fine.
+    let unbound = r#"<d:multistatus xmlns:d="DAV:"><q:response><d:status>HTTP/1.1 200 OK</d:status></q:response></d:multistatus>"#;
+    assert!(book_contacts(unbound).is_err());
+}
+
+#[test]
+fn valid_empty_multistatus_answers_are_genuinely_empty() {
+    for xml in [
+        r#"<d:multistatus xmlns:d="DAV:"/>"#,
+        r#"<d:multistatus xmlns:d="DAV:"></d:multistatus>"#,
+        r#"<d:multistatus xmlns:d="DAV:"><!-- no books yet --></d:multistatus>"#,
+    ] {
+        assert_eq!(json!(book_contacts(xml).unwrap()), json!([]), "{xml}");
+    }
+    // A default namespace binds the root just as well as a prefix.
+    let default_ns = r#"<multistatus xmlns="DAV:"><response><propstat><prop><getetag xmlns="DAV:">"1"</getetag></prop><status xmlns="DAV:">HTTP/1.1 200 OK</status></propstat></response></multistatus>"#;
+    // The card above carries no address-data, so it is not a complete
+    // card answer; only the framing of the default namespace is checked
+    // here through the parsers that accept it structurally.
+    assert!(book_contacts(default_ns).is_err());
+    let empty_default = r#"<multistatus xmlns="DAV:"/>"#;
+    assert_eq!(json!(book_contacts(empty_default).unwrap()), json!([]));
+}
+
+#[test]
+fn addressbook_detection_requires_the_carddav_namespace() {
+    let base = Url::parse("https://dav.example.org/dav/").unwrap();
+    // An addressbook resourcetype in the DAV namespace (or none) is not a
+    // CardDAV address book; the member is skipped, not listed.
+    let spoofed = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/x/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><x:addressbook xmlns:x="DAV:"/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert_eq!(json!(book_list(spoofed, &base).unwrap()), json!([]));
+    let real = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/x/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert_eq!(book_list(real, &base).unwrap()[0]["href"], "https://dav.example.org/x/");
+}
+
+#[test]
+fn failing_siblings_are_handled_not_swallowed() {
+    let base = Url::parse("https://dav.example.org/dav/").unwrap();
+    // A propstat the server failed refuses the whole listing.
+    let failed = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/gone/</d:href><d:propstat><d:prop><d:displayname>Gone</d:displayname><d:resourcetype><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:propstat></d:response></d:multistatus>"#;
+    assert!(matches!(book_list(failed, &base), Err("carddav_invalid_response")));
+    // A member that vanished between listing and answering is not a book.
+    let vanished = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/gone/</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response><d:response><d:href>/kept/</d:href><d:propstat><d:prop><d:resourcetype><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#;
+    let books = book_list(vanished, &base).unwrap();
+    assert_eq!(books.len(), 1);
+    assert_eq!(books[0]["href"], "https://dav.example.org/kept/");
+    // A sibling the server could not answer refuses the listing.
+    let error_sibling = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:carddav"><d:response><d:href>/kept/</d:href><d:propstat><d:prop><d:resourcetype><c:addressbook/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response><d:response><d:href>/broken/</d:href><d:status>HTTP/1.1 503 Service Unavailable</d:status></d:response></d:multistatus>"#;
+    assert!(matches!(
+        book_list(error_sibling, &base),
+        Err("carddav_invalid_response")
+    ));
+}
+
+#[test]
+fn a_swapped_snapshot_file_serves_no_foreign_books() {
+    let _guard = snapshot_test_lock();
+    let root = snapshot_test_root();
+    let a = derive_source_id("https://a.example.org/", "ann").unwrap();
+    let b = derive_source_id("https://b.example.org/", "ann").unwrap();
+    // A file written under one source id that claims another source's
+    // identity is refused rather than served.
+    snapshot_write(&a, &[json!({"href": "https://a.example.org/x/", "contacts": []})]).unwrap();
+    let swapped = std::path::Path::new(&root).join("carddav").join(snapshot_name(&a));
+    let target = std::path::Path::new(&root).join("carddav").join(snapshot_name(&b));
+    std::fs::copy(&swapped, &target).unwrap();
+    assert!(snapshot(&json!({"sourceId": b})).is_err());
+    assert_eq!(snapshot(&json!({"sourceId": a})).unwrap()["books"].as_array().unwrap().len(), 1);
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -107,10 +107,12 @@ def read_api(path):
     names = set()
     for case in cases:
         if (not isinstance(case, dict) or not {'name', 'method', 'params'} <= set(case)
-                or set(case) - {'name', 'method', 'params', 'errorCode', 'equals', 'types'}
+                or set(case) - {'name', 'method', 'params', 'errorCode', 'equals', 'types', 'peer'}
                 or not isinstance(case['name'], str) or not case['name'] or case['name'] in names
                 or case['method'] not in methods or not isinstance(case['params'], dict)):
             raise ValueError('invalid API contract case')
+        if 'peer' in case and case['peer'] != 'carddav':
+            raise ValueError('unknown contract case peer: ' + repr(case['peer']))
         names.add(case['name'])
         if 'errorCode' in case:
             if type(case['errorCode']) is not int:

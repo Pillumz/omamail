@@ -9,7 +9,7 @@
 //! the only methods spoken are PROPFIND and the addressbook-query REPORT.
 
 use quick_xml::{
-    Reader,
+    NsReader,
     escape::resolve_xml_entity,
     events::{BytesRef, Event},
 };
@@ -318,7 +318,10 @@ async fn dav_with(
         if response.status() == StatusCode::NOT_FOUND {
             return Err("carddav_not_found");
         }
-        if response.status() != StatusCode::MULTI_STATUS && !response.status().is_success() {
+        // A PROPFIND or REPORT answer is a 207 Multi-Status. A plain 2xx is
+        // a gateway interstitial or a login page, never an address book
+        // answer, and must not be parsed as one.
+        if response.status() != StatusCode::MULTI_STATUS {
             return Err("carddav_request_failed");
         }
         return Ok((url, response_body(response, limit).await?));
@@ -330,6 +333,114 @@ async fn dav_with(
 // Bounded XML reading. quick_xml never resolves document-defined entities;
 // character references and the five predefined entities are resolved by hand,
 // a DOCTYPE is refused outright, and the open-element stack is depth-capped.
+// Beyond that, every answer is read strictly: its elements are namespace
+// resolved through the document's own xmlns bindings, it must consist of
+// exactly one closed {DAV:}multistatus root, and the propstat statuses must
+// say the properties actually came back. A truncated, foreign or erroring
+// answer is refused whole, so it can never replace a last complete snapshot
+// with an empty or partial one.
+
+const DAV_NS: &str = "DAV:";
+const CARDDAV_NS: &str = "urn:ietf:params:xml:ns:carddav";
+
+/// The namespace of one element, resolved from the document's own bindings.
+/// A prefix nothing binds is a refused answer; an element outside DAV: and
+/// the CardDAV namespace is merely one this reader does not act on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ns {
+    Dav,
+    Carddav,
+    Other,
+    None,
+}
+
+fn ns_of(resolved: quick_xml::name::ResolveResult<'_>) -> Result<Ns, &'static str> {
+    use quick_xml::name::ResolveResult;
+    match resolved {
+        ResolveResult::Bound(namespace) if namespace == quick_xml::name::Namespace(DAV_NS.as_bytes()) => Ok(Ns::Dav),
+        ResolveResult::Bound(namespace) if namespace == quick_xml::name::Namespace(CARDDAV_NS.as_bytes()) => Ok(Ns::Carddav),
+        ResolveResult::Bound(_) => Ok(Ns::Other),
+        ResolveResult::Unbound => Ok(Ns::None),
+        ResolveResult::Unknown(_) => Err("carddav_invalid_response"),
+    }
+}
+
+/// Strict framing for one DAV answer: exactly one {DAV:}multistatus root,
+/// every opened element closed, and nothing meaningful after the root. A
+/// truncated document reaches Eof with elements still open; an HTML or error
+/// page never names the root at all.
+#[derive(Default)]
+struct Framing {
+    open: usize,
+    opened: bool,
+    closed: bool,
+}
+
+impl Framing {
+    fn open_element(&mut self, namespace: Ns, local: &[u8], empty: bool) -> Result<(), &'static str> {
+        if self.closed || self.open >= MAX_XML_DEPTH {
+            return Err("carddav_invalid_response");
+        }
+        if !self.opened {
+            if namespace != Ns::Dav || local != b"multistatus" {
+                return Err("carddav_invalid_response");
+            }
+            self.opened = true;
+        }
+        if !empty {
+            self.open += 1;
+        }
+        Ok(())
+    }
+
+    fn close_element(&mut self) -> Result<(), &'static str> {
+        if self.open == 0 {
+            return Err("carddav_invalid_response");
+        }
+        self.open -= 1;
+        if self.open == 0 {
+            self.closed = true;
+        }
+        Ok(())
+    }
+
+    /// After the root closes only whitespace may follow.
+    fn content(&self, raw: &[u8]) -> Result<(), &'static str> {
+        if self.closed && !raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            return Err("carddav_invalid_response");
+        }
+        Ok(())
+
+    }
+
+    fn eof(&self) -> Result<(), &'static str> {
+        if self.opened && self.open == 0 {
+            Ok(())
+        } else {
+            Err("carddav_invalid_response")
+        }
+    }
+}
+
+/// The code of one DAV status line ("HTTP/1.1 207 Multi-Status"). A propstat
+/// or response status that is not an HTTP status line is a refused answer.
+fn status_code(line: &str) -> Result<u16, &'static str> {
+    let text = line.trim();
+    let (version, rest) = text.split_once(char::is_whitespace).ok_or("carddav_invalid_response")?;
+    if !version.starts_with("HTTP/") || !version.contains('.') {
+        return Err("carddav_invalid_response");
+    }
+    let rest = rest.trim_start();
+    let digits = rest.get(..3).ok_or("carddav_invalid_response")?;
+    if rest.len() > 3 && !rest.as_bytes()[3].is_ascii_whitespace() {
+        return Err("carddav_invalid_response");
+    }
+    let code: u16 = digits.parse().map_err(|_| "carddav_invalid_response")?;
+    if !(100..=599).contains(&code) {
+        return Err("carddav_invalid_response");
+    }
+    Ok(code)
+}
 
 fn local_name(raw: &[u8]) -> &[u8] {
     raw.rsplit(|byte| *byte == b':').next().unwrap_or(raw)
@@ -352,56 +463,131 @@ fn append_reference(target: &mut String, reference: &BytesRef<'_>) -> Result<(),
 
 /// The hrefs nested inside one named property, e.g. current-user-principal or
 /// addressbook-home-set. A multistatus also carries a response-level href, so
-/// the container scope matters.
-fn nested_hrefs(xml: &str, container: &[u8]) -> Result<Vec<String>, &'static str> {
-    let mut reader = Reader::from_str(xml);
+/// the container scope matters. The property counts only from a propstat
+/// whose status says it came back; a 404 propstat spells the property absent
+/// and any other non-2xx status fails the whole answer, as does a
+/// response-level status that is not a success.
+fn nested_hrefs(xml: &str, container: Ns, container_name: &[u8]) -> Result<Vec<String>, &'static str> {
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut text = String::new();
+    let mut framing = Framing::default();
+    let mut stack: Vec<(Ns, Vec<u8>)> = Vec::new();
+    let mut href_text = String::new();
+    let mut status_text = String::new();
     let mut hrefs = Vec::new();
+    // Hrefs buffered per propstat: the status line follows the properties
+    // (RFC 4918 propstat is prop, then status), so whether they count is
+    // decided only when the propstat closes.
+    let mut pending: Vec<String> = Vec::new();
+    let mut in_propstat = false;
+    let mut response_status: Option<u16> = None;
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(event)) => {
-                if stack.len() >= MAX_XML_DEPTH {
-                    return Err("carddav_invalid_response");
-                }
-                stack.push(local_name(event.name().as_ref()).to_vec());
-                if stack.last().is_some_and(|name| name.as_slice() == b"href") {
-                    text.clear();
-                }
-            }
-            Ok(Event::Text(event))
-                if stack.last().is_some_and(|name| name.as_slice() == b"href") =>
-            {
-                text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
-            }
-            Ok(Event::CData(event))
-                if stack.last().is_some_and(|name| name.as_slice() == b"href") =>
-            {
-                text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
-            }
-            Ok(Event::GeneralRef(event))
-                if stack.last().is_some_and(|name| name.as_slice() == b"href") =>
-            {
-                append_reference(&mut text, &event)?;
-            }
-            Ok(Event::End(event)) => {
-                let qualified = event.name();
-                let name = local_name(qualified.as_ref()).to_vec();
-                if name == b"href"
-                    && stack.iter().any(|entry| entry.as_slice() == container)
-                    && !text.trim().is_empty()
-                {
-                    if hrefs.len() >= MAX_HOMES {
-                        return Err("carddav_invalid_response");
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|_| "carddav_invalid_response")?;
+        let namespace = ns_of(resolved)?;
+        match event {
+            Event::Start(event) => {
+                let name = local_name(event.name().as_ref()).to_vec();
+                framing.open_element(namespace, &name, false)?;
+                match (namespace, name.as_slice()) {
+                    (Ns::Dav, b"propstat") => {
+                        in_propstat = true;
+                        status_text.clear();
                     }
-                    hrefs.push(text.trim().to_owned());
+                    (Ns::Dav, b"status") if !in_propstat => status_text.clear(),
+                    (Ns::Dav, b"href") => href_text.clear(),
+                    _ => {}
+                }
+                stack.push((namespace, name));
+            }
+            Event::Empty(event) => {
+                let raw = event.name().as_ref().to_vec();
+                let name = local_name(&raw);
+                framing.open_element(namespace, name, true)?;
+            }
+            Event::Text(event) => {
+                let bytes = event.as_ref();
+                framing.content(bytes)?;
+                match stack.last() {
+                    Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
+                        href_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                    }
+                    Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
+                        status_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                    }
+                    _ => {}
+                }
+            }
+            Event::CData(event) => match stack.last() {
+                Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
+                    href_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                }
+                Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
+                    status_text.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                }
+                _ => {}
+            },
+            Event::GeneralRef(event) => match stack.last() {
+                Some((Ns::Dav, name)) if name.as_slice() == b"href" => {
+                    append_reference(&mut href_text, &event)?;
+                }
+                Some((Ns::Dav, name)) if name.as_slice() == b"status" => {
+                    append_reference(&mut status_text, &event)?;
+                }
+                _ => {}
+            },
+            Event::End(event) => {
+                let name = local_name(event.name().as_ref()).to_vec();
+                match (namespace, name.as_slice()) {
+                    (Ns::Dav, b"propstat") => {
+                        let code = status_code(&status_text)?;
+                        if code == 404 {
+                            pending.clear();
+                        } else if !(200..300).contains(&code) {
+                            return Err("carddav_invalid_response");
+                        } else {
+                            for href in pending.drain(..) {
+                                if hrefs.len() >= MAX_HOMES {
+                                    return Err("carddav_invalid_response");
+                                }
+                                hrefs.push(href);
+                            }
+                        }
+                        status_text.clear();
+                        in_propstat = false;
+                    }
+                    (Ns::Dav, b"status") if !in_propstat => {
+                        response_status = Some(status_code(&status_text)?);
+                        status_text.clear();
+                    }
+                    (Ns::Dav, b"href")
+                        if stack
+                            .iter()
+                            .any(|entry| entry.0 == container && entry.1 == container_name)
+                            && in_propstat
+                            && !href_text.trim().is_empty() =>
+                    {
+                        pending.push(href_text.trim().to_owned());
+                    }
+                    (Ns::Dav, b"response") => {
+                        if let Some(code) = response_status
+                            && !(200..300).contains(&code)
+                        {
+                            return Err("carddav_invalid_response");
+                        }
+                        response_status = None;
+                    }
+                    _ => {}
                 }
                 stack.pop();
+                framing.close_element()?;
             }
-            Ok(Event::DocType(_)) => return Err("carddav_invalid_response"),
-            Ok(Event::Eof) => return Ok(hrefs),
-            Err(_) => return Err("carddav_invalid_response"),
+            Event::DocType(_) => return Err("carddav_invalid_response"),
+            Event::Eof => {
+                framing.eof()?;
+                return Ok(hrefs);
+            }
             _ => {}
         }
     }
@@ -414,92 +600,186 @@ struct DavBook {
     is_addressbook: bool,
 }
 
+/// Which single text element a reader is currently capturing.
+#[derive(PartialEq)]
+enum Capture {
+    None,
+    Status,
+    Href,
+    Displayname,
+}
+
 /// The address books in a Depth:1 PROPFIND answer, as absolute same-origin
-/// URLs. Responses whose resourcetype lacks `addressbook` — the home set
-/// itself, calendar collections, principals — are skipped.
+/// URLs. Responses whose resourcetype lacks a CardDAV `addressbook` — the
+/// home set itself, calendar collections, principals — are skipped. A 404
+/// propstat spells its properties absent; any other non-2xx propstat status,
+/// or a sibling response whose own status names a failure, refuses the whole
+/// answer: a listing that silently misses books is not a listing.
 fn book_list(xml: &str, base: &Url) -> Result<Vec<Value>, &'static str> {
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
-    let mut current: Option<DavBook> = None;
-    let mut capture = Vec::<u8>::new();
+    let mut framing = Framing::default();
+    let mut current = DavBook::default();
+    let mut in_response = false;
+    // The text element being captured: displayname, the response-level href
+    // or a status line, each into its own buffer.
+    let mut capture = Capture::None;
     let mut captured = String::new();
     let mut books = Vec::new();
+    // Properties buffered per propstat: whether they count is decided by the
+    // status line that follows them (RFC 4918 propstat is prop, then status).
+    let mut pending = DavBook::default();
+    let mut in_propstat = false;
+    let mut status_text = String::new();
+    let mut response_status: Option<u16> = None;
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(event)) => {
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|_| "carddav_invalid_response")?;
+        let namespace = ns_of(resolved)?;
+        match event {
+            Event::Start(event) => {
                 let name = local_name(event.name().as_ref()).to_vec();
-                if name == b"response" {
-                    current = Some(DavBook::default());
-                }
-                if let Some(value) = current.as_mut() {
-                    match name.as_slice() {
-                        b"addressbook" => value.is_addressbook = true,
-                        b"href" | b"displayname" => {
-                            capture = name;
-                            captured.clear();
-                        }
-                        _ => {}
+                framing.open_element(namespace, &name, false)?;
+                match (namespace, name.as_slice()) {
+                    (Ns::Dav, b"response") => {
+                        in_response = true;
+                        current = DavBook::default();
+                        response_status = None;
                     }
-                }
-            }
-            Ok(Event::Empty(event)) => {
-                if let Some(value) = current.as_mut()
-                    && local_name(event.name().as_ref()) == b"addressbook"
-                {
-                    value.is_addressbook = true;
-                }
-            }
-            Ok(Event::Text(event)) if !capture.is_empty() => {
-                captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
-            }
-            Ok(Event::CData(event)) if !capture.is_empty() => {
-                captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
-            }
-            Ok(Event::GeneralRef(event)) if !capture.is_empty() => {
-                append_reference(&mut captured, &event)?;
-            }
-            Ok(Event::End(event)) => {
-                let qualified = event.name();
-                let name = local_name(qualified.as_ref()).to_vec();
-                if name == capture.as_slice() {
-                    // Propstats answer independently: a 404 propstat repeats
-                    // the absent property as an empty element, and it may
-                    // follow the 200 one. The first non-empty value wins.
-                    if let Some(value) = current.as_mut() {
-                        if name == b"href" && value.href.is_empty() {
-                            value.href = captured.trim().to_owned();
-                        } else if name == b"displayname"
-                            && value.name.is_empty()
-                            && !captured.trim().is_empty()
-                        {
-                            value.name = captured.trim().to_owned();
-                        }
+                    (Ns::Dav, b"propstat") => {
+                        in_propstat = true;
+                        pending = DavBook::default();
+                        status_text.clear();
                     }
-                    capture.clear();
-                    captured.clear();
-                }
-                if name == b"response" {
-                    let value = current.take().ok_or("carddav_invalid_response")?;
-                    if value.is_addressbook {
-                        let url = resolve(base, &value.href)?;
-                        if books.len() >= MAX_BOOKS {
-                            return Err("carddav_too_many_books");
-                        }
-                        let name = if value.name.is_empty()
-                            || value.name.len() > 1024
-                            || value.name.chars().any(char::is_control)
-                        {
-                            "Address book".to_owned()
-                        } else {
-                            value.name
-                        };
-                        books.push(json!({"href": url.as_str(), "name": name}));
+                    (Ns::Dav, b"status") => {
+                        capture = Capture::Status;
+                        captured.clear();
                     }
+                    (Ns::Carddav, b"addressbook") if in_propstat => {
+                        pending.is_addressbook = true;
+                    }
+                    (Ns::Dav, b"href") => {
+                        capture = Capture::Href;
+                        captured.clear();
+                    }
+                    (Ns::Dav, b"displayname") if in_propstat => {
+                        capture = Capture::Displayname;
+                        captured.clear();
+                    }
+                    _ => {}
                 }
             }
-            Ok(Event::DocType(_)) => return Err("carddav_invalid_response"),
-            Ok(Event::Eof) => return Ok(books),
-            Err(_) => return Err("carddav_invalid_response"),
+            Event::Empty(event) => {
+                let raw = event.name().as_ref().to_vec();
+                let name = local_name(&raw);
+                framing.open_element(namespace, name, true)?;
+                if namespace == Ns::Carddav && name == b"addressbook" && in_propstat {
+                    pending.is_addressbook = true;
+                }
+            }
+            Event::Text(event) => {
+                framing.content(event.as_ref())?;
+                if !matches!(capture, Capture::None) {
+                    captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                }
+            }
+            Event::CData(event) => {
+                if !matches!(capture, Capture::None) {
+                    captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                }
+            }
+            Event::GeneralRef(event) => {
+                if !matches!(capture, Capture::None) {
+                    append_reference(&mut captured, &event)?;
+                }
+            }
+            Event::End(event) => {
+                let name = local_name(event.name().as_ref()).to_vec();
+                match (namespace, name.as_slice()) {
+                    (Ns::Dav, b"propstat") => {
+                        let code = status_code(&status_text)?;
+                        if (200..300).contains(&code) {
+                            // Propstats answer independently: a 404 propstat
+                            // repeats the absent property as an empty element,
+                            // and it may follow the 200 one. The first
+                            // non-empty value wins.
+                            if current.name.is_empty() && !pending.name.is_empty() {
+                                current.name = pending.name.clone();
+                            }
+                            if pending.is_addressbook {
+                                current.is_addressbook = true;
+                            }
+                        } else if code != 404 {
+                            return Err("carddav_invalid_response");
+                        }
+                        pending = DavBook::default();
+                        status_text.clear();
+                        in_propstat = false;
+                    }
+                    (Ns::Dav, b"status") => {
+                        let code = status_code(&captured.trim())?;
+                        if in_propstat {
+                            status_text = captured.trim().to_owned();
+                        } else if in_response {
+                            response_status = Some(code);
+                        }
+                        captured.clear();
+                        capture = Capture::None;
+                    }
+                    (Ns::Dav, b"href") => {
+                        if in_propstat {
+                            pending.href = captured.trim().to_owned();
+                        } else if in_response {
+                            current.href = captured.trim().to_owned();
+                        }
+                        captured.clear();
+                        capture = Capture::None;
+                    }
+                    (Ns::Dav, b"displayname") => {
+                        if in_propstat && !captured.trim().is_empty() {
+                            pending.name = captured.trim().to_owned();
+                        }
+                        captured.clear();
+                        capture = Capture::None;
+                    }
+                    (Ns::Dav, b"response") => {
+                        // A sibling that names its own failure takes the whole
+                        // listing with it, except a member that vanished,
+                        // which is simply not a book.
+                        let missing = response_status == Some(404);
+                        if response_status.is_some() && !missing {
+                            return Err("carddav_invalid_response");
+                        }
+                        if in_response && !missing {
+                            if current.is_addressbook {
+                                let url = resolve(base, &current.href)?;
+                                if books.len() >= MAX_BOOKS {
+                                    return Err("carddav_too_many_books");
+                                }
+                                let name = if current.name.is_empty()
+                                    || current.name.len() > 1024
+                                    || current.name.chars().any(char::is_control)
+                                {
+                                    "Address book".to_owned()
+                                } else {
+                                    current.name.clone()
+                                };
+                                books.push(json!({"href": url.as_str(), "name": name}));
+                            }
+                        }
+                        in_response = false;
+                        in_propstat = false;
+                    }
+                    _ => {}
+                }
+                framing.close_element()?;
+            }
+            Event::DocType(_) => return Err("carddav_invalid_response"),
+            Event::Eof => {
+                framing.eof()?;
+                return Ok(books);
+            }
             _ => {}
         }
     }
@@ -681,60 +961,177 @@ fn card_contacts(
 /// Every vCard in an addressbook-query answer. Hitting a bound is an error,
 /// never a silently truncated book.
 fn book_contacts(xml: &str) -> Result<Vec<Value>, &'static str> {
-    let mut reader = Reader::from_str(xml);
+    let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
-    let mut depth = 0usize;
-    let mut in_data = false;
+    let mut framing = Framing::default();
     let mut data = String::new();
     let mut book = Vec::new();
     let mut cards = 0usize;
     let mut seen = std::collections::HashSet::new();
+    // Address data buffered per propstat: whether it counts is decided by the
+    // status line that follows it, so a failed propstat can never contribute
+    // a partial card, and a card whose property failed can never be silently
+    // dropped from an otherwise complete book.
+    let mut pending: Vec<Value> = Vec::new();
+    let mut pending_cards = 0usize;
+    let mut pending_data_elements = 0usize;
+    let mut pending_had_text = false;
+    let mut response_data_elements = 0usize;
+    let mut in_data = false;
+    let mut in_propstat = false;
+    let mut in_response = false;
+    let mut propstats = 0usize;
+    let mut status_text = String::new();
+    let mut response_status: Option<u16> = None;
+    let mut capture = Capture::None;
+    let mut captured = String::new();
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(event)) => {
-                depth += 1;
-                if depth > MAX_XML_DEPTH {
-                    return Err("carddav_invalid_response");
-                }
-                if local_name(event.name().as_ref()) == b"address-data" {
-                    in_data = true;
-                    data.clear();
-                }
-            }
-            Ok(Event::Text(event)) if in_data => {
-                if event.len() > MAX_CARD_BYTES - data.len() {
-                    return Err("carddav_too_many_contacts");
-                }
-                data.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
-            }
-            Ok(Event::CData(event)) if in_data => {
-                if event.len() > MAX_CARD_BYTES - data.len() {
-                    return Err("carddav_too_many_contacts");
-                }
-                data.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
-            }
-            Ok(Event::GeneralRef(event)) if in_data => {
-                append_reference(&mut data, &event)?;
-            }
-            Ok(Event::End(event)) => {
-                if local_name(event.name().as_ref()) == b"address-data" && in_data {
-                    in_data = false;
-                    // A propstat for absent properties can spell address-data
-                    // as an empty element; it is not a card.
-                    if !data.trim().is_empty() {
-                        cards += 1;
-                        if cards > MAX_CARDS {
-                            return Err("carddav_too_many_contacts");
-                        }
-                        card_contacts(&mut book, &data, &mut seen)?;
+        let (resolved, event) = reader
+            .read_resolved_event()
+            .map_err(|_| "carddav_invalid_response")?;
+        let namespace = ns_of(resolved)?;
+        match event {
+            Event::Start(event) => {
+                let name = local_name(event.name().as_ref()).to_vec();
+                framing.open_element(namespace, &name, false)?;
+                match (namespace, name.as_slice()) {
+                    (Ns::Dav, b"response") => {
+                        in_response = true;
+                        propstats = 0;
+                        response_status = None;
+                        response_data_elements = 0;
+                    }
+                    (Ns::Dav, b"propstat") => {
+                        in_propstat = true;
+                        propstats += 1;
+                        status_text.clear();
+                    }
+                    (Ns::Dav, b"status") => {
+                        capture = Capture::Status;
+                        captured.clear();
+                    }
+                    (Ns::Carddav, b"address-data") if in_propstat => {
+                        in_data = true;
+                        pending_data_elements += 1;
                         data.clear();
                     }
+                    _ => {}
                 }
-                depth = depth.saturating_sub(1);
             }
-            Ok(Event::DocType(_)) => return Err("carddav_invalid_response"),
-            Ok(Event::Eof) => return Ok(book),
-            Err(_) => return Err("carddav_invalid_response"),
+            Event::Empty(event) => {
+                let raw = event.name().as_ref().to_vec();
+                let name = local_name(&raw);
+                framing.open_element(namespace, name, true)?;
+                // A propstat for absent properties can spell address-data as
+                // an empty element; it is not a card, and whether that shape
+                // is acceptable is decided by that propstat's status.
+                if namespace == Ns::Carddav && name == b"address-data" && in_propstat {
+                    pending_data_elements += 1;
+                }
+            }
+            Event::Text(event) => {
+                framing.content(event.as_ref())?;
+                if in_data {
+                    if event.len() > MAX_CARD_BYTES - data.len() {
+                        return Err("carddav_too_many_contacts");
+                    }
+                    let text = event.decode().map_err(|_| "carddav_invalid_response")?;
+                    if !text.bytes().all(|byte| byte.is_ascii_whitespace()) {
+                        pending_had_text = true;
+                    }
+                    data.push_str(&text);
+                } else if matches!(capture, Capture::Status) {
+                    captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                }
+            }
+            Event::CData(event) => {
+                if in_data {
+                    if event.len() > MAX_CARD_BYTES - data.len() {
+                        return Err("carddav_too_many_contacts");
+                    }
+                    data.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                    pending_had_text = true;
+                } else if matches!(capture, Capture::Status) {
+                    captured.push_str(&event.decode().map_err(|_| "carddav_invalid_response")?);
+                }
+            }
+            Event::GeneralRef(event) => {
+                if in_data {
+                    append_reference(&mut data, &event)?;
+                    pending_had_text = true;
+                } else if matches!(capture, Capture::Status) {
+                    append_reference(&mut captured, &event)?;
+                }
+            }
+            Event::End(event) => {
+                let name = local_name(event.name().as_ref()).to_vec();
+                match (namespace, name.as_slice()) {
+                    (Ns::Carddav, b"address-data") if in_data => {
+                        in_data = false;
+                        if !data.trim().is_empty() {
+                            pending_cards += 1;
+                            if cards + pending_cards > MAX_CARDS {
+                                return Err("carddav_too_many_contacts");
+                            }
+                            card_contacts(&mut pending, &data, &mut seen)?;
+                            data.clear();
+                        }
+                    }
+                    (Ns::Dav, b"status") => {
+                        let code = status_code(captured.trim())?;
+                        if in_propstat {
+                            status_text = captured.trim().to_owned();
+                        } else {
+                            response_status = Some(code);
+                        }
+                        captured.clear();
+                        capture = Capture::None;
+                    }
+                    (Ns::Dav, b"propstat") => {
+                        let code = status_code(&status_text)?;
+                        if (200..300).contains(&code) {
+                            cards += pending_cards;
+                            book.append(&mut pending);
+                            response_data_elements += pending_data_elements;
+                        } else if code == 404 && (pending_had_text || pending_data_elements > 0) {
+                            // The card exists but its data could not be read:
+                            // the answer is incomplete, not empty.
+                            return Err("carddav_invalid_response");
+                        } else if code != 404 {
+                            return Err("carddav_invalid_response");
+                        }
+                        pending.clear();
+                        pending_cards = 0;
+                        pending_data_elements = 0;
+                        pending_had_text = false;
+                        status_text.clear();
+                        in_propstat = false;
+                    }
+                    (Ns::Dav, b"response") => {
+                        // Every card the query matched comes back as its
+                        // address data under a 2xx propstat. A response
+                        // without one, carrying a status of its own, or
+                        // reporting its card's data absent, is not part of
+                        // a complete answer: refusing it keeps the last
+                        // complete book instead of storing a thinner one.
+                        if in_response
+                            && (propstats == 0
+                                || response_status.is_some()
+                                || response_data_elements == 0)
+                        {
+                            return Err("carddav_invalid_response");
+                        }
+                        in_response = false;
+                    }
+                    _ => {}
+                }
+                framing.close_element()?;
+            }
+            Event::DocType(_) => return Err("carddav_invalid_response"),
+            Event::Eof => {
+                framing.eof()?;
+                return Ok(book);
+            }
             _ => {}
         }
     }
@@ -820,6 +1217,13 @@ fn snapshot_read(source_id: &str) -> Result<Value, &'static str> {
     }
     let raw: Value =
         serde_json::from_slice(&bytes).map_err(|_| "carddav_snapshot_unavailable")?;
+    // The file must belong to the source being read: a swapped or edited
+    // snapshot must not serve another source's books as this one's.
+    let stored = raw["source"].as_str().ok_or("carddav_snapshot_unavailable")?;
+    bounded(stored, 1024).map_err(|_| "carddav_snapshot_unavailable")?;
+    if stored != source_id {
+        return Err("carddav_snapshot_unavailable");
+    }
     Ok(json!({"books": snapshot_books(&raw)?}))
 }
 
@@ -962,7 +1366,13 @@ fn snapshot_write(source_id: &str, books: &[Value]) -> Result<(), &'static str> 
 const PRINCIPAL: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:current-user-principal/></d:prop></d:propfind>";
 const HOME: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><c:addressbook-home-set/></d:prop></d:propfind>";
 const BOOK_PROPS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:displayname/><d:resourcetype/></d:prop></d:propfind>";
-const ADDRESSBOOK_QUERY: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag/><c:address-data/></d:prop></c:addressbook-query>";
+// RFC 6352 10.3 requires the filter: addressbook-query is
+// (prop?, filter, limit?). 10.5 defines filter as prop-filter* with a
+// default anyof test, so an empty filter matches every card — the
+// all-contacts query, identical in result to the filterless one this
+// replaced but valid for strict parsers such as Apple CalendarServer,
+// which refuse a query without one.
+const ADDRESSBOOK_QUERY: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?><c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag/><c:address-data/></d:prop><c:filter/></c:addressbook-query>";
 
 fn propfind() -> Method {
     Method::from_bytes(b"PROPFIND").unwrap()
@@ -1049,7 +1459,7 @@ where
             DISCOVERY_LIMIT,
         )
         .await?;
-        let mut principals = nested_hrefs(&xml, b"current-user-principal")?;
+        let mut principals = nested_hrefs(&xml, Ns::Dav, b"current-user-principal")?;
         let Some(principal) = principals.pop() else {
             return Err("carddav_discovery_failed");
         };
@@ -1064,7 +1474,7 @@ where
             DISCOVERY_LIMIT,
         )
         .await?;
-        let homes = nested_hrefs(&xml, b"addressbook-home-set")?;
+        let homes = nested_hrefs(&xml, Ns::Carddav, b"addressbook-home-set")?;
         if homes.is_empty() {
             return Err("carddav_discovery_failed");
         }

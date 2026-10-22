@@ -270,9 +270,9 @@ jobs:
       - name: Build this revision's backend and run the whole contract against it
         run: |
           set -euo pipefail
-          cargo build --locked --bin omamail
+          cargo build --locked --bin omamail --features integration-test-credentials
           python3 scripts/package-backend.py check-api
-          python3 tests/test_backend_api.py --binary target/debug/omamail
+          python3 tests/test_backend_api.py --binary target/debug/omamail --carddav-peer
           python3 tests/test_agent_native_bridge.py
       - name: Leave a note for the PR comment when this gate fails
         if: failure() && github.event_name == 'pull_request'
@@ -289,12 +289,12 @@ jobs:
           ### Unreleased API gate failed
           A backend built from this branch does not pass the whole contract, or the native agent bridge. Build it and run the same checks locally:
           ```
-          cargo build --locked --bin omamail
+          cargo build --locked --bin omamail --features integration-test-credentials
           python3 scripts/package-backend.py check-api
-          python3 tests/test_backend_api.py --binary target/debug/omamail
+          python3 tests/test_backend_api.py --binary target/debug/omamail --carddav-peer
           python3 tests/test_agent_native_bridge.py
           ```
-          A contract case you added under `unreleased.cases` must pass here; `check-api` also refuses a second unreleased step and an unreleased list that names nothing in the contract.
+          A contract case you added under `unreleased.cases` must pass here; `check-api` also refuses a second unreleased step and an unreleased list that names nothing in the contract. The debug binary is built with `integration-test-credentials` so the peer-gated CardDAV fixtures (marked `"peer": "carddav"` in backend-api.json) run against `src/carddav/tls_test.py` in serve mode with a synthetic keyring; a binary without the feature skips them with a notice.
           NOTE
       - uses: actions/upload-artifact@v4
         if: failure() && github.event_name == 'pull_request'
