@@ -18,11 +18,17 @@ Item {
     property var snapshotReleases: []
     property bool holdRefreshes: false
     property var refreshReleases: []
+    property bool holdDiscovers: false
+    property var discoverReleases: []
 
     function call(method, params, callback) {
       mailService.backendCalls.push({ method: method, params: params })
       if (method === "contacts.suggest") { callback(mailService.localResult, null); return }
-      if (method === "carddav.discover") { callback(mailService.discoverResult, mailService.discoverError); return }
+      if (method === "carddav.discover") {
+        if (mockBackend.holdDiscovers) { mockBackend.discoverReleases.push(callback); return }
+        callback(mailService.discoverResult, mailService.discoverError)
+        return
+      }
       if (method === "carddav.refresh") {
         if (mockBackend.holdRefreshes) { mockBackend.refreshReleases.push(callback); return }
         callback(mailService.refreshResult, mailService.refreshError)
@@ -109,6 +115,8 @@ Item {
       mockBackend.snapshotReleases = []
       mockBackend.holdRefreshes = false
       mockBackend.refreshReleases = []
+      mockBackend.holdDiscovers = false
+      mockBackend.discoverReleases = []
       mailService.backendCanCarddav = true
       mailService.credentialCalls = []
       mailService.backendCalls = []
@@ -129,6 +137,7 @@ Item {
       controller.lastErrors = ({})
       controller.pendingQueue = []
       controller.cycleRunning = false
+      controller.cyclePhase = ""
       controller.cycleGeneration = 0
       controller.busy = false
       controller.busySourceId = ""
@@ -175,6 +184,12 @@ Item {
       verify(mockBackend.refreshReleases.length > 0, "a refresh answer is waiting")
       var callback = mockBackend.refreshReleases.shift()
       callback(mailService.refreshResult, mailService.refreshError)
+    }
+
+    function releaseDiscover(result) {
+      verify(mockBackend.discoverReleases.length > 0, "a discovery answer is waiting")
+      var callback = mockBackend.discoverReleases.shift()
+      callback(result !== undefined ? result : (mailService.discoverResult || { books: [] }), null)
     }
 
     function releaseConfigWrite(ok) {
@@ -603,6 +618,44 @@ Item {
       compare(controller.store.sources[0].books[0].href, staffBookHref,
         "a write from the retired life does not replace the stored books")
       compare(controller.busy, false)
+    }
+
+    function test_the_new_cycle_waits_for_a_retired_operation_and_then_refreshes() {
+      mockBackend.holdSnapshots = true
+      mockBackend.holdDiscovers = true
+      controller.store = storeWithSource()
+      seedContacts()
+      verify(controller.refreshSource(staffId))
+      compare(controller.busy, true, "the manual refresh is waiting on discovery")
+      compare(backendCallsOf("carddav.discover").length, 1)
+      // The backend drops and comes back while that discovery answer is
+      // still on its way; the reconnect starts a fresh snapshot phase.
+      mockBackend.ready = false
+      mockBackend.ready = true
+      compare(backendCallsOf("carddav.snapshot").length, 1)
+      // The new snapshot is answered first, while the retired operation
+      // still holds the one-at-a-time slot.
+      releaseSnapshot()
+      compare(controller.pendingQueue.length, 1, "the refresh stays queued, not dropped")
+      compare(controller.cycleRunning, true)
+      compare(controller.busy, true)
+      compare(backendCallsOf("carddav.refresh").length, 0,
+        "no refresh starts while the slot is held")
+      // The retired discovery answer arrives. It must write nothing and
+      // issue no request; its completion lets the queued refresh run.
+      mockBackend.holdDiscovers = false
+      mailService.discoverResult = { books: [{ href: staffBookHref, name: "CDM Staff" }] }
+      releaseDiscover({ books: [{ href: "https://dav.example.org/obsolete/", name: "Obsolete" }] })
+      compare(backendCallsOf("carddav.refresh").length, 1,
+        "the queued source refreshes once the retired operation ends")
+      compare(controller.cycleRunning, false)
+      compare(controller.busy, false)
+      compare(mailService.configWrites.length, 1, "only the live discovery saves a book list")
+      verify(JSON.stringify(mailService.configWrites).indexOf("obsolete") === -1,
+        "the retired discovery answer writes nothing")
+      compare(controller.store.sources[0].books.length, 1)
+      compare(controller.store.sources[0].books[0].href, staffBookHref)
+      verify(controller.lastErrors[staffId] === undefined)
     }
 
     function test_a_source_removed_with_an_answer_in_flight_stays_removed() {

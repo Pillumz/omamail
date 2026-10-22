@@ -45,9 +45,12 @@ Item {
   property var pendingQueue: []
   // The startup cycle: one serialized run of every stored snapshot, then
   // every enabled source's refresh. `cycleRunning` refuses a second trigger
-  // while answers are still in flight; `cycleGeneration` separates answers
-  // of the current run from those of a backend life that already ended.
+  // while answers are still in flight; `cyclePhase` tells the snapshot queue
+  // from the refresh queue so a slot released mid-cycle resumes the right
+  // one; `cycleGeneration` separates answers of the current run from those
+  // of a backend life that already ended.
   property bool cycleRunning: false
+  property string cyclePhase: ""
   property int cycleGeneration: 0
 
   signal connectFinished(bool ok, string error)
@@ -218,11 +221,19 @@ Item {
     var finish = function(refreshed, refreshError) {
       root.busy = false
       root.busySourceId = ""
-      if (token !== root.cycleGeneration) return
+      if (token !== root.cycleGeneration) {
+        // A retired operation never advances its own chain, but the current
+        // cycle may be waiting on the slot it just released.
+        root.resumeRefreshQueue()
+        return
+      }
       root.refreshFinished(source.id, refreshed, refreshed ? "" : refreshError)
       if (typeof done === "function") done(refreshed, refreshError)
     }
     root.discover(source, function(ok, books) {
+      // The answer arrived after the backend life that asked for it ended:
+      // neither write the discovered books nor issue the refresh request.
+      if (token !== root.cycleGeneration) { finish(false, ""); return }
       if (!ok) {
         // Discovery is best-effort during a refresh: the stored book list
         // still names what to sync.
@@ -418,6 +429,7 @@ Item {
     if (root.loaded) root.refreshLocalContacts()
     if (!root.available || !root.loaded) return
     root.cycleRunning = true
+    root.cyclePhase = "snapshots"
     root.cycleGeneration += 1
     var token = root.cycleGeneration
     var sources = root.store.sources
@@ -450,6 +462,7 @@ Item {
 
   function refreshAll(token) {
     if (token !== root.cycleGeneration) return
+    root.cyclePhase = "refreshes"
     var sources = root.store.sources
     for (var i = 0; i < sources.length; i++) {
       if (sources[i] && sources[i].enabled === true)
@@ -459,17 +472,28 @@ Item {
   }
 
   function refreshNext(token) {
-    if (token !== root.cycleGeneration) return
+    if (token !== root.cycleGeneration || !root.cycleRunning) return
     if (root.pendingQueue.length === 0 || !root.available) {
       root.pendingQueue = []
+      root.cyclePhase = ""
       root.cycleRunning = false
       return
     }
+    // One operation at a time: an older refresh may still be finishing. Its
+    // completion hands the slot back through resumeRefreshQueue().
+    if (root.busy) return
     var id = root.pendingQueue.shift()
     var started = root.refreshSourceInternal(id, function(_refreshed, _refreshError) {
       root.refreshNext(token)
     }, token)
     if (!started) root.refreshNext(token)
+  }
+
+  // A refresh that held the one-at-a-time slot has completed. If the startup
+  // cycle is waiting on that slot, continue its refresh queue.
+  function resumeRefreshQueue() {
+    if (root.cycleRunning && root.cyclePhase === "refreshes" && root.pendingQueue.length > 0)
+      root.refreshNext(root.cycleGeneration)
   }
 
   // The full startup cycle runs once: the first config answer and a ready
@@ -521,6 +545,7 @@ Item {
       // releases it, including when the answer turns out to be stale.
       root.cycleGeneration += 1
       root.cycleRunning = false
+      root.cyclePhase = ""
       root.pendingQueue = []
       root.contactsLoading = false
     }
