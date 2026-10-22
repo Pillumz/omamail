@@ -51,6 +51,9 @@ Item {
   // of a backend life that already ended.
   property bool cycleRunning: false
   property string cyclePhase: ""
+  // Any operation can hold the slot while startup loads snapshots. Resume
+  // after its callback finishes, including removal and failed connection cleanup.
+  onBusyChanged: if (!busy) Qt.callLater(root.resumeRefreshQueue)
   property int cycleGeneration: 0
 
   signal connectFinished(bool ok, string error)
@@ -221,12 +224,7 @@ Item {
     var finish = function(refreshed, refreshError) {
       root.busy = false
       root.busySourceId = ""
-      if (token !== root.cycleGeneration) {
-        // A retired operation never advances its own chain, but the current
-        // cycle may be waiting on the slot it just released.
-        root.resumeRefreshQueue()
-        return
-      }
+      if (token !== root.cycleGeneration) return
       root.refreshFinished(source.id, refreshed, refreshed ? "" : refreshError)
       if (typeof done === "function") done(refreshed, refreshError)
     }

@@ -147,6 +147,30 @@ Item {
       controller.startupStarted = true
     }
 
+    function test_removing_a_source_during_snapshot_load_does_not_strand_other_refreshes() {
+      var other = sourceRecord()
+      other.username = "second@example.org"
+      other.id = CarddavSources.deriveId(other.url, other.username)
+      controller.store = CarddavSources.add(storeWithSource(), other)
+      mockBackend.holdSnapshots = true
+      controller.start()
+      mailService.holdConfigWrites = true
+      verify(controller.removeSource(staffId))
+      releaseSnapshot()
+      releaseSnapshot()
+      compare(backendCallsOf("carddav.refresh").length, 0)
+      mailService.holdConfigWrites = false
+      mailService.discoverResult = { books: [{ href: staffBookHref, name: "Other directory" }] }
+      mailService.refreshResult = { books: [{ href: staffBookHref,
+        contacts: [{ name: "Current", email: "current@example.org" }] }], errors: [], stored: true }
+      mailService.configWriteReleases.shift()(true, "")
+      tryCompare(removedSpy, "count", 1)
+      tryVerify(function() { return backendCallsOf("carddav.refresh").length === 1 })
+      compare(backendCallsOf("carddav.refresh")[0].params.source.id, other.id)
+      compare(controller.contactsForAccount("imap:work@example.com")[0].email, "current@example.org")
+      compare(CarddavSources.find(controller.store, staffId), null)
+    }
+
     function connectWork() {
       mailService.discoverResult = { books: [
         { href: staffBookHref, name: "CDM Staff" }
@@ -646,7 +670,7 @@ Item {
       mockBackend.holdDiscovers = false
       mailService.discoverResult = { books: [{ href: staffBookHref, name: "CDM Staff" }] }
       releaseDiscover({ books: [{ href: "https://dav.example.org/obsolete/", name: "Obsolete" }] })
-      compare(backendCallsOf("carddav.refresh").length, 1,
+      tryVerify(function() { return backendCallsOf("carddav.refresh").length === 1 }, 5000,
         "the queued source refreshes once the retired operation ends")
       compare(controller.cycleRunning, false)
       compare(controller.busy, false)
