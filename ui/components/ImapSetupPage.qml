@@ -30,7 +30,7 @@ Column {
 
   readonly property var auth: service ? service.auth : null
   readonly property bool signedIn: !!auth && auth.loggedIn
-  readonly property bool busy: !!auth && auth.loginBusy
+  readonly property bool busy: !!auth && (auth.loginBusy || auth.replacementBusy === true)
   readonly property bool toolsMissing: !!auth && auth.toolsChecked && auth.missingTools.length > 0
 
   // Recomputed as the address is typed, and only ever used to *fill* the
@@ -70,6 +70,7 @@ Column {
 
   function syncFromStore() {
     nameField.syncFromStore()
+    senderField.syncFromStore()
     if (!auth || !auth.settings) return
     var settings = auth.settings
     addressField.text = service ? service.accountAddress : ""
@@ -113,8 +114,17 @@ Column {
 
   // Saved before the password is tried, so a mailbox that the server rejects
   // still has its settings to correct rather than an empty form to fill again.
+  //
+  // A password typed into a signed-in mailbox is a replacement, usually for
+  // one the server has started refusing. It goes through `signIn`, which
+  // verifies it before it is stored; saving only the servers would drop it
+  // without a word and keep sending the refused one.
   function save() {
     if (!service) return
+    if (passwordField.text !== "") {
+      signIn()
+      return
+    }
     var address = validatedAddress()
     if (address === "") return
     var check = Imap.validateSettings(currentSettings())
@@ -127,12 +137,13 @@ Column {
       provider: "imap",
       email: address,
       imap: check.settings,
-      label: nameField.value()
+      label: nameField.value(),
+      senderName: senderField.value()
     })
   }
 
   function signIn() {
-    if (!service) return
+    if (!service || busy) return
     var address = validatedAddress()
     if (address === "") return
     var check = Imap.validateSettings(currentSettings())
@@ -145,7 +156,8 @@ Column {
       provider: "imap",
       email: address,
       imap: check.settings,
-      label: nameField.value()
+      label: nameField.value(),
+      senderName: senderField.value()
     }, passwordField.text)
   }
 
@@ -157,6 +169,9 @@ Column {
     function onLastErrorChanged() {
       if (root.auth && root.auth.lastError !== "") errorText.text = root.auth.lastError
     }
+    // Stored means done with: left in the field, the next Save changes would
+    // verify it all over again. A refused one stays, to be corrected.
+    function onCredentialsSaved() { passwordField.text = "" }
   }
 
   // ------------------------------------------------------------------ hero
@@ -218,6 +233,16 @@ Column {
 
     AccountNameField {
       id: nameField
+      service: root.service
+      width: parent.width
+      foreground: root.textColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.bodySmall
+      onAccepted: (senderField.available ? senderField : addressField).forceActiveFocus()
+    }
+
+    SenderNameField {
+      id: senderField
       service: root.service
       width: parent.width
       foreground: root.textColor
@@ -292,6 +317,7 @@ Column {
 
       TextField {
         id: passwordField
+        objectName: "imap-password-field"
         anchors.left: parent.left
         anchors.right: parent.right
         // Masked by default: this window is shoulder-surfable. Readable on
@@ -456,8 +482,10 @@ Column {
     }
 
     Button {
+      objectName: "imap-save-button"
       visible: root.signedIn
-      text: "Save changes"
+      text: root.busy ? "Checking" : "Save changes"
+      enabled: !root.busy
       foreground: root.textColor
       bordered: true
       fontSize: Style.font.bodySmall

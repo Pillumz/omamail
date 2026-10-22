@@ -1,6 +1,7 @@
 .pragma library
 
 .import "Aliases.js" as Aliases
+.import "../backend/Plain.js" as Plain
 
 // The list of Gmail accounts and which one the window is showing. One account
 // was the original design; several is a list plus a selection, and every rule
@@ -57,7 +58,7 @@ function calendarProvider(raw) {
   var account = raw || {}
   var provider = trimmed(account.provider).toLowerCase()
   if (provider === "gmail" || provider === "") return "google"
-  if (provider === "outlook") return "microsoft"
+  if (provider === "outlook" || provider === "m365") return "microsoft"
   if (provider !== "imap") return ""
   var host = trimmed(account.imap && account.imap.imapHost).toLowerCase()
   var email = trimmed(account.email).toLowerCase()
@@ -90,7 +91,7 @@ function accountId(email, provider) {
 // anything written before providers existed — is Gmail: that is what every
 // account in an upgraded install actually is, and defaulting to it is what
 // stops an upgrade from presenting a working mailbox as unconfigured.
-var PROVIDERS = ["gmail", "outlook", "hey", "imap", "jmap"]
+var PROVIDERS = ["gmail", "outlook", "m365", "hey", "imap", "jmap"]
 var DEFAULT_PROVIDER = "gmail"
 
 function normalizeProvider(value) {
@@ -212,6 +213,10 @@ function makeAccount(account) {
     imap: makeImapSettings(raw.imap),
     jmap: makeJmapSettings(raw.jmap),
     label: trimmed(raw.label),
+    // The name recipients see beside this mailbox's own address. Only the
+    // mailboxes `namesSender` admits read it; the others take theirs from
+    // the server.
+    senderName: senderNameText(raw.senderName),
     signature: trimmed(raw.signature),
     // The signature as markup, imported from a file and rebuilt by
     // `Signature.js` before it is stored: never the file's own bytes. Sent as
@@ -504,26 +509,8 @@ function discardDraftAt(list, index) {
 // Empty is not a name and clears it, which is what puts the address back:
 // `label()` falls through to the local part, so there is no state in which a
 // mailbox has nothing to be called.
-// QML 6.12 can hand a value that crossed a signal or `var` boundary back as a
-// V4Sequence: not an Array, but a sequence with an integral length and the
-// sequence methods (including `slice`). Read one by index into a plain JS
-// array. A JSON object can carry a numeric `length` but can never carry a
-// function, so an arbitrary object stays rejected, as it was when only
-// Array.isArray was accepted; a genuine sequence is the only non-Array that
-// gets through. Copy by index rather than enumerating keys, so an own
-// "__proto__" is never run as a setter.
-function plainList(value) {
-  if (Array.isArray(value)) return value
-  if (!value || typeof value !== "object" || typeof value.slice !== "function"
-      || typeof value.length !== "number" || !isFinite(value.length)
-      || value.length < 0 || Math.floor(value.length) !== value.length) return []
-  var out = []
-  for (var i = 0; i < value.length; i++) out.push(value[i])
-  return out
-}
-
 function idList(value) {
-  var list = plainList(value)
+  var list = Array.isArray(value) ? value : []
   var out = []
   for (var i = 0; i < list.length; i++) {
     var item = trimmed(list[i])
@@ -533,13 +520,16 @@ function idList(value) {
 }
 
 // The watched list replaced whole: what a rename or a move leaves it as,
-// once the ids it held have followed the folders they named.
+// once the ids it held have followed the folders they named. They arrive
+// through the account's `monitoredMigrated` signal, so they are made plain
+// first: read as nothing, they emptied every watch on the account and wrote
+// that to disk.
 function setMonitored(list, id, labelIds) {
   var next = copyList(list)
   var at = indexOfId(next.accounts, id)
   if (at < 0) return next
   var entry = makeAccount(next.accounts[at])
-  entry.monitored = idList(labelIds)
+  entry.monitored = idList(Plain.plain(labelIds))
   next.accounts[at] = entry
   return next
 }
@@ -567,6 +557,32 @@ function setLabel(list, id, text) {
   // field existed comes out of a write with the same shape as every other.
   var entry = makeAccount(next.accounts[at])
   entry.label = trimmed(text)
+  next.accounts[at] = entry
+  return next
+}
+
+// Whether this mailbox's sender name is ours to set. IMAP and Outlook have no
+// server that names the sender, so the account entry is the only place a name
+// can come from; Gmail, JMAP and HEY report their own identities with names.
+// The backend makes the same distinction when it builds the From header.
+function namesSender(provider) {
+  var id = String(provider || "")
+  return id === "imap" || id === "outlook"
+}
+
+// One header line, so a pasted line break, tab or other control character
+// (C1 included) becomes a space instead of a name the send would refuse.
+function senderNameText(value) {
+  return trimmed(String(value === undefined || value === null ? "" : value)
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/ {2,}/g, " "))
+}
+
+function setSenderName(list, id, text) {
+  var next = copyList(list)
+  var at = indexOfId(next.accounts, id)
+  if (at < 0) return next
+  var entry = makeAccount(next.accounts[at])
+  entry.senderName = senderNameText(text)
   next.accounts[at] = entry
   return next
 }

@@ -27,7 +27,9 @@ pub enum CredentialKind {
     OutlookRefreshToken { client_id: String },
     ImapPassword,
     JmapSecret,
+    M365RefreshToken { client_id: String },
     CalendarPassword,
+    CarddavPassword,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +81,7 @@ impl CredentialStore for NativeStore {
     fn get(&self, key: &CredentialKey) -> Result<Secret, Error> {
         key.attributes()?;
         #[cfg(feature = "integration-test-credentials")]
-        if let Some(result) = fixture_secret() {
+        if let Some(result) = fixture_secret(key) {
             return result;
         }
         #[cfg(test)]
@@ -91,6 +93,10 @@ impl CredentialStore for NativeStore {
     fn put(&self, key: &CredentialKey, secret: &[u8]) -> Result<(), Error> {
         key.attributes()?;
         validate_secret(secret)?;
+        #[cfg(feature = "integration-test-credentials")]
+        if let Some(result) = fixture_write("put", key) {
+            return result;
+        }
         #[cfg(test)]
         if let Some(store) = tests::override_store() {
             return store.put(key, secret);
@@ -100,6 +106,10 @@ impl CredentialStore for NativeStore {
     }
     fn delete(&self, key: &CredentialKey) -> Result<(), Error> {
         key.attributes()?;
+        #[cfg(feature = "integration-test-credentials")]
+        if let Some(result) = fixture_write("delete", key) {
+            return result;
+        }
         #[cfg(test)]
         if let Some(store) = tests::override_store() {
             return store.delete(key);
@@ -109,10 +119,21 @@ impl CredentialStore for NativeStore {
 }
 
 #[cfg(feature = "integration-test-credentials")]
-fn fixture_secret() -> Option<Result<Secret, Error>> {
+fn fixture_trace(trace: std::ffi::OsString, line: String) -> Result<(), Error> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()))
+        .map_err(|_| Error::Unavailable)
+}
+
+#[cfg(feature = "integration-test-credentials")]
+fn fixture_secret(key: &CredentialKey) -> Option<Result<Secret, Error>> {
     let path = std::env::var_os("OMAMAIL_INTEGRATION_CREDENTIAL_FILE")?;
     if let Some(trace) = std::env::var_os("OMAMAIL_INTEGRATION_CREDENTIAL_TRACE") {
-        if std::fs::write(trace, b"get\n").is_err() {
+        let line = format!("get {} {}\n", key.provider, key.account_id);
+        if fixture_trace(trace, line).is_err() {
             return Some(Err(Error::Unavailable));
         }
     }
@@ -125,6 +146,21 @@ fn fixture_secret() -> Option<Result<Secret, Error>> {
         b"synthetic\n" => Secret::new(b"synthetic".to_vec()),
         _ => Err(Error::Unavailable),
     })
+}
+
+/// The integration fixture stands in for the keyring, so a sandboxed app
+/// run never writes a real store: writes are acknowledged and traced with
+/// the operation and the key they addressed — never the secret.
+#[cfg(feature = "integration-test-credentials")]
+fn fixture_write(operation: &str, key: &CredentialKey) -> Option<Result<(), Error>> {
+    std::env::var_os("OMAMAIL_INTEGRATION_CREDENTIAL_FILE")?;
+    if let Some(trace) = std::env::var_os("OMAMAIL_INTEGRATION_CREDENTIAL_TRACE") {
+        let line = format!("{} {} {}\n", operation, key.provider, key.account_id);
+        if fixture_trace(trace, line).is_err() {
+            return Some(Err(Error::Unavailable));
+        }
+    }
+    Some(Ok(()))
 }
 
 fn validate_secret(bytes: &[u8]) -> Result<(), Error> {
@@ -153,7 +189,9 @@ impl CredentialKey {
             CredentialKind::OutlookRefreshToken { .. } => ("outlook", "outlook-refresh-token"),
             CredentialKind::ImapPassword => ("imap", "imap-password"),
             CredentialKind::JmapSecret => ("jmap", "jmap-secret"),
+            CredentialKind::M365RefreshToken { .. } => ("m365", "m365-refresh-token"),
             CredentialKind::CalendarPassword => ("caldav", "calendar-password"),
+            CredentialKind::CarddavPassword => ("carddav", "carddav-password"),
         };
         if self.provider != provider {
             return Err(Error::InvalidKey);
@@ -162,7 +200,7 @@ impl CredentialKey {
             ("service".into(), "omamail".into()),
             ("kind".into(), kind.into()),
         ]);
-        if provider == "caldav" {
+        if provider == "caldav" || provider == "carddav" {
             attrs.insert("source".into(), self.account_id.clone());
         } else {
             if self.account_id.chars().any(char::is_whitespace)
@@ -177,7 +215,8 @@ impl CredentialKey {
             attrs.insert("account".into(), self.account_id.to_lowercase());
         }
         if let CredentialKind::GoogleRefreshToken { client_id }
-        | CredentialKind::OutlookRefreshToken { client_id } = &self.kind
+        | CredentialKind::OutlookRefreshToken { client_id }
+        | CredentialKind::M365RefreshToken { client_id } = &self.kind
         {
             metadata(client_id)?;
             attrs.insert("client-id".into(), client_id.clone());

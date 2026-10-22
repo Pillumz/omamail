@@ -207,6 +207,9 @@ impl Session {
         if method.starts_with("jmap.") {
             return Box::pin(self.jmap.call(method, params)).await;
         }
+        if method.starts_with("m365.") {
+            return Box::pin(crate::providers::m365::call(method, params)).await;
+        }
         if method.starts_with("imap.") || method == "smtp.send" {
             return Box::pin(crate::providers::imap::call(method, params)).await;
         }
@@ -258,6 +261,9 @@ impl Session {
             return tokio::task::spawn_blocking(crate::contacts::suggest)
                 .await
                 .map_err(|_| "worker_failed")?;
+        }
+        if method.starts_with("carddav.") {
+            return Box::pin(crate::carddav::call(method, params)).await;
         }
         if matches!(method, "public.image" | "public.unsubscribe") {
             let fields = params.as_object().ok_or("invalid_params")?;
@@ -322,12 +328,10 @@ impl Session {
                         .await?,
                 ),
                 Some("microsoft") => Some(
-                    crate::auth::access_token(
-                        "outlook",
+                    crate::auth::graph_token(
                         params["source"]["accountId"]
                             .as_str()
                             .ok_or("invalid_params")?,
-                        "graph",
                     )
                     .await?,
                 ),
@@ -479,7 +483,7 @@ pub fn dispatch(method: &str, params: &Value) -> Result<Value, &'static str> {
     match method {
         "system.info" => Ok(json!({
             "name": "omamail", "version": env!("CARGO_PKG_VERSION"),
-            "protocol": 1, "apiVersion": 6, "methods": methods::available(),
+            "protocol": 1, "apiVersion": 9, "methods": methods::available(),
             "capabilities": {"agent": cfg!(all(feature = "agent", unix))}
         })),
         "system.quit" => Ok(json!({"quitReady": true})),

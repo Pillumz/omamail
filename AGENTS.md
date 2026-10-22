@@ -11,6 +11,7 @@ Read the relevant document before changing its area; these contain constraints t
 | HEY | [docs/providers/hey.md](docs/providers/hey.md) |
 | IMAP, SMTP and Proton Bridge | [docs/providers/imap.md](docs/providers/imap.md) |
 | JMAP discovery and streaming | [docs/providers/jmap.md](docs/providers/jmap.md) |
+| Microsoft 365 over Graph | [docs/providers/m365.md](docs/providers/m365.md) |
 | Message HTML, images, direction and outgoing MIME | [docs/MESSAGE-RENDERING.md](docs/MESSAGE-RENDERING.md) |
 | Network requests, credentials, subprocesses and security reviews | [docs/SECURITY-BOUNDARIES.md](docs/SECURITY-BOUNDARIES.md) |
 | Backend APIs, binary pins and releases | [docs/BACKEND-RUNTIME.md](docs/BACKEND-RUNTIME.md) |
@@ -20,6 +21,7 @@ Read the relevant document before changing its area; these contain constraints t
 - Group by module, not file type. Rust lives in `src/`, CLI handling in `src/cli/`, and dispatch in `src/backend/`. QML and its JavaScript live together under `ui/`. Rust unit tests live with their modules; UI tests live in `ui/tests/`; integration tests live in `tests/`.
 - Rust owns mail business logic and durable agent jobs. QML owns presentation and interaction state, communicating with the persistent backend over stdin/stdout rather than invoking CLI commands. See `docs/BACKEND.md` and `docs/ARCHITECTURE.md`.
 - QML JavaScript libraries start with `.pragma library` and use `var` and `function`, not `const`, `let`, arrows or template literals. Put testable presentation rules there. Tests load module paths, e.g. `load("cache/Cache.js")`; `ui/tests/load.js` resolves QML `.import` chains.
+- A list or object received through a `var` signal argument (on Qt 6.12) or a delegate's `modelData` is a sequence or reference object, not a JavaScript array or object: `Array.isArray` says no and its keys come back sorted. A receiver that judges such a value, keeps it or writes to it takes `Plain.plain` (`ui/backend/Plain.js`) of it first; `ui/tests/qml/tst_signal_lists.qml` shows the pattern.
 - List new QML files in the Makefile's lint inputs and import other modules explicitly.
 - `Service.qml` is shell-constructed and must declare no required properties. The shell injects only `shell`, `manifest`, `pluginRegistry`, and `barWidgetRegistry`; settings arrive through the bar widget's `applySettings`.
 
@@ -43,6 +45,13 @@ Read the relevant document before changing its area; these contain constraints t
 - Keep credentials out of argv, logs and world-readable settings. Use synthetic credentials and controlled targets for tests.
 - Preserve account/draft ownership, human approval of AI proposals, and normal outbox dispatch. Model text must not supply routing or permission to send mail.
 - Every review states **Security: PASS / BLOCK / NOT VERIFIED** for the affected boundaries. Missing evidence or a security failure blocks approval/release. Security regressions must verify the forbidden effect did not happen, not merely that an error was returned; follow `docs/SECURITY-BOUNDARIES.md`.
+
+## Review priorities
+
+- PR review primarily decides whether a new or adjusted capability belongs in Omamail and whether its product and interaction design is appropriate. Begin each PR report by explaining what changes, the problem it aims to solve, and who benefits.
+- Assess necessity, fit with project goals, overlap with existing workflows, simpler alternatives, and interface and maintenance costs. Give a clear recommendation to introduce, defer, or leave out the change, with reasons; the maintainer owns the product decision.
+- Evaluate design independently of implementation quality: workflow, discoverability, defaults, information hierarchy, keyboard and focus behavior, consistency, and loading, empty, error and cancellation states. State when screenshots or hands-on evidence are missing rather than treating tests as design evidence.
+- Functional correctness, tests, performance and security support this product and design assessment and remain approval gates. Passing technical checks alone does not justify adding a capability. Explain the change and purpose for every PR, including passing and skipped PRs.
 
 ## Repository and pull requests
 

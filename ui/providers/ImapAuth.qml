@@ -51,6 +51,14 @@ Item {
   // them without knowing which provider it has.
   readonly property bool credentialsPresent: configured
   property bool loginBusy: false
+  // A signed-in mailbox checking a replacement password. Kept apart from
+  // `loginBusy`, which would take the mailbox out of service while it is
+  // checked: with one mailbox the window would rebuild its root and close the
+  // setup page, and a refusal with it.
+  property bool replacementBusy: false
+  // Which attempt an answer belongs to. Sign-out, a cancel or another mailbox
+  // moves it on, so a late answer cannot finish an attempt nobody is waiting on.
+  property int sessionGeneration: 0
   property bool credentialLookupBusy: false
   property bool credentialWriteBusy: false
   property int credentialLookupSerial: 0
@@ -167,6 +175,10 @@ Item {
   // will answer everything else — rather than by being written down first and
   // failing silently later.
   function signIn(secret) {
+    // One attempt at a time: `pendingPassword` holds a single value, so a
+    // second attempt started before the first answers would have that answer
+    // applied to the password typed last, and an unverified one stored.
+    if (loginBusy || replacementBusy) return false
     if (platform && platform.canAccessCredentials === false) {
       lastError = "Install or update the mail backend before signing in"
       return false
@@ -175,7 +187,14 @@ Item {
       lastError = "Missing " + missingTools.join(", ")
       return false
     }
-    var value = String(secret || "")
+    // Pasting from a line can include its trailing line break. Remove only
+    // that suffix; silently changing controls inside a password would verify
+    // and save a different secret from the one the user entered.
+    var value = String(secret || "").replace(/[\r\n]+$/, "")
+    if (/[\x00-\x1f\x7f]/.test(value)) {
+      lastError = "The password contains a control character. Enter it again"
+      return false
+    }
     if (value === "") {
       lastError = "Enter the password for this mailbox"
       return false
@@ -186,7 +205,9 @@ Item {
       return false
     }
     lastError = ""
-    loginBusy = true
+    sessionGeneration++
+    if (password !== "") replacementBusy = true
+    else loginBusy = true
     pendingPassword = value
     verifyRequested(settings, settings.username + ":" + value)
     return true
@@ -195,8 +216,11 @@ Item {
   // The client owns the transport, so it performs the check and reports back.
   signal verifyRequested(var settings, string credentials)
 
-  function completeSignIn(ok, error) {
+  function completeSignIn(ok, error, generation) {
+    if (generation !== undefined && generation !== sessionGeneration) return
+    if (!loginBusy && !replacementBusy) return
     loginBusy = false
+    replacementBusy = false
     if (!ok) {
       pendingPassword = ""
       lastError = safeError(error) || "The server rejected that username or password"
@@ -241,8 +265,8 @@ Item {
 
   function logout() {
     var boundAccount = accountId
+    abandonSignIn()
     password = ""
-    pendingPassword = ""
     passwordChecked = true
     if (credentialWriteBusy && credentialWriteAccount === boundAccount)
       pendingCredentialDelete = boundAccount
@@ -263,12 +287,22 @@ Item {
   // `MailAccount` should not have to ask which provider it holds before
   // calling one.
   function beginLogin() { /* the setup form drives sign-in, not a browser */ }
-  function cancelLogin() { loginBusy = false }
+  function cancelLogin() { abandonSignIn() }
+
+  // Nothing is waiting for the attempt in flight any more; its answer, if it
+  // ever comes, finds a newer generation and is dropped.
+  function abandonSignIn() {
+    sessionGeneration++
+    loginBusy = false
+    replacementBusy = false
+    pendingPassword = ""
+  }
 
   onAccountIdChanged: {
     // A different mailbox has a different password. Dropping the one in memory
     // is what stops an account rename from leaving the previous account's
     // credential in front of the new one's server.
+    abandonSignIn()
     password = ""
     passwordChecked = false
     lookupHandled = false

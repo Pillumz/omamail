@@ -28,8 +28,8 @@ Item {
       pluginDir: "/synthetic/plugin"
       bundledMode: true
       bundledExecutable: "/synthetic/app/omamail"
-      bundledVersion: "0.10.7"
-      bundledApiVersion: 5
+      bundledVersion: "0.11.1"
+      bundledApiVersion: 8
     }
   }
   TestCase {
@@ -40,13 +40,13 @@ Item {
       var runtime = createTemporaryObject(bundledFactory, parent)
       runtime.refresh()
       compare(runtime.state, "ready")
-      compare(runtime.requiredApiVersion, 5)
-      compare(runtime.latestApiVersion, 6)
+      compare(runtime.requiredApiVersion, 8)
+      compare(runtime.latestApiVersion, 9)
       compare(runtime.unreleasedMethods.length, 0)
-      for (var api = 5; api <= 7; api++) {
-        var info = { protocol: 1, version: "0.10.7", apiVersion: api }
+      for (var api = 7; api <= 10; api++) {
+        var info = { protocol: 1, version: "0.11.1", apiVersion: api }
         compare(Compatibility.accepts(info, runtime.requiredVersion, runtime.requiredApiVersion,
-          runtime.latestApiVersion), api !== 7, "API " + api)
+          runtime.latestApiVersion), api === 8 || api === 9, "API " + api)
       }
     }
 

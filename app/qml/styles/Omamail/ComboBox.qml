@@ -29,6 +29,7 @@ T.ComboBox {
   }
 
   indicator: Canvas {
+    id: chevron
     objectName: "omamail-combobox-chevron"
     x: control.width - width - Style.spacing.controlPaddingX
     y: (control.height - height) / 2
@@ -47,7 +48,7 @@ T.ComboBox {
     }
     Connections {
       target: control
-      function onSemanticForegroundChanged() { parent.requestPaint() }
+      function onSemanticForegroundChanged() { chevron.requestPaint() }
     }
   }
 

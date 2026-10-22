@@ -226,9 +226,16 @@ DropArea {
     ? service.cachePath("compose") : ""
   property bool attachmentHostPending: false
 
-  readonly property var contactBook: root.service
-    && Array.isArray(root.service.recipientContacts)
-    ? root.service.recipientContacts : []
+  // The book a draft completes from belongs to the mailbox the draft belongs
+  // to: CardDAV sources linked to another account stay out of it.
+  readonly property var contactBook: {
+    if (!root.service) return []
+    var carddav = root.service.carddavController
+    if (carddav && typeof carddav.mergedForAccount === "function")
+      return carddav.mergedForAccount(root.accountId !== "" ? root.accountId
+        : String(root.service.activeAccountId || ""))
+    return Array.isArray(root.service.recipientContacts) ? root.service.recipientContacts : []
+  }
 
   readonly property var fromAliases: {
     if (!root.service || !Array.isArray(root.service.sendAsAliases)) return []

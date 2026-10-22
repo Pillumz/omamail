@@ -1,6 +1,6 @@
 {
-  "apiVersion": 6,
-  "releasedApiVersion": 6,
+  "apiVersion": 9,
+  "releasedApiVersion": 8,
   "protocolVersion": 1,
   "methods": [
     "system.info",
@@ -89,6 +89,10 @@
     "cache.calendarRead",
     "cache.calendarPut",
     "contacts.suggest",
+    "carddav.discover",
+    "carddav.refresh",
+    "carddav.snapshot",
+    "carddav.forget",
     "attachment.read",
     "attachment.store",
     "attachment.storeUpload",
@@ -183,7 +187,24 @@
     "jmap.request",
     "jmap.stream.open",
     "jmap.stream.poll",
-    "jmap.stream.close"
+    "jmap.stream.close",
+    "m365.signInBegin",
+    "m365.signInPoll",
+    "m365.signOut",
+    "m365.verify",
+    "m365.list",
+    "m365.messages",
+    "m365.read",
+    "m365.attachment",
+    "m365.modify",
+    "m365.trash",
+    "m365.untrash",
+    "m365.send",
+    "m365.saveDraft",
+    "m365.deleteDraft",
+    "m365.sendAs",
+    "m365.invalidate",
+    "m365.cancel"
   ],
   "contractCases": [
     {
@@ -512,7 +533,7 @@
           "recipient@example.org"
         ],
         "subject": "Contract preview",
-        "body": "Hello \u5408\u6210\nSecond line"
+        "body": "Hello 合成\nSecond line"
       },
       "equals": {
         "dryRun": true,
@@ -523,7 +544,31 @@
           "recipient@example.org"
         ],
         "subject": "Contract preview",
-        "body": "Hello \u5408\u6210\nSecond line",
+        "body": "Hello 合成\nSecond line",
+        "attachments": []
+      }
+    },
+    {
+      "name": "mail send dry run names the IMAP sender",
+      "method": "mail.send",
+      "params": {
+        "account": "imap:named@example.org",
+        "to": [
+          "recipient@example.org"
+        ],
+        "subject": "Contract preview",
+        "body": "Hello"
+      },
+      "equals": {
+        "dryRun": true,
+        "executed": false,
+        "accountId": "imap:named@example.org",
+        "from": "Jane Example <named@example.org>",
+        "to": [
+          "recipient@example.org"
+        ],
+        "subject": "Contract preview",
+        "body": "Hello",
         "attachments": []
       }
     },
@@ -788,7 +833,7 @@
         "now": 1700000000000
       },
       "equals": {
-        "body.text": "Hello \u5408\u6210",
+        "body.text": "Hello 合成",
         "summary.subject": "API fixture",
         "summary.id": "fixture"
       },
@@ -1263,10 +1308,457 @@
       "types": {
         "ticket": "string"
       }
+    },
+    {
+      "name": "Microsoft 365 provider rules",
+      "method": "providers.snapshot",
+      "params": {},
+      "equals": {
+        "m365.nativeSync": true,
+        "m365.capabilities.archive": true,
+        "m365.capabilities.spam": false,
+        "m365.capabilities.labels": false,
+        "m365.queries.archive": "role:archive",
+        "m365.queries.starred": "role:inbox flagged"
+      }
+    },
+    {
+      "name": "Microsoft 365 text search is a text query",
+      "method": "providers.resolve",
+      "params": {
+        "provider": "m365",
+        "operation": "query",
+        "search": "invoice"
+      },
+      "equals": {
+        "value": "text:invoice"
+      }
+    },
+    {
+      "name": "Microsoft 365 answers one sender identity without a request",
+      "method": "m365.sendAs",
+      "params": {
+        "accountId": "m365:sender@example.org"
+      },
+      "equals": {
+        "0.email": "sender@example.org",
+        "0.isDefault": true
+      }
+    },
+    {
+      "name": "Microsoft 365 verify names a mailbox that is not saved",
+      "method": "m365.verify",
+      "params": {
+        "accountId": "m365:absent@example.org"
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "auth_account_missing"
+      }
+    },
+    {
+      "name": "Microsoft 365 list refuses a forged page token",
+      "method": "m365.list",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "query": "role:inbox",
+        "limit": 5,
+        "pageToken": "forged"
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "Microsoft 365 messages refuse an id that is not its own",
+      "method": "m365.messages",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "ids": [
+          "1:INBOX"
+        ],
+        "full": false
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "Microsoft 365 send refuses a body that is not canonical base64url",
+      "method": "m365.send",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "raw": "not base64url!"
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "Microsoft 365 sign-in needs an application id",
+      "method": "m365.signInBegin",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "address": "sender@example.org"
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "mail action rejects malformed Microsoft 365 IDs before preview",
+      "method": "mail.act",
+      "params": {
+        "account": "m365:sender@example.org",
+        "operation": "read",
+        "ids": [
+          "1:INBOX"
+        ]
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "Microsoft 365 saves a draft only from canonical base64url",
+      "method": "m365.saveDraft",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "raw": "not base64url!"
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "Microsoft 365 deletes a draft only by an id of its own",
+      "method": "m365.deleteDraft",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "id": "1:Drafts"
+      },
+      "errorCode": -32602,
+      "equals": {
+        "message": "Invalid params"
+      }
+    },
+    {
+      "name": "Microsoft 365 calendar discovery asks the mailbox's own sign-in",
+      "method": "calendar.discover",
+      "params": {
+        "accountId": "m365:absent@example.org"
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "auth_account_missing"
+      }
+    },
+    {
+      "name": "outbox accepts the Microsoft 365 provider",
+      "method": "outbox.enqueue",
+      "params": {
+        "accountId": "m365:sender@example.org",
+        "provider": "m365",
+        "payload": {
+          "raw": "eA",
+          "unexpected": true
+        }
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "outbox_invalid_payload"
+      }
+    },
+    {
+      "name": "CardDAV discovery rejects unknown fields before credentials",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org",
+          "token": "x"
+        }
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV source id commits to the endpoint",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://other.example.org/",
+          "username": "employee@example.org"
+        }
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV source id commits to the username",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "anna"
+        }
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV discovery refuses a plain-HTTP collection before credentials",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "collection": "http://dav.example.org/card/"
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "carddav_invalid_url"
+      }
+    },
+    {
+      "name": "CardDAV discovery pins an explicit collection to the source origin",
+      "method": "carddav.discover",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "collection": "https://other.example.org/card/"
+      },
+      "errorCode": -32000,
+      "equals": {
+        "message": "carddav_origin_refused"
+      }
+    },
+    {
+      "name": "CardDAV refresh rejects unknown book fields before credentials",
+      "method": "carddav.refresh",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "books": [
+          {
+            "href": "/book/",
+            "etag": "1"
+          }
+        ]
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV refresh pins every book href to the source origin",
+      "method": "carddav.refresh",
+      "params": {
+        "source": {
+          "id": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5",
+          "url": "https://dav.example.org/",
+          "username": "employee@example.org"
+        },
+        "books": [
+          {
+            "href": "https://other.example.org/book/"
+          }
+        ]
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV snapshot rejects a foreign source identity",
+      "method": "carddav.snapshot",
+      "params": {
+        "sourceId": "imap:a@example.org"
+      },
+      "errorCode": -32602
+    },
+    {
+      "name": "CardDAV snapshot reads an absent store as empty",
+      "method": "carddav.snapshot",
+      "params": {
+        "sourceId": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5"
+      },
+      "equals": {
+        "books": []
+      }
+    },
+    {
+      "name": "CardDAV forget is idempotent",
+      "method": "carddav.forget",
+      "params": {
+        "sourceId": "carddav:c0424dfef4bb67212cfa1f9008fa6fb34756a2474f2698ce1ae118f01dd5c7c5"
+      },
+      "equals": {
+        "forgotten": true
+      }
+    },
+    {
+      "name": "CardDAV discovery returns the directory's address books",
+      "method": "carddav.discover",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        }
+      },
+      "equals": {
+        "books.length": 2,
+        "books.0.name": "Personal contacts",
+        "books.1.name": "Справочник компании"
+      },
+      "types": {
+        "books.0.href": "string",
+        "books.1.href": "string"
+      }
+    },
+    {
+      "name": "CardDAV refresh stores complete books",
+      "method": "carddav.refresh",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        },
+        "books": [
+          {
+            "href": "https://carddav-peer.invalid/dav/personal/"
+          },
+          {
+            "href": "https://carddav-peer.invalid/dav/directory/"
+          }
+        ]
+      },
+      "equals": {
+        "stored": true,
+        "errors.length": 0,
+        "books.length": 2,
+        "books.0.contacts.0.name": "Иван Петров",
+        "books.0.contacts.0.email": "ivan.petrov@example.org",
+        "books.0.contacts.length": 4,
+        "books.1.contacts.length": 4,
+        "books.1.contacts.0.email": "elena.volkova@example.org"
+      }
+    },
+    {
+      "name": "CardDAV snapshot reads the stored contacts",
+      "method": "carddav.snapshot",
+      "peer": "carddav",
+      "params": {
+        "sourceId": "carddav-peer-source-id"
+      },
+      "equals": {
+        "books.length": 2,
+        "books.0.contacts.0.name": "Иван Петров",
+        "books.1.contacts.0.email": "elena.volkova@example.org"
+      }
+    },
+    {
+      "name": "CardDAV refresh reports a book the server failed",
+      "method": "carddav.refresh",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        },
+        "books": [
+          {
+            "href": "https://carddav-peer.invalid/dav/personal/"
+          },
+          {
+            "href": "https://carddav-peer.invalid/dav/directory/"
+          }
+        ]
+      },
+      "equals": {
+        "stored": true,
+        "books.length": 1,
+        "books.0.contacts.length": 4,
+        "errors.length": 1,
+        "errors.0.error": "carddav_request_failed"
+      }
+    },
+    {
+      "name": "CardDAV snapshot keeps a failed book's last complete contacts",
+      "method": "carddav.snapshot",
+      "peer": "carddav",
+      "params": {
+        "sourceId": "carddav-peer-source-id"
+      },
+      "equals": {
+        "books.length": 2,
+        "books.0.contacts.0.email": "elena.volkova@example.org",
+        "books.0.contacts.length": 4,
+        "books.1.contacts.0.email": "ivan.petrov@example.org"
+      }
+    },
+    {
+      "name": "CardDAV refresh reports a snapshot it could not persist",
+      "method": "carddav.refresh",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        },
+        "books": [
+          {
+            "href": "https://carddav-peer.invalid/dav/personal/"
+          }
+        ]
+      },
+      "equals": {
+        "stored": false,
+        "books.length": 1,
+        "books.0.contacts.length": 4
+      }
     }
   ],
   "unreleased": {
-    "methods": [],
-    "cases": []
+    "methods": [
+      "carddav.discover",
+      "carddav.refresh",
+      "carddav.snapshot",
+      "carddav.forget"
+    ],
+    "cases": [
+      "CardDAV discovery rejects unknown fields before credentials",
+      "CardDAV source id commits to the endpoint",
+      "CardDAV source id commits to the username",
+      "CardDAV discovery refuses a plain-HTTP collection before credentials",
+      "CardDAV discovery pins an explicit collection to the source origin",
+      "CardDAV refresh rejects unknown book fields before credentials",
+      "CardDAV refresh pins every book href to the source origin",
+      "CardDAV snapshot rejects a foreign source identity",
+      "CardDAV snapshot reads an absent store as empty",
+      "CardDAV forget is idempotent",
+      "CardDAV discovery returns the directory's address books",
+      "CardDAV refresh stores complete books",
+      "CardDAV snapshot reads the stored contacts",
+      "CardDAV refresh reports a book the server failed",
+      "CardDAV snapshot keeps a failed book's last complete contacts",
+      "CardDAV refresh reports a snapshot it could not persist"
+    ]
   }
 }

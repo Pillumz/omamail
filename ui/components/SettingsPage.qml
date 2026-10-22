@@ -5,6 +5,7 @@ import qs.Ui
 import "../message/Direction.js" as Direction
 import "../settings/Appearance.js" as Appearance
 import "../message/Html.js" as Html
+import "../account/Accounts.js" as Accounts
 
 // Where mailboxes are managed.
 //
@@ -19,6 +20,7 @@ Column {
 
   required property var service
   required property var calendarController
+  required property var carddavController
   required property color textColor
   required property color dimColor
   required property color accentColor
@@ -55,6 +57,7 @@ Column {
     values.push({ key: "writing", title: "Writing", y: writingHeading.y })
     values.push({ key: "mailboxes", title: "Mailboxes", y: mailboxesHeading.y })
     values.push({ key: "calendars", title: "Calendars", y: calendarsSection.y })
+    values.push({ key: "contacts", title: "Contacts", y: contactsSection.y })
     values.push({ key: "oauth", title: "Google OAuth client", y: oauthHeading.y })
     return values
   }
@@ -88,25 +91,43 @@ Column {
       service.setAccountLabel(selectedNameAccountId, nameEdit.text)
   }
 
+  // Whether the selected mailbox takes its From name from here. The others
+  // are named by their server, and a field that changed nothing on the sent
+  // message would be a promise the page could not keep. So would one on a
+  // backend too old to write the name.
+  readonly property bool senderNameEditable: {
+    var entry = signatureAccount(selectedNameAccountId)
+    return !!(service && service.backendCanNameSender && entry
+      && Accounts.namesSender(entry.provider))
+  }
+
+  function saveSenderName() {
+    if (service && senderNameEditable)
+      service.setAccountSenderName(selectedNameAccountId, senderNameEdit.text)
+  }
+
+  function showNameAccount(next) {
+    selectedNameAccountId = next ? String(next.id || "") : ""
+    nameEdit.text = next ? String(next.label || "") : ""
+    senderNameEdit.text = next ? String(next.senderName || "") : ""
+  }
+
   function selectNameAccount(id) {
     var next = signatureAccount(id)
     if (!next || String(next.id || "") === selectedNameAccountId) return
     saveName()
-    selectedNameAccountId = String(next.id || "")
-    nameEdit.text = String(next.label || "")
+    saveSenderName()
+    showNameAccount(next)
   }
 
   function ensureNameAccount() {
     if (signatureAccounts.length === 0) {
-      selectedNameAccountId = ""
-      nameEdit.text = ""
+      showNameAccount(null)
       return
     }
     if (signatureAccount(selectedNameAccountId)) return
     var activeId = service ? String(service.activeAccountId || "") : ""
-    var next = signatureAccount(activeId) || signatureAccounts[0]
-    selectedNameAccountId = String(next.id || "")
-    nameEdit.text = String(next.label || "")
+    showNameAccount(signatureAccount(activeId) || signatureAccounts[0])
   }
 
   // The imported markup for the selected mailbox, and the import in flight.
@@ -1168,7 +1189,7 @@ Column {
 
     Text {
       width: parent.width
-      text: "Name"
+      text: "Mailbox name"
       color: root.textColor
       font.family: root.panelFontFamily
       font.pixelSize: Style.font.bodySmall
@@ -1201,6 +1222,47 @@ Column {
       text: "What this mailbox is called in Omamail — in the switcher, in this "
         + "list, and beside every message in a combined view. Leave it empty "
         + "to use the address. It is not sent to anyone."
+      color: root.dimColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
+    }
+
+    Item {
+      width: parent.width
+      implicitHeight: Style.space(4)
+      visible: root.senderNameEditable
+    }
+
+    Text {
+      width: parent.width
+      visible: root.senderNameEditable
+      text: "Your name"
+      color: root.textColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.bodySmall
+    }
+
+    TextField {
+      id: senderNameEdit
+      objectName: "settings-sender-name-editor"
+      visible: root.senderNameEditable
+      width: parent.width
+      foreground: root.textColor
+      accent: root.accentColor
+      font.family: root.panelFontFamily
+      font.pixelSize: Style.font.bodySmall
+
+      onActiveFocusChanged: if (!activeFocus) root.saveSenderName()
+      onAccepted: root.saveSenderName()
+    }
+
+    Text {
+      width: parent.width
+      visible: root.senderNameEditable
+      textFormat: Text.PlainText
+      text: "Who your mail is from, as recipients see it beside this mailbox's "
+        + "address. Leave it empty to send the address alone."
       color: root.dimColor
       font.family: root.panelFontFamily
       font.pixelSize: Style.font.caption
@@ -1350,6 +1412,23 @@ Column {
     onClientSetupRequested: root.clientSetupRequested()
     onAddAccountRequested: root.addRequested()
     onOpenCalendarRequested: root.openCalendarRequested()
+  }
+
+  PanelSeparator {
+    width: parent.width
+    foreground: root.textColor
+  }
+
+  ContactsSettings {
+    id: contactsSection
+    width: parent.width
+    service: root.service
+    controller: root.carddavController
+    textColor: root.textColor
+    dimColor: root.dimColor
+    accentColor: root.accentColor
+    urgentColor: root.urgentColor
+    panelFontFamily: root.panelFontFamily
   }
 
   PanelSeparator {

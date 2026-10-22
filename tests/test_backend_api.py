@@ -46,6 +46,7 @@ const {spawn} = require('child_process');
 const {load} = require(process.env.CONTRACT_ROOT + '/ui/tests/load.js');
 const Wire = load('backend/Wire.js');
 const Chunks = load('backend/Chunks.js');
+const CarddavSources = load('contacts/CarddavSources.js');
 const whole = JSON.parse(fs.readFileSync(process.env.CONTRACT_ROOT + '/backend-api.json'));
 // The pinned, published binary is asked only for the released API; a binary
 // built from this checkout for all of it.
@@ -66,35 +67,69 @@ const contract = agentUnavailable ? {
   methods: selected.methods.filter(m => !m.startsWith('agent.')),
   contractCases: selected.contractCases.filter(c => !c.method.startsWith('agent.'))
 } : selected;
-const child = spawn(process.env.CONTRACT_BINARY, ['serve'], {stdio:['pipe','pipe','pipe']});
+// Peer fixtures need the loopback HTTPS CardDAV peer. Only the runner that
+// was given --carddav-peer starts it; every other run skips exactly those
+// cases and says so, because the binary it holds has no synthetic keyring
+// to answer them with.
+const peerMode = process.env.CONTRACT_CARDDAV_PEER === '1';
+let peer = null, peerPort = 0;
+// One line of the peer's JSON-lines protocol, awaited.
+function peerLine() {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('CardDAV peer timed out')), 15000);
+    const onData = chunk => {
+      const line = chunk.toString();
+      if (line.includes('\n')) {
+        clearTimeout(timer);
+        peer.stdout.removeListener('data', onData);
+        resolve(JSON.parse(line));
+      }
+    };
+    peer.stdout.once('data', onData);
+    peer.once('exit', () => { clearTimeout(timer); reject(new Error('CardDAV peer exited')); });
+  });
+}
+async function peerCommand(value) {
+  peer.stdin.write(JSON.stringify(value) + '\n');
+  return await peerLine();
+}
+function stopPeer() {
+  if (!peer) return;
+  try { peer.stdin.write('{"stop":true}\n'); } catch (_) {}
+  peer.kill('SIGKILL');
+  peer = null;
+}
+let child = null;
 let buffer = '', state = null, serial = 0, finished = false;
 const pending = new Map();
 const tested = new Set();
-function fail(error) { console.error(error.stack || error); child.kill('SIGKILL'); process.exit(1); }
-child.on('error', fail);
-child.on('exit', code => { if (!finished) fail(new Error('Backend exited before contract completed: ' + code)); });
-// Stderr is consumed, bounded and never printed: errors must not dump mail data.
-let stderrBytes = 0;
-child.stderr.on('data', chunk => { stderrBytes += chunk.length; if (stderrBytes > 1048576) fail(new Error('Excessive backend stderr')); });
-child.stdout.setEncoding('utf8');
-child.stdout.on('data', chunk => {
-  try {
-    buffer += chunk;
-    let newline;
-    while ((newline = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
-      const decoded = Chunks.decode(state, line); state = decoded.state;
-      assert.ok(!decoded.error, 'production chunk decoder accepts frame');
-      if (decoded.line === null) continue;
-      if (Wire.notificationValue(decoded.value)) continue;
-      const reply = Wire.responseValue(decoded.value);
-      assert.ok(reply && pending.has(reply.id), 'production response codec and request correlation');
-      const entry = pending.get(reply.id); pending.delete(reply.id); clearTimeout(entry.timer);
-      entry.resolve(reply);
-    }
-    assert.ok(buffer.length < 1048576, 'bounded unfinished frame');
-  } catch (error) { fail(error); }
-});
+function fail(error) { console.error(error.stack || error); stopPeer(); if (child) child.kill('SIGKILL'); process.exit(1); }
+function attachBackend(child) {
+  child.on('error', fail);
+  child.on('exit', code => { if (!finished) fail(new Error('Backend exited before contract completed: ' + code)); });
+  // Stderr is consumed, bounded and never printed: errors must not dump mail data.
+  let stderrBytes = 0;
+  child.stderr.on('data', chunk => { stderrBytes += chunk.length; if (stderrBytes > 1048576) fail(new Error('Excessive backend stderr')); });
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    try {
+      buffer += chunk;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+        const decoded = Chunks.decode(state, line); state = decoded.state;
+        assert.ok(!decoded.error, 'production chunk decoder accepts frame');
+        if (decoded.line === null) continue;
+        if (Wire.notificationValue(decoded.value)) continue;
+        const reply = Wire.responseValue(decoded.value);
+        assert.ok(reply && pending.has(reply.id), 'production response codec and request correlation');
+        const entry = pending.get(reply.id); pending.delete(reply.id); clearTimeout(entry.timer);
+        entry.resolve(reply);
+      }
+      assert.ok(buffer.length < 1048576, 'bounded unfinished frame');
+    } catch (error) { fail(error); }
+  });
+}
 async function call(method, params = {}, errorCode = null, advertised = true) {
   assert.equal(contract.methods.includes(method), advertised, 'method inventory: ' + method);
   if (advertised) tested.add(method);
@@ -111,6 +146,18 @@ function safeDocument(value) {
   assert.ok(value && typeof value === 'object');
   assert.ok(!JSON.stringify(value).includes('forbiddenScript'));
 }
+// The fixture origin names the peer by a reserved invalid TLD; the real
+// loopback origin and the source id the backend derives from it are
+// substituted here, using the same derivation the QML settings use.
+const PEER_ORIGIN_PLACEHOLDER = 'https://carddav-peer.invalid';
+function peerParams(fixture) {
+  const origin = 'https://127.0.0.1:' + peerPort;
+  const params = JSON.parse(JSON.stringify(fixture.params).split(PEER_ORIGIN_PLACEHOLDER).join(origin));
+  const id = CarddavSources.deriveId(origin + '/dav/', 'synthetic@example.org');
+  if (params.source) params.source.id = id;
+  if (params.sourceId === 'carddav-peer-source-id') params.sourceId = id;
+  return params;
+}
 function storageSnapshot(directory = process.env.HOME) {
   const snapshot = {};
   function visit(path) {
@@ -123,6 +170,25 @@ function storageSnapshot(directory = process.env.HOME) {
   return snapshot;
 }
 (async () => {
+  if (peerMode) {
+    peer = spawn(process.env.CONTRACT_CARDDAV_PYTHON || 'python3',
+      [process.env.CONTRACT_ROOT + '/src/carddav/tls_test.py'],
+      {stdio:['pipe','pipe','ignore']});
+    peer.stdout.setEncoding('utf8');
+    const reported = await peerLine();
+    peerPort = reported.port;
+    // The peer's disposable certificate is trusted only for this run, through
+    // the same native-root path production uses; the synthetic keyring file
+    // answers the credential the fixture feature looks for. Neither exists in
+    // a production build.
+    process.env.SSL_CERT_FILE = reported.certificate;
+    const credentials = path.join(process.env.HOME, 'carddav-credentials');
+    fs.writeFileSync(credentials, 'synthetic\n', {mode: 0o600});
+    process.env.OMAMAIL_INTEGRATION_CREDENTIAL_FILE = credentials;
+    await peerCommand({serve: true});
+  }
+  child = spawn(process.env.CONTRACT_BINARY, ['serve'], {stdio:['pipe','pipe','pipe']});
+  attachBackend(child);
   const info = await call('system.info');
   assert.equal(info.name, 'omamail');
   assert.equal(info.protocol, contract.protocolVersion);
@@ -152,6 +218,23 @@ function storageSnapshot(directory = process.env.HOME) {
   function at(value, path) { return path ? path.split('.').reduce((v, key) => v === undefined || v === null ? undefined : v[key], value) : value; }
   assert.ok(Array.isArray(contract.contractCases) && contract.contractCases.length);
   for (const fixture of contract.contractCases) {
+    if (fixture.peer === 'carddav') {
+      if (!peerMode) { console.log('skipping peer fixture (no --carddav-peer): ' + fixture.name); continue; }
+      if (fixture.name === 'CardDAV refresh reports a book the server failed')
+        peerCommand({faults: {'/dav/directory/': 503}});
+      if (fixture.name === 'CardDAV refresh reports a snapshot it could not persist') {
+        // A private cache path the storage boundary refuses — here a symlinked
+        // carddav directory, which O_NOFOLLOW never opens — is a local
+        // condition that leaves a complete answer unpersisted. A plain
+        // permission change cannot model it: the private path repair resets
+        // its directories to 0700 before writing.
+        const carddavCache = path.join(process.env.HOME, 'cache/omamail/carddav');
+        fs.mkdirSync(carddavCache, {recursive: true, mode: 0o700});
+        fs.renameSync(carddavCache, carddavCache + '.real');
+        fs.symlinkSync('carddav.real', carddavCache);
+      }
+    }
+    const params = fixture.peer === 'carddav' ? peerParams(fixture) : fixture.params;
     if (fixture.name === 'AI transcript pages preserve native session identity') {
       // Match agent::storage::Store, including macOS where XDG_STATE_HOME
       // is unset. Never seed a relative "undefined/" tree in the fixture home.
@@ -186,7 +269,16 @@ function storageSnapshot(directory = process.env.HOME) {
     const before = noWrites ? storageSnapshot() : null;
     if (fixture.name === 'AI recovery preserves app-owned quote metadata')
       fixture.params.expectedRevision = (await call('compose.recoveryRead', {})).revision;
-    const value = await call(fixture.method, fixture.params, fixture.errorCode === undefined ? null : fixture.errorCode);
+    const value = await call(fixture.method, params, fixture.errorCode === undefined ? null : fixture.errorCode);
+    if (fixture.peer === 'carddav') {
+      if (fixture.name === 'CardDAV refresh reports a snapshot it could not persist') {
+        const carddavCache = path.join(process.env.HOME, 'cache/omamail/carddav');
+        fs.rmSync(carddavCache);
+        fs.renameSync(carddavCache + '.real', carddavCache);
+      }
+      if (fixture.name === 'CardDAV refresh reports a book the server failed')
+        await peerCommand({faults: {}});
+    }
     if (noWrites) assert.deepEqual(storageSnapshot(), before, fixture.name + ': no storage or credential effects');
     if (emptyRegistry) fs.writeFileSync(registryPath, registryBefore);
     for (const [path, expected] of Object.entries(fixture.equals || {})) {
@@ -206,7 +298,8 @@ function storageSnapshot(directory = process.env.HOME) {
 
   await call('message.parse', {raw:17}, -32602);
   const providers = await call('providers.snapshot');
-  for (const id of ['gmail','outlook','hey','jmap','imap']) {
+  // The pinned release has no m365 provider; its rules are unreleased.
+  for (const id of ['gmail','outlook','hey','jmap','imap'].concat(released ? [] : ['m365'])) {
     assert.ok(providers[id] && providers[id].queries && providers[id].capabilities);
     assert.equal(typeof providers[id].nativeSync, 'boolean');
   }
@@ -255,6 +348,7 @@ function storageSnapshot(directory = process.env.HOME) {
   finished = true;
   child.stdin.end();
   child.kill('SIGTERM');
+  stopPeer();
 })().catch(fail);
 """
 
@@ -267,9 +361,12 @@ def main():
                         help='check only the released API, as the pinned published binary speaks it')
     parser.add_argument('--standalone', action='store_true',
                         help='check standalone capabilities, including native agents on Linux/macOS')
+    parser.add_argument('--carddav-peer', action='store_true',
+                        help='also exercise the peer-gated CardDAV success fixtures against a loopback HTTPS peer '
+                             '(requires a debug binary built with --features integration-test-credentials)')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
-    contract = json.loads((ROOT / 'backend-api.json').read_text())
+    contract = json.loads((ROOT / 'backend-api.json').read_text(encoding='utf-8'))
     if (type(contract.get('apiVersion')) is not int or contract['apiVersion'] < 1
             or type(contract.get('protocolVersion')) is not int
             or not isinstance(contract.get('methods'), list)
@@ -313,7 +410,9 @@ def main():
                    CONTRACT_ROOT=str(ROOT), CONTRACT_BINARY=str(binary),
                    CONTRACT_VERSION=args.expected_version or '',
                    CONTRACT_RELEASED='1' if args.released else '',
-                   CONTRACT_STANDALONE='1' if args.standalone else '')
+                   CONTRACT_STANDALONE='1' if args.standalone else '',
+                   CONTRACT_CARDDAV_PEER='1' if args.carddav_peer else '',
+                   CONTRACT_CARDDAV_PYTHON=sys.executable)
         runtime_root.mkdir(parents=True, mode=0o700)
         registry.parent.mkdir(parents=True)
         if os.name != 'nt':
@@ -324,8 +423,12 @@ def main():
             {'email': 'contract@example.org'},
             {'provider': 'imap', 'email': 'sender@example.org',
              'imap': {'username': 'sender@example.org'}},
+            {'provider': 'imap', 'email': 'named@example.org', 'senderName': 'Jane Example',
+             'imap': {'username': 'named@example.org'}},
             {'provider': 'hey', 'email': 'sender@example.org'},
-            {'provider': 'outlook', 'email': 'sender@example.org'}]
+            {'provider': 'outlook', 'email': 'sender@example.org'},
+            {'provider': 'm365', 'email': 'sender@example.org',
+             'clientId': '00000000-1111-2222-3333-444444444444'}]
         registry.write_text(json.dumps({'version': 1, 'activeId': 'contract@example.org',
                                         'accounts': accounts}))
         registry.chmod(0o600)

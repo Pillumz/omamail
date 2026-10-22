@@ -5,6 +5,7 @@ import "../calendar/Calendar.js" as Calendar
 
 Item {
   id: root
+  readonly property string timeFormat: Qt.locale().timeFormat(Locale.ShortFormat)
 
   required property var controller
   required property var days
@@ -39,12 +40,27 @@ Item {
     }
   }
 
-  readonly property real timeRailWidth: Math.max(Style.space(52), allDayLabelMetrics.advanceWidth + Style.space(12))
+  readonly property real timeRailWidth: Math.max(Style.space(52),
+    allDayLabelMetrics.advanceWidth + Style.space(12),
+    midnightTimeMetrics.advanceWidth + Style.space(12),
+    noonTimeMetrics.advanceWidth + Style.space(12), nowLabel.implicitWidth + Style.space(12))
   TextMetrics {
     id: allDayLabelMetrics
     font.family: root.panelFontFamily
     font.pixelSize: Style.font.caption
     text: "all-day"
+  }
+  TextMetrics {
+    id: midnightTimeMetrics
+    font.family: root.panelFontFamily
+    font.pixelSize: Style.font.caption
+    text: Calendar.timeLabel(new Date(2000, 0, 1, 0, 59).getTime(), root.timeFormat)
+  }
+  TextMetrics {
+    id: noonTimeMetrics
+    font.family: root.panelFontFamily
+    font.pixelSize: Style.font.caption
+    text: Calendar.timeLabel(new Date(2000, 0, 1, 12, 59).getTime(), root.timeFormat)
   }
   readonly property var weekdayNames: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
   readonly property var hourRange: Calendar.weekHourRange(
@@ -248,8 +264,8 @@ Item {
             contentItem: Text {
               text: String(allDayEvent.eventData.summary || "Untitled event")
                 + (allDayEvent.eventData.start.allDay ? "" : "\n"
-                  + Qt.formatDateTime(new Date(allDayEvent.eventData.start.ms), "ddd d MMM, HH:mm")
-                  + " – " + Qt.formatDateTime(new Date(allDayEvent.eventData.end.ms), "ddd d MMM, HH:mm"))
+                  + Calendar.dateTimeLabel(allDayEvent.eventData.start.ms, "ddd d MMM", root.timeFormat, ", ")
+                  + " – " + Calendar.dateTimeLabel(allDayEvent.eventData.end.ms, "ddd d MMM", root.timeFormat, ", "))
               textFormat: Text.PlainText
               color: root.textColor
               font.family: root.panelFontFamily
@@ -298,7 +314,7 @@ Item {
             anchors.leftMargin: Style.space(4)
             anchors.top: parent.top
             anchors.topMargin: index === 0 ? Style.space(2) : -implicitHeight / 2
-            text: Calendar.two(root.firstHour + index) + ":00"
+            text: Calendar.timeLabel(new Date(2000, 0, 1, root.firstHour + index).getTime(), root.timeFormat)
             color: root.dimColor
             font.family: root.panelFontFamily
             font.pixelSize: Style.font.caption
@@ -332,7 +348,7 @@ Item {
         Text {
           id: nowLabel
           anchors.centerIn: parent
-          text: Calendar.timeLabel(root.nowMs)
+          text: Calendar.timeLabel(root.nowMs, root.timeFormat)
           color: root.backgroundColor
           font.family: root.panelFontFamily
           font.pixelSize: Style.font.caption
@@ -360,7 +376,7 @@ Item {
                 moved.end = { ms: root.pendingGesture.end }
                 return moved
               }), modelData)
-            readonly property var positionedEvents: Calendar.timedLayout(dayEvents, modelData)
+            readonly property var positionedEvents: Calendar.dayLanes(dayEvents, modelData, timeline.hourHeight)
             width: (timeline.width - root.timeRailWidth) / Math.max(1, root.days.length)
             height: parent.height
 
@@ -389,7 +405,7 @@ Item {
                   y: Calendar.eventTop({start:{ms:first}}, dayColumn.modelData, root.firstHour, timeline.hourHeight),
                   width: dayColumn.width,
                   height: (last - first) / 3600000 * timeline.hourHeight,
-                  label: Qt.formatTime(new Date(first), "HH:mm") + "–" + Qt.formatTime(new Date(last), "HH:mm") }
+                  label: Calendar.timeRangeLabel(first, last, root.timeFormat) }
               }
               onPressed: function(mouse) { initialY = mouse.y; selectTo(mouse.y) }
               onPositionChanged: function(mouse) { if (pressed) selectTo(mouse.y) }
@@ -408,14 +424,18 @@ Item {
               delegate: Rectangle {
                 id: eventBlock
                 required property var modelData
+                readonly property real laneWidth: Math.max(0, dayColumn.width - Style.space(6)) / Math.max(1, modelData.lanes)
+                readonly property bool narrow: width < Style.space(44)
                 readonly property color eventColor: calendarPalette.colorFor(
                   root.controller ? root.controller.colorKeyFor(eventData.sourceId) : "")
                 readonly property var eventData: modelData.event
                 readonly property bool canReschedule: !!root.controller
                   && typeof root.controller.rescheduleRefusal === "function"
                   && root.controller.rescheduleRefusal(eventData) === ""
-                x: Style.space(3) + modelData.column * (dayColumn.width - Style.space(6)) / modelData.columns
-                width: (dayColumn.width - Style.space(6)) / modelData.columns - Style.space(2)
+                x: Style.space(3) + modelData.lane * laneWidth
+                width: Math.max(0, modelData.span * laneWidth
+                  - (modelData.lane + modelData.span < modelData.lanes
+                    ? Math.min(Style.space(2), laneWidth / 4) : 0))
                 y: Calendar.eventTop(eventData, dayColumn.modelData,
                   root.firstHour, timeline.hourHeight)
                 height: Calendar.eventHeight(eventData, dayColumn.modelData, timeline.hourHeight)
@@ -445,16 +465,17 @@ Item {
                     font.family: root.panelFontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
-                    wrapMode: Text.WordWrap
-                    maximumLineCount: eventBlock.height > Style.space(70) ? 2 : 1
+                    wrapMode: eventBlock.narrow ? Text.NoWrap : Text.WordWrap
+                    maximumLineCount: eventBlock.narrow ? 1 : Math.max(1, Math.floor(
+                      (eventBlock.height - Style.space(10)) / (Style.font.caption * 1.35)) - 1)
                     elide: Text.ElideRight
                     textFormat: Text.PlainText
                   }
                   Text {
                     width: parent.width
-                    visible: eventBlock.height >= Style.space(38)
-                    text: Qt.formatTime(new Date(eventBlock.eventData.start.ms), "HH:mm")
-                      + (width >= timeMetrics.advanceWidth ? "–" + Qt.formatTime(new Date(eventBlock.eventData.end.ms), "HH:mm") : "")
+                    visible: !eventBlock.narrow && eventBlock.height >= Style.font.caption * 2.9 + Style.space(10)
+                    text: width >= timeMetrics.advanceWidth ? timeMetrics.text
+                      : Calendar.timeLabel(eventBlock.eventData.start.ms, root.timeFormat)
                     elide: Text.ElideRight
                     color: root.dimColor
                     font.family: root.panelFontFamily
@@ -464,7 +485,7 @@ Item {
                       id: timeMetrics
                       font.family: root.panelFontFamily
                       font.pixelSize: Style.font.caption
-                      text: "00:00–00:00"
+                      text: Calendar.timeRangeLabel(eventBlock.eventData.start.ms, eventBlock.eventData.end.ms, root.timeFormat)
                     }
                   }
                 }
@@ -504,7 +525,7 @@ Item {
                     root.dragPreview = { x: root.timeRailWidth + (edge === "" ? column : initialColumn) * dayColumn.width,
                       y: Calendar.eventTop(previewEvent, previewDay, root.firstHour, timeline.hourHeight),
                       width: dayColumn.width, height: Calendar.eventHeight(previewEvent, previewDay, timeline.hourHeight),
-                      label: Qt.formatTime(new Date(proposed.start), "HH:mm") + "–" + Qt.formatTime(new Date(proposed.end), "HH:mm") }
+                      label: Calendar.timeRangeLabel(proposed.start, proposed.end, root.timeFormat) }
                   }
                   onReleased: {
                     root.dragPreview = null
@@ -539,12 +560,12 @@ Item {
                   visible: eventBlock.canReschedule && (eventMouse.containsMouse || eventMouse.pressed)
                 }
                 ToolTip {
+                  objectName: "calendar-event-tooltip"
                   visible: eventMouse.containsMouse && !eventMouse.pressed
                   delay: 500
                   contentItem: Text {
                     text: String(eventBlock.eventData.summary || "Untitled event") + "\n"
-                      + Qt.formatTime(new Date(eventBlock.eventData.start.ms), "HH:mm") + "–"
-                      + Qt.formatTime(new Date(eventBlock.eventData.end.ms), "HH:mm")
+                      + Calendar.timeRangeLabel(eventBlock.eventData.start.ms, eventBlock.eventData.end.ms, root.timeFormat)
                     textFormat: Text.PlainText
                     color: root.textColor
                     font.family: root.panelFontFamily
@@ -613,8 +634,10 @@ Item {
       Text {
         anchors.top: parent.top
         anchors.left: parent.left
+        anchors.right: parent.right
         anchors.margins: Style.space(5)
         text: root.dragPreview ? root.dragPreview.label || "" : ""
+        elide: Text.ElideRight
         textFormat: Text.PlainText
         color: root.textColor
         font.family: root.panelFontFamily

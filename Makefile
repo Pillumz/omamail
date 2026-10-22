@@ -1,18 +1,22 @@
 QMLLINT := /usr/lib/qt6/bin/qmllint
 .DEFAULT_GOAL := test
-QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryController.qml \
+QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryController.qml ui/compose/PendingCompose.qml \
 	ui/tests/compatibility/tst_published_agent.qml \
+	ui/tests/qml/tst_unified_batch.qml ui/tests/qml/tst_clipboard_arguments.qml \
+	ui/tests/qml/tst_reader_subject_menu.qml ui/tests/qml/tst_drafts_refresh.qml ui/tests/qml/tst_account_hosts.qml \
 	ui/backend/Backend.qml ui/backend/Runtime.qml ui/diagnostics/Diagnostics.qml \
 	ui/components/BackendSetup.qml ui/components/OmamailLogo.qml \
-	ui/account/MailAccount.qml ui/account/BackendSync.qml ui/account/SendQueue.qml ui/account/Intents.qml ui/account/BatchAction.qml ui/account/Rsvp.qml ui/account/LabelActions.qml ui/account/Unsubscribe.qml ui/account/NewMailNotification.qml \
+	ui/account/MailAccount.qml ui/account/BackendSync.qml ui/account/SendQueue.qml ui/account/DraftList.qml ui/account/Intents.qml ui/account/BatchAction.qml ui/account/UnifiedBatchAction.qml ui/account/UnifiedBatchSelection.qml ui/account/Rsvp.qml ui/account/LabelActions.qml ui/account/Unsubscribe.qml ui/account/NewMailNotification.qml \
 	ui/cache/CacheStore.qml ui/cache/BodyCache.qml \
 	ui/providers/AuthManager.qml ui/providers/GmailApiClient.qml \
 	ui/providers/OutlookAuth.qml \
+	ui/providers/M365Auth.qml ui/providers/M365Client.qml \
 	ui/providers/ImapAuth.qml ui/providers/ImapClient.qml \
 	ui/providers/HeyAuth.qml ui/providers/HeyClient.qml \
 	ui/providers/JmapAuth.qml ui/providers/JmapClient.qml ui/providers/JmapPush.qml \
 	ui/components/ImapSetupPage.qml \
 	ui/components/OutlookSetupPage.qml \
+	ui/components/M365SetupPage.qml \
 	ui/components/JmapSetupPage.qml \
 	ui/components/HeySetupPage.qml \
 	ui/components/ProviderPicker.qml \
@@ -41,6 +45,7 @@ QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryContr
 	ui/components/InviteCard.qml \
 	ui/components/SwitcherSearch.qml \
 	ui/components/AccountNameField.qml \
+	ui/components/SenderNameField.qml \
 	ui/components/ReaderBlankSlate.qml \
 	ui/components/ReaderSkeleton.qml \
 	ui/components/ComposeView.qml \
@@ -56,13 +61,14 @@ QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryContr
 	ui/components/LabelMenu.qml \
 	ui/components/LabelMovePicker.qml \
 	ui/components/NamePrompt.qml \
-	ui/components/AddressMenu.qml ui/components/TextMenu.qml \
+	ui/components/AddressMenu.qml ui/components/TextMenu.qml ui/components/SubjectMenu.qml \
 	ui/components/ComposeAgent.qml \
 	ui/agent/AgentRunner.qml ui/agent/AgentContext.qml \
 	ui/agent/EventSuggester.qml ui/components/EventSuggestionCard.qml \
 	ui/components/AccountRemovalDialog.qml \
 	ui/components/ComposeExitDialog.qml \
 	ui/components/BackBar.qml \
+	ui/components/MouseBack.qml \
 	ui/components/SettingsPage.qml ui/components/AiSettings.qml \
 	ui/components/SettingsSidebar.qml \
 	ui/components/CalendarSettings.qml \
@@ -71,8 +77,10 @@ QML_FILES := ui/Service.qml ui/BarWidget.qml ui/App.qml ui/compose/RecoveryContr
 	ui/components/CalendarPalette.qml \
 	ui/components/ConfirmDeleteDialog.qml \
 	ui/components/SetupPage.qml \
+	ui/components/SetupPages.qml \
 	ui/components/ShortcutHelp.qml \
 	ui/calendar/CalendarController.qml ui/calendar/CalendarCache.qml ui/calendar/CalendarReminders.qml ui/calendar/CalendarReminderInbox.qml \
+	ui/contacts/CarddavController.qml ui/components/ContactsSettings.qml \
 	ui/components/CalendarView.qml \
 	ui/components/WeekCalendarView.qml \
 	ui/components/WindowMoveArea.qml \
@@ -118,6 +126,7 @@ test-js:
 	node app/tests/test_shell_theme.js
 	node ui/tests/test_bar_bridge.js
 	node ui/tests/test_backend_wire.js
+	node ui/tests/test_backend_plain.js
 	node ui/tests/test_backend_queue.js
 	node ui/tests/test_backend_compatibility.js
 	node ui/tests/test_backend_runtime.js
@@ -140,11 +149,13 @@ test-js:
 	node ui/tests/test_gmail_api.js
 	node ui/tests/test_message.js
 	node ui/tests/test_calendar.js
+	node ui/tests/test_calendar_time.js
 	node ui/tests/test_calendar_cache.js
 	node ui/tests/test_calendar_feed.js
 	node ui/tests/test_calendar_sources.js
 	node ui/tests/test_calendar_reminders.js
 	node ui/tests/test_calendar_palette.js
+	node ui/tests/test_carddav_sources.js
 	node ui/tests/test_bar_preview.js
 	node ui/tests/test_unsubscribe.js
 	node ui/tests/test_mailto.js
@@ -164,6 +175,7 @@ test-js:
 	node ui/tests/test_aliases.js
 	node ui/tests/test_menu.js
 	node ui/tests/test_provider.js
+	node ui/tests/test_m365.js
 	node ui/tests/test_imap.js
 	node ui/tests/test_jmap.js
 	node ui/tests/test_jmap_threads.js
@@ -191,6 +203,7 @@ test-shell-portable:
 	python3 tests/test_contacts.py
 	python3 tests/test_qml_names.py
 	python3 tests/test_qml_text_format.py
+	python3 tests/test_clipboard.py
 	bash tests/test_source.sh
 	bash tests/test_service_source.sh
 	bash tests/test_config_store.sh
@@ -251,6 +264,7 @@ test-qml:
 	python3 tests/run_qml_native.py "$(QMLTESTRUNNER)" -input ui/tests/qml
 	python3 tests/test_outlook_http.py "$(QMLTESTRUNNER)"
 	python3 tests/test_sidebar_text.py "$(QMLTESTRUNNER)"
+	python3 tests/test_tooltip_text.py "$(QMLTESTRUNNER)"
 	QMLTESTRUNNER="$(QMLTESTRUNNER)" cargo test --locked --lib message::html::tests::native_output_cannot_trigger_qt_resource_requests -- --ignored
 
 test-app-qml:

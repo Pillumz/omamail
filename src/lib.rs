@@ -7,6 +7,7 @@ pub mod auth;
 pub mod backend;
 pub mod cache;
 pub mod calendar;
+pub mod carddav;
 pub mod cli;
 pub mod compose;
 pub mod contacts;
