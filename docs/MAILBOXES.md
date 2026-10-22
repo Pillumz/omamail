@@ -104,6 +104,18 @@ server is set.
 
 The sent copy is filed by Omamail rather than left to the server: a message handed to SMTP submission lands nowhere on its own. It goes to the server's own Sent folder, named by the server rather than guessed, and arrives already marked read; a server that reports no Sent folder holds no copy, and the status row says so. One thing worth knowing: a Gmail account read over IMAP has Google file its own copy of anything sent through Gmail's SMTP, so those accounts hold two.
 
+## CardDAV address books
+
+Open **Settings → Contacts → Connect a CardDAV address book...** to add a company directory or personal address book. Enter the provider's HTTPS CardDAV server URL, username and password or app password. These are separate from your mailbox sign-in; Omamail does not reuse its saved password automatically. Passwords go into the system keyring, not the address-book configuration.
+
+Choose the sending mailbox that should receive these suggestions, or **All accounts** if you want them everywhere. Omamail discovers the available books; disable any you do not want. If your provider gives you a specific address-book URL, enter it in the optional field; it must use the same HTTPS server and port as the server URL. Shared books may live outside your personal address-book directory.
+
+Contacts appear in To/Cc/Bcc suggestions, the contacts picker and calendar guests for the linked account, alongside existing local contacts. Omamail only reads CardDAV: it cannot edit or delete contacts on the server. It loads saved contacts at startup, refreshes enabled sources, and offers **Refresh** for later changes; typing a recipient does not make network requests. A failed refresh keeps the last complete contacts and shows an error. Disabling a source stops its suggestions without deleting the server's book.
+
+CardDAV requires backend API 9 or newer. The pinned upstream 0.11.1 backend does not provide it; this fork's explicit source-built installation does. If Settings says the backend needs an update, follow the [fork installation instructions](../README.md#omarchy-plugin).
+
+## Remove Omamail
+
 If you enabled the optional CLI link, first run
 `python3 scripts/backend-runtime.py disable-cli` from the plugin directory.
 Omarchy has no verified uninstall hook to remove that external link for you.
