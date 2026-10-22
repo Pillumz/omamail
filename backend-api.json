@@ -1606,6 +1606,133 @@
       "equals": {
         "forgotten": true
       }
+    },
+    {
+      "name": "CardDAV discovery returns the directory's address books",
+      "method": "carddav.discover",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        }
+      },
+      "equals": {
+        "books.length": 2,
+        "books.0.name": "Personal contacts",
+        "books.1.name": "Справочник компании"
+      },
+      "types": {
+        "books.0.href": "string",
+        "books.1.href": "string"
+      }
+    },
+    {
+      "name": "CardDAV refresh stores complete books",
+      "method": "carddav.refresh",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        },
+        "books": [
+          {
+            "href": "https://carddav-peer.invalid/dav/personal/"
+          },
+          {
+            "href": "https://carddav-peer.invalid/dav/directory/"
+          }
+        ]
+      },
+      "equals": {
+        "stored": true,
+        "errors.length": 0,
+        "books.length": 2,
+        "books.0.contacts.0.name": "Иван Петров",
+        "books.0.contacts.0.email": "ivan.petrov@example.org",
+        "books.0.contacts.length": 4,
+        "books.1.contacts.length": 4,
+        "books.1.contacts.0.email": "elena.volkova@example.org"
+      }
+    },
+    {
+      "name": "CardDAV snapshot reads the stored contacts",
+      "method": "carddav.snapshot",
+      "peer": "carddav",
+      "params": {
+        "sourceId": "carddav-peer-source-id"
+      },
+      "equals": {
+        "books.length": 2,
+        "books.0.contacts.0.name": "Иван Петров",
+        "books.1.contacts.0.email": "elena.volkova@example.org"
+      }
+    },
+    {
+      "name": "CardDAV refresh reports a book the server failed",
+      "method": "carddav.refresh",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        },
+        "books": [
+          {
+            "href": "https://carddav-peer.invalid/dav/personal/"
+          },
+          {
+            "href": "https://carddav-peer.invalid/dav/directory/"
+          }
+        ]
+      },
+      "equals": {
+        "stored": true,
+        "books.length": 1,
+        "books.0.contacts.length": 4,
+        "errors.length": 1,
+        "errors.0.error": "carddav_request_failed"
+      }
+    },
+    {
+      "name": "CardDAV snapshot keeps a failed book's last complete contacts",
+      "method": "carddav.snapshot",
+      "peer": "carddav",
+      "params": {
+        "sourceId": "carddav-peer-source-id"
+      },
+      "equals": {
+        "books.length": 2,
+        "books.0.contacts.0.email": "elena.volkova@example.org",
+        "books.0.contacts.length": 4,
+        "books.1.contacts.0.email": "ivan.petrov@example.org"
+      }
+    },
+    {
+      "name": "CardDAV refresh reports a snapshot it could not persist",
+      "method": "carddav.refresh",
+      "peer": "carddav",
+      "params": {
+        "source": {
+          "id": "carddav-peer-source-id",
+          "url": "https://carddav-peer.invalid/dav/",
+          "username": "synthetic@example.org"
+        },
+        "books": [
+          {
+            "href": "https://carddav-peer.invalid/dav/personal/"
+          }
+        ]
+      },
+      "equals": {
+        "stored": false,
+        "books.length": 1,
+        "books.0.contacts.length": 4
+      }
     }
   ],
   "unreleased": {
@@ -1625,7 +1752,13 @@
       "CardDAV refresh pins every book href to the source origin",
       "CardDAV snapshot rejects a foreign source identity",
       "CardDAV snapshot reads an absent store as empty",
-      "CardDAV forget is idempotent"
+      "CardDAV forget is idempotent",
+      "CardDAV discovery returns the directory's address books",
+      "CardDAV refresh stores complete books",
+      "CardDAV snapshot reads the stored contacts",
+      "CardDAV refresh reports a book the server failed",
+      "CardDAV snapshot keeps a failed book's last complete contacts",
+      "CardDAV refresh reports a snapshot it could not persist"
     ]
   }
 }
