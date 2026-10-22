@@ -470,7 +470,7 @@ async fn a_slow_server_that_answers_every_command_still_pages() {
                 let ids: Vec<u32> = if set == "1:*" {
                     (1..=9000).collect()
                 } else {
-                    set.split(',').map(|id| id.parse().unwrap()).collect()
+                    expand(set)
                 };
                 for uid in &ids {
                     response.push_str(&if dated {
