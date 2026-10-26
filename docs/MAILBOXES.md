@@ -112,7 +112,7 @@ Choose the sending mailbox that should receive these suggestions, or **All accou
 
 Contacts appear in To/Cc/Bcc suggestions, the contacts picker and calendar guests for the linked account, alongside existing local contacts. Omamail only reads CardDAV: it cannot edit or delete contacts on the server. It loads saved contacts at startup, refreshes enabled sources, and offers **Refresh** for later changes; typing a recipient does not make network requests. A failed refresh keeps the last complete contacts and shows an error. Disabling a source stops its suggestions without deleting the server's book. **Remove** deletes Omamail's saved password, cached contacts and source configuration, never the server's contacts; it needs a connected, compatible backend. If cleanup fails, the row stays visible with an error so you can retry.
 
-CardDAV requires backend API 9 or newer. The pinned upstream 0.11.1 backend does not provide it; this fork's explicit source-built installation does. If Settings says the backend needs an update, follow the [fork installation instructions](../README.md#omarchy-plugin).
+CardDAV requires backend API 9 or newer. The pinned upstream 0.11.2 backend does not provide it; this fork's explicit source-built installation does. If Settings says the backend needs an update, follow the [fork installation instructions](../README.md#omarchy-plugin).
 
 ## Remove Omamail
 

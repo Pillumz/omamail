@@ -51,17 +51,11 @@ async fn search_pages_survive_process_exit_and_deletion_of_the_cursor_message() 
                     data.push_str("\r\n");
                 } else if let Some(rest) = cmd.strip_prefix("O1 UID FETCH ") {
                     let (set, fields) = rest.split_once(' ').unwrap();
-                    // A valid sequence set mixes single UIDs and ranges.
                     let wanted: Vec<u32> = set
                         .split(',')
-                        .flat_map(|token| match token.split_once(':') {
-                            Some((first, last)) => {
-                                first.parse::<u32>().unwrap()..=last.parse::<u32>().unwrap()
-                            }
-                            None => {
-                                let uid = token.parse::<u32>().unwrap();
-                                uid..=uid
-                            }
+                        .flat_map(|part| {
+                            let (first, last) = part.split_once(':').unwrap_or((part, part));
+                            first.parse::<u32>().unwrap()..=last.parse().unwrap()
                         })
                         .collect();
                     if fields == "(UID)\r\n" {

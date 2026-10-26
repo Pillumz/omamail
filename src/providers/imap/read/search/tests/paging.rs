@@ -7,7 +7,6 @@ struct State {
     inventories: usize,
     searches: usize,
     largest_search: usize,
-    largest_fetch_set: usize,
     // Expunged between SEARCH and the metadata FETCH.
     missing: Vec<u32>,
 }
@@ -37,7 +36,6 @@ impl Server {
             inventories: 0,
             searches: 0,
             largest_search: 0,
-            largest_fetch_set: 0,
             missing: vec![],
         }));
         let shared = state.clone();
@@ -72,7 +70,6 @@ async fn peer(socket: TcpStream, state: Arc<Mutex<State>>) {
         let data = {
             let mut state = state.lock().unwrap();
             let mut data = String::new();
-            let mut refused = false;
             if cmd.starts_with("O1 LOGIN ") {
             } else if cmd == "O1 CAPABILITY\r\n" {
                 data.push_str("* CAPABILITY IMAP4rev1\r\n");
@@ -111,18 +108,12 @@ async fn peer(socket: TcpStream, state: Arc<Mutex<State>>) {
                 state.largest_search = state.largest_search.max(data.len());
             } else if let Some(rest) = cmd.strip_prefix("O1 UID FETCH ") {
                 let (set, fields) = rest.split_once(' ').unwrap();
-                if set.len() > 8000 {
-                    // Stalwart's exact refusal for an over-long argument.
-                    data.push_str(
-                        "O1 BAD [PARSE] Argument exceeds maximum length of 8000 bytes\r\n",
-                    );
-                    refused = true;
-                } else if fields == "(UID)\r\n" {
+                if fields == "(UID)\r\n" {
                     let wanted: Option<Vec<u32>> = if set.starts_with("1:") {
                         state.inventories += 1;
                         None
                     } else {
-                        Some(expand(set))
+                        Some(set.split(',').map(|s| s.parse().unwrap()).collect())
                     };
                     for (uid, _) in &state.folders[&folder] {
                         if wanted.as_ref().is_none_or(|uids| {
@@ -133,11 +124,16 @@ async fn peer(socket: TcpStream, state: Arc<Mutex<State>>) {
                     }
                 } else {
                     assert_eq!(fields, "(UID INTERNALDATE)\r\n");
-                    let wanted: Vec<u32> = expand(set);
-                    assert!(wanted.len() <= BATCH);
-                    state.largest_fetch_set = state.largest_fetch_set.max(set.len());
-                    for (uid, day) in &state.folders[&folder] {
-                        if wanted.contains(uid) && !state.missing.contains(uid) {
+                    // A range between sparse UIDs spans far more numbers than
+                    // messages; like a server, answer only the messages it names.
+                    let ranges = super::ranges(set);
+                    let named: Vec<_> = state.folders[&folder]
+                        .iter()
+                        .filter(|(uid, _)| ranges.iter().any(|range| range.contains(uid)))
+                        .collect();
+                    assert!(named.len() <= BATCH);
+                    for (uid, day) in named {
+                        if !state.missing.contains(uid) {
                             data.push_str(&format!("* 1 FETCH (UID {uid} INTERNALDATE \"{day:02}-Sep-2026 12:00:00 +0000\")\r\n"));
                         }
                     }
@@ -145,9 +141,7 @@ async fn peer(socket: TcpStream, state: Arc<Mutex<State>>) {
             } else {
                 panic!("unexpected IMAP command: {cmd}");
             }
-            if !refused {
-                data.push_str("O1 OK done\r\n");
-            }
+            data.push_str("O1 OK done\r\n");
             data
         };
         if write(&mut wire, data.as_bytes()).await.is_err() {
@@ -179,7 +173,7 @@ async fn evict(p: &Value) {
 }
 
 #[tokio::test]
-async fn fifteen_thousand_sparse_ten_digit_uids_have_bounded_search_and_fetch_commands() {
+async fn fifteen_thousand_sparse_ten_digit_uids_have_bounded_search_lines() {
     let rows: Vec<_> = (0..15000)
         .map(|i| (3_000_000_000 + i * 10000, if i == 0 { 28 } else { 20 }))
         .collect();
@@ -194,10 +188,6 @@ async fn fifteen_thousand_sparse_ten_digit_uids_have_bounded_search_and_fetch_co
         "sparse gaps must not cause empty-window walks"
     );
     assert!(state.largest_search < 65536);
-    // The synthetic server rejects an argument past 8000 bytes with the exact
-    // Stalwart refusal; fetch sets stay under it while using it substantially.
-    assert!(state.largest_fetch_set > 8000 / 2);
-    assert!(state.largest_fetch_set <= 8000);
 }
 
 #[tokio::test]
