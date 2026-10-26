@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(omamail-app VERSION 0.11.1 LANGUAGES CXX)
+project(omamail-app VERSION 0.11.2 LANGUAGES CXX)
 
 # The standalone host bundles a backend built from this checkout, so the exact
 # API revision it requires is this checkout's own contract, just as the plugin's

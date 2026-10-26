@@ -38,7 +38,7 @@ to make the override available when the shell constructs the plugin, restarting
 the shell with that environment when needed. This is not a second Quickshell
 application. Rust mail migration remains incomplete; see [BACKEND.md](BACKEND.md).
 
-The fork's CI verifies the inherited `0.10.8` and `0.11.1` published APIs against the original upstream releases, explicitly for those historical pins only. Source-built fork changes still pass the full built-backend gate; later published pins must come from this fork. Publishing future releases additionally requires configuring `RELEASE_TOKEN` and bootstrapping the release workflow's historical baseline; local builds and this trial do not depend on either.
+The fork's CI verifies the inherited `0.10.8`, `0.11.1` and `0.11.2` published APIs against the original upstream releases, explicitly for those historical pins only. Source-built fork changes still pass the full built-backend gate; later published pins must come from this fork. Publishing future releases additionally requires configuring `RELEASE_TOKEN` and bootstrapping the release workflow's historical baseline; local builds and this trial do not depend on either.
 
 ### Forcing a clean reconnect
 
