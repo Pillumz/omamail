@@ -57,5 +57,6 @@ Start with [CONTRIBUTING.md — Review](CONTRIBUTING.md#review) for scope decisi
 
 - `make publish VERSION=X.Y.Z` prepares one versioned release PR from clean, synchronized main; without VERSION it increments the patch. Never push main directly. Release CI publishes and verifies immutable assets before updating the binary pin and folding API metadata on that same branch. Tags alone do not publish. Follow `docs/BACKEND-RUNTIME.md` for release and recovery details.
 - Preserve `scripts/release-notes.sh` aggregation of PR release-note sections; GitHub-generated notes are not a substitute.
-- Run `make validate` after QML or behavior changes. `make test` includes Rust, JavaScript, source regressions and QML tests. Inspect the Makefile for the current targets.
+- Screenshots and recordings are optional for all PRs in this fork; use synthetic or redacted data if attaching captures. See [the contributor guide](CONTRIBUTING.md#if-you-touched-the-interface).
+- On this fork, run checks suited to the changed workflows and report what passed, failed, or was skipped. `make validate` is an optional broad local check. Failures already present on the base and unavailable local checks are reported and assessed separately from regressions. Required CI, security and backend release gates still apply.
 - QML tests and `qmllint` are local gates using the installed Qt; release CI uses `make test-js test-shell`. Unresolved `qs.Ui` / `qs.Commons` lint warnings are expected; the exit code is the gate.

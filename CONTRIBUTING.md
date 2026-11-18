@@ -77,11 +77,9 @@ make validate    # node tests, source regressions, QML tests, qmllint, manifest
 
 `make app-build` needs Rust, CMake 3.21 or newer, and Qt 6.5 or newer. On Linux, the Qt DBus development component is also required. It builds the backend with `--no-default-features --features standalone`, so the resulting process has no AI worker surface. `make app-run` sets only the development resource and bundled-backend overrides needed to run that build.
 
-`make validate` needs `node`, `python3`, Qt 6 QML test tooling (`qt6-declarative` on Arch, `qt6-declarative-dev-tools` and `qml6-module-qttest` on Debian and Ubuntu) and the `omarchy` CLI. It has to be green before you open the pull request, and green on your machine — nothing in CI runs it for you. Standalone changes must also pass `make test-app-qml` locally.
+Use the Makefile targets that exercise the changed behavior. `make validate` is available for broader local checks; an all-green result from it is optional for every PR in this fork. It needs `node`, `python3`, Qt 6 QML test tooling and the `omarchy` CLI. For standalone and release changes, see the required gates in [Backend runtime](docs/BACKEND-RUNTIME.md).
 
 Linux verification satisfies contributor and reviewer platform-testing requirements. Testing on macOS or Windows is optional; reviewers must not request it as a prerequisite or block a PR because those local or hands-on results are absent. Required automated CI still needs to pass, including its native platform jobs described in [Backend runtime](docs/BACKEND-RUNTIME.md#standalone-security-gates). Report the platform actually tested without claiming verification on others.
-
-Contributors are not required to test anything by hand. Use reproducible automated checks and generated visual evidence appropriate to the changed behavior. If verification is missing, the review comment must identify the specific behavior, expected result and automated test or evidence to add, so the contributor's agent can address it.
 
 ## How the change gets made
 
@@ -89,7 +87,7 @@ In this order, and none of the steps fold into each other:
 
 1. **Implement it.** One change, finished — not a sketch with the hard half
    left for review to find.
-2. **Verify the changed behavior.** Run `make validate`, confirm any bug regression fails against the unfixed behavior, and use automated interaction or integration checks where needed. Follow [testing standards](docs/TESTING.md) to decide whether to extend an existing test, add one or rely on existing coverage. Record results for the submitted revision; rerun affected checks after review fixes.
+2. **Check the change.** Run targeted checks on the revision you send. Where practical, exercise the affected workflow or verify a bug against the unfixed version. Report gaps, skipped checks, and failures with enough context to distinguish existing problems from regressions. Follow the [testing standards](docs/TESTING.md).
 3. **Have a fresh agent review it.** Open a *new* agent — an empty context,
    nothing of the conversation that wrote the code — hand it the diff and
    `AGENTS.md`, and ask it to find what is wrong. The agent that wrote a patch
@@ -122,11 +120,8 @@ Verify that the runner discovers the new test, or register it in the Makefile, C
   that the change did not require. [AGENTS.md's UI section](AGENTS.md#ui)
   gives the same rules where they are specific to this
   codebase, and `tests/test_source.sh` enforces the part of them that grep can.
-- **Automate verification of the changed interaction.** Exercise the applicable mouse, keyboard, focus and state transitions with QML or host integration checks. Use generated captures to inspect layout in the relevant light/dark themes and compact/wide sizes. Component harnesses using production components are valid evidence for the behavior they exercise; request broader integration coverage only for a concrete gap they leave. Hands-on testing is optional.
-- **Every UI change requires clear, detailed visual evidence.** Attach labeled before-and-after screenshots of every changed view and relevant state, captured at matching window dimensions, theme, and scale. Explain what changed and identify the platforms, themes, and sizes tested. Screenshots must be legible enough to evaluate the actual layout, labels, and states; update them whenever the UI changes.
-- **Multi-stage or stateful workflows also require a detailed screen recording, including bug fixes to existing workflows.** Show the complete path from entry to result, including the relevant keyboard and mouse interactions and loading, empty, error, cancellation, or recovery states. Show observable side effects and retry invariants rather than only the final status: for an invitation-calendar change, record invitation import, update of the same existing event, and a failed save followed by calendar-only retry, with evidence that retry sends no second RSVP. Add steps or timestamps and expected results so maintainers can assess the interaction without installing or running the app. Screenshots alone are not sufficient for these changes.
-- Identify the capture's host (Omarchy plugin, standalone app, or component/test harness), platform, UI commit, theme, dimensions and scale, plus the backend version, API revision and source commit when built locally. For mocked backends, identify the fixture contract/API revision and explicitly say that no real backend/provider ran. Label synthetic component recordings and any fixture-only controls or side-effect counters; distinguish UI-flow evidence from real backend/provider verification. Automated screenshots and recordings are acceptable. Refresh affected recordings after interaction changes and verify uploaded attachments are accessible and decodable before requesting review or re-review.
-- Use synthetic or redacted data in screenshots and recordings. Upload the evidence as PR attachments rather than committing it to the repository. Visual evidence complements regression tests; neither requires a contributor to operate the app by hand.
+- Describe what changes for the user and check relevant interactions. Use an isolated app session when layout or visual behavior matters; see [the development runtime instructions](docs/BACKEND-RUNTIME.md). Report what you actually exercised.
+- Screenshots and recordings are optional for every PR in this fork. Share them when they help explain the change. Use synthetic or redacted data and attach the files to the PR.
 
 ## The pull request
 
@@ -137,11 +132,7 @@ Keep runtime assets, source, tests and maintained documentation in the tree, and
 **One change per pull request.** A refactor travelling with a bug fix makes the
 fix impossible to review and impossible to revert on its own.
 
-**The title is the commit message.** Merges here are squashes, so the title you
-write becomes the line in `git log` with `(#123)` appended, and it is read by
-people looking for when something changed. Write a sentence in the imperative,
-sentence case, naming what is different afterwards — no `fix:` or `feat:`
-prefix:
+**The title is the commit message.** Squash ordinary PRs; use a merge commit for upstream syncs to preserve their shared history. Write an imperative, sentence-case title naming what changes — no `fix:` or `feat:` prefix:
 
 ```
 Fix MIME decoding for bodies declared as UTF-8
@@ -163,25 +154,14 @@ Then:
 ````markdown
 ## Verification
 
-`make validate` green. `tests/test_message.js` covers the 8-bit body with an
-accent in it, and fails with the change reverted. An automated rendering
-fixture confirms the French subject displays correctly.
+`node tests/test_message.js` passed. The accented-subject case failed with the change reverted. A synthetic message also displayed correctly in the reader.
 
 ## Release Notes
 
 - Accented characters in message bodies no longer render as mojibake.
 ````
 
-`## Verification` names the commands you ran and what they said. Measured, not
-inferred: "should work" is not verification, and neither is a test you did not
-watch fail. Four things belong in it, and a reviewer will ask for any that is
-missing:
-
-- `make validate`, and that it was green on the commit you are sending.
-- For a bug fix, the new or extended regression and its observed failure against the unfixed behavior. Otherwise, name the applicable existing checks; do not add a test merely to fill this item.
-- The relevant automated behavior checks and visual evidence, with provenance required under [If you touched the interface](#if-you-touched-the-interface).
-- That a fresh agent reviewed the diff, and what it found. "Nothing" is an
-  answer; not having asked is not.
+`## Verification` records the checks and workflows actually exercised, their results, and material gaps. Say which failures also occur on the base. Include the bug reproduction or regression check where applicable, and record the independent review and what it found.
 
 `## Release Notes` is lifted verbatim by `scripts/release-notes.sh` into the
 GitHub release for the version that ships it — the heading is matched exactly,
@@ -200,18 +180,15 @@ Judge product and interaction design independently of implementation quality: ne
 
 Routine improvements within existing functionality do not need a separate product-direction decision. This includes focused bug fixes, small workflow refinements, wording, performance, text selection/copy, focus recovery and minor layout or spacing tradeoffs. Several reasonable implementation or UI choices do not by themselves make a change fundamental. Review the actual behavior, conflicts, regressions and applicable evidence before recommending approval; identify concrete gaps in automated or visual evidence rather than demanding hands-on testing.
 
-Large new capabilities or workflows, new providers, substantial architecture changes and integrations beyond the project boundary require explicit product confirmation from a maintainer. Tag @huacnlee or @klaudworks with the focused decision question; either may confirm the direction. Resolve explicit maintainer objections before proceeding. Scope acceptance never waives correctness, security or the verification requirements above.
+Large new capabilities or workflows, new providers, substantial architecture changes and integrations beyond the project boundary require explicit product confirmation from a maintainer. Ask the fork owner the focused decision question. Resolve explicit maintainer objections before proceeding. Scope acceptance never waives correctness, security or the verification requirements above.
 
 Keep review summaries easy to act on, using **Status → Summary → Findings → Next step**. State whether this is a request for missing information or a completed review. Explain the user-visible change, who benefits and the recommendation, then give the actual findings in plain language. The next step names who should act, what they should do and what result or evidence to report. Prefer a short paragraph or a few bullets; group related requests and link evidence when it helps resolve a finding. Omit passed CI/check summaries already visible in the PR. Keep detailed investigation in logs or linked code rather than repeating file inventories, every reviewed criterion, speculative alternatives or caveats that do not affect the decision. State the affected security result as required by [AGENTS.md](AGENTS.md#security), and retain limitations that materially affect the recommendation. These priorities also apply when recommending deferral or skipping a review.
 
 Make missing-verification requests actionable by the contributor's agent: name the scenario, the observable assertion or capture needed and where the result should be reported. For example, ask for an automated selection → copy → Escape regression that asserts clipboard contents and restored focus, rather than asking someone to test the app manually. Inspect existing coverage first and request only the uncovered behavior.
 
-An approval is not permission to merge: maintainers make the final merge decision, and automated reviewers must never merge.
+The fork owner makes the final merge decision. An agent may merge a particular PR through GitHub after the owner explicitly authorizes it.
 
-Answer a review comment by changing the code or by saying why the change would
-be wrong, and re-run `make validate` after every round — a fix made under
-review is a change like any other. Both answers are useful; silence and a
-force-push are not.
+Answer a review comment by changing the code or explaining why the change would be wrong. Re-run the affected checks after fixes.
 
 If an agent wrote the patch, you are still its author: read the diff before you
 send it, and be able to explain any line in it.

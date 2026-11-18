@@ -8,9 +8,7 @@
 
 <!-- Follow CONTRIBUTING.md#the-pull-request. -->
 
-## Visual evidence
-
-<!-- Follow CONTRIBUTING.md#if-you-touched-the-interface. Link the required evidence here, or explain why it is not applicable. -->
+<!-- Optional: include synthetic or redacted visual evidence when it helps explain the change. -->
 
 ## Release Notes
 
