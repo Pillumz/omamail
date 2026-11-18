@@ -2,13 +2,15 @@
 
 Open Settings and choose Add mailbox, then select your provider.
 
-**Gmail** signs in with Google directly. Google issues Gmail API access per
-project, so this route needs an OAuth client you create once — the setup page
-walks through it. In exchange it gets labels, conversations, Gmail's own search
+**Gmail** signs in with Google directly. Released builds include an OAuth
+client, so signing in needs no setup. A development build ships none: create
+your own client once and the setup page walks through it. Your own client
+always takes precedence over the included one, for your own quota and consent
+screen. In exchange Gmail gets labels, conversations, Gmail's own search
 syntax, and a "report spam" that Google actually learns from.
 
-Calendar rides the same sign-in but is a separate API: enable **Google
-Calendar API** in the Cloud project too, alongside Gmail API, from
+Calendar rides the same sign-in but is a separate API. With your own client,
+enable **Google Calendar API** in the Cloud project too, alongside Gmail API, from
 [the API library](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
 or `gcloud services enable calendar-json.googleapis.com`. Skipping this step
 does not surface as a missing-permission message — the calendar panel just
@@ -112,7 +114,7 @@ Choose the sending mailbox that should receive these suggestions, or **All accou
 
 Contacts appear in To/Cc/Bcc suggestions, the contacts picker and calendar guests for the linked account, alongside existing local contacts. Omamail only reads CardDAV: it cannot edit or delete contacts on the server. It loads saved contacts at startup, refreshes enabled sources, and offers **Refresh** for later changes; typing a recipient does not make network requests. A failed refresh keeps the last complete contacts and shows an error. Disabling a source stops its suggestions without deleting the server's book. **Remove** deletes Omamail's saved password, cached contacts and source configuration, never the server's contacts; it needs a connected, compatible backend. If cleanup fails, the row stays visible with an error so you can retry.
 
-CardDAV requires backend API 9 or newer. The pinned upstream 0.11.2 backend does not provide it; this fork's explicit source-built installation does. If Settings says the backend needs an update, follow the [fork installation instructions](../README.md#omarchy-plugin).
+CardDAV requires backend API 10 or newer in this checkout. The pinned upstream 0.11.3 backend does not provide it; this fork's explicit source-built installation does. If Settings says the backend needs an update, follow the [fork installation instructions](../README.md#omarchy-plugin).
 
 ## Remove Omamail
 

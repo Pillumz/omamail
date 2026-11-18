@@ -97,7 +97,7 @@ Column {
     SectionHeading { text: "CONTACTS" }
     Text {
       width: parent.width
-      text: "Recipient suggestions come from this device. Connect a CardDAV address book — a company directory, say — to suggest its contacts while composing. Address books are read-only here; nothing is written back to the server."
+      text: "Suggestions can come from this device and from Gmail accounts with Google Contacts access. Connect a read-only CardDAV address book to add a company directory or personal contacts."
       color: root.dimColor
       font.family: root.panelFontFamily
       font.pixelSize: Style.font.caption

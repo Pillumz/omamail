@@ -1,26 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(omamail-app VERSION 0.11.2 LANGUAGES CXX)
+project(omamail-app VERSION 0.11.3 LANGUAGES CXX)
 
-# The standalone host bundles a backend built from this checkout, so the exact
-# API revision it requires is this checkout's own contract, just as the plugin's
-# runtime handshake takes its required revision from its pinned backend-version.
-# Neither accepts a different revision than the one it ships with.
-set(OMAMAIL_BACKEND_API_CONTRACT "${CMAKE_CURRENT_SOURCE_DIR}/../backend-api.json")
-if(NOT EXISTS "${OMAMAIL_BACKEND_API_CONTRACT}")
-  message(FATAL_ERROR "Missing backend API contract: ${OMAMAIL_BACKEND_API_CONTRACT}")
-endif()
-file(READ "${OMAMAIL_BACKEND_API_CONTRACT}" OMAMAIL_BACKEND_API_JSON)
-string(JSON OMAMAIL_API_VERSION ERROR_VARIABLE OMAMAIL_API_VERSION_ERROR
-  GET "${OMAMAIL_BACKEND_API_JSON}" apiVersion)
-if(NOT OMAMAIL_API_VERSION_ERROR STREQUAL "NOTFOUND")
-  message(FATAL_ERROR
-    "Invalid backend API contract ${OMAMAIL_BACKEND_API_CONTRACT}: ${OMAMAIL_API_VERSION_ERROR}")
-endif()
-if(NOT OMAMAIL_API_VERSION MATCHES "^[1-9][0-9]*$")
-  message(FATAL_ERROR
-    "backend-api.json apiVersion must be a positive integer, got '${OMAMAIL_API_VERSION}'")
-endif()
+# The smoke-test handshake follows the same contract as the bundled backend.
+set(OMAMAIL_API_CONTRACT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../backend-api.json")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${OMAMAIL_API_CONTRACT_PATH}")
+file(READ "${OMAMAIL_API_CONTRACT_PATH}" OMAMAIL_API_CONTRACT)
+string(JSON OMAMAIL_BACKEND_API_VERSION GET "${OMAMAIL_API_CONTRACT}" apiVersion)
 
 if(WIN32)
   enable_language(RC)
@@ -87,7 +73,7 @@ endif()
 target_include_directories(omamail_native PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(omamail_native PUBLIC
   OMAMAIL_APP_VERSION="${PROJECT_VERSION}"
-  OMAMAIL_API_VERSION=${OMAMAIL_API_VERSION}
+  OMAMAIL_BACKEND_API_VERSION=${OMAMAIL_BACKEND_API_VERSION}
   OMAMAIL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
 )
 if(DEFINED OMAMAIL_BACKEND AND NOT OMAMAIL_BACKEND STREQUAL "")

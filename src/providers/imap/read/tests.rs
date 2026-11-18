@@ -26,6 +26,8 @@ fn list_handles_literals_noselect_special_use_and_modified_utf7() {
     let value = folders_value(&boxes);
     assert_eq!(value["labels"].as_array().unwrap().len(), 2);
     assert_eq!(value["labels"][1]["name"], "日本語");
+    assert_eq!(value["labels"][1]["id"], "&ZeVnLIqe-");
+    assert_eq!(value["labels"][1]["rawName"], "&ZeVnLIqe-");
 }
 #[test]
 fn date_pages_are_descending_unique_with_uid_tiebreaker() {
@@ -421,4 +423,29 @@ async fn a_command_that_is_never_answered_ends_the_call() {
         Err("request_timed_out")
     );
     peer.abort();
+}
+
+#[test]
+fn a_full_read_carries_a_message_larger_than_the_generic_parse_limit() {
+    // ~17 MiB of attachment, base64-encoded to ~23 MiB: over MAX_MESSAGE, under LIMIT.
+    let attachment = "QUFB".repeat(17 * 1024 * 1024 / 3);
+    let raw = format!(
+        "Subject: big\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=big.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n{attachment}\r\n--b--\r\n"
+    );
+    assert!(raw.len() > crate::message::MAX_MESSAGE && raw.len() < LIMIT);
+    let data = [
+        format!(
+            "* 1 FETCH (UID 7 RFC822.SIZE {} BODY[] {{{}}}\r\n",
+            raw.len(),
+            raw.len()
+        )
+        .as_bytes(),
+        raw.as_bytes(),
+        b")\r\nO1 OK done\r\n",
+    ]
+    .concat();
+    let boxes = parse_folders(b"* LIST (\\Inbox) \"/\" INBOX\r\n").unwrap();
+    let parsed = parse_messages(&data, "INBOX", true, &boxes).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["id"], "7:INBOX");
 }
