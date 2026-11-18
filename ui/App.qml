@@ -1048,6 +1048,9 @@ Item {
     if (id === "calendarPreviousPeriod") return calendarView.movePeriod(-1)
     if (id === "calendarNextPeriod") return calendarView.movePeriod(1)
     if (id === "calendarToday") return calendarView.goToday()
+    if (id === "calendarZoomIn") return calendarView.zoomHours(1)
+    if (id === "calendarZoomOut") return calendarView.zoomHours(-1)
+    if (id === "calendarZoomReset") return calendarView.zoomHours(0)
     if (id === "calendarWeek") return calendarView.setView("week")
     if (id === "calendarDay") return calendarView.setView("day")
     if (id === "calendarAgenda") return calendarView.setView("agenda")
@@ -1456,6 +1459,7 @@ Item {
         composing: root.composing,
         eventComposing: eventComposer.opened,
         guestSuggestions: eventComposer.guestSuggestionsOpen,
+        eventDescriptionFocused: eventComposer.descriptionFocused,
         searchFocused: searchBar.fieldFocused,
         calendarVisible: root.calendarVisible,
         currentView: root.currentView,
@@ -1475,7 +1479,7 @@ Item {
           if (composeAgent.opened && !composeAgent.activeFocus) composeAgent.takeFocus()
           else if (agentPrompt.opened && !agentPrompt.activeFocus) agentPrompt.takeFocus()
         }
-        else if (keyContext === "eventCompose" || keyContext === "eventGuests") {
+        else if (keyContext === "eventCompose" || keyContext === "eventGuests" || keyContext === "eventDescription") {
           if (!focusWithin(eventComposer)) eventComposer.takeFocus()
         }
         else if (keyContext === "compose") {
@@ -1776,6 +1780,9 @@ Item {
             root.backToList()
           }
           onFolderToggled: function(path) { root.service.toggleFolder(path) }
+          dropAllowed: function(k, id) { return rowDrag.wouldAct(k, id) }
+          onLabelDropped: function(id) { rowDrag.dropOnLabel(id) }
+          onMailboxDropped: function(k) { rowDrag.dropOnMailbox(k) }
           onLabelMenuRequested: function(labelId, path, sceneX, sceneY) {
             root.openLabelMenu(labelId, path, sceneX, sceneY)
           }
@@ -1896,6 +1903,9 @@ Item {
               onMessageActivated: function(id) { root.openMessage(id) }
               onAgentRequested: function(id, sceneX, sceneY) { root.openAgentFromRow(id, sceneX, sceneY) }
               onRowActionRequested: function(id, action) { root.actFromRow(id, action) }
+              onRowDragStarted: function(id, x, y) { rowDrag.start(id, x, y) }
+              onRowDragMoved: function(x, y) { rowDrag.move(x, y) }
+              onRowDragEnded: rowDrag.end()
               onCheckToggled: function(id) { root.toggleCheck(id) }
               onCheckRangeRequested: function(id) { root.checkRange(id) }
               onMenuRequested: function(id, sceneX, sceneY, ids) {
@@ -2072,6 +2082,7 @@ Item {
 
         CalendarEventComposer {
           id: eventComposer
+          onKeyPressed: function(event) { keyRouter.routeKeyEvent(event) }
           anchors.fill: parent
           z: 20
           visible: opened && !root.showPage
@@ -2118,7 +2129,12 @@ Item {
             // follows it.
             onDetailOpenChanged: {
               if (detailOpen) { if (root.page !== "calendarDetail") root.pushEntry("calendarDetail", {}) }
-              else if (root.page === "calendarDetail") { root.navUntouched = false; root.nav = Nav.pop(root.nav) }
+              else {
+                if (root.page === "calendarDetail") { root.navUntouched = false; root.nav = Nav.pop(root.nav) }
+                // Closing a preview keeps the calendar context, so restore its
+                // focus explicitly rather than leaving hidden text selected.
+                if (focusScope.focusWithin(calendarView)) Qt.callLater(focusScope.applyContextFocus)
+              }
             }
             onCreateAt: function(startMs) { eventComposer.beginAt(startMs) }
             onCopyRequested: function(text) { root.copyText(text) }
@@ -2293,7 +2309,6 @@ Item {
               width: settingsArea.pageWidth
               service: root.service
               calendarController: root.service ? root.service.calendarController : null
-              carddavController: root.service ? root.service.carddavController : null
               textColor: root.foreground
               dimColor: root.dim
               accentColor: root.accent
@@ -2706,7 +2721,11 @@ Item {
               proposalComposer: compose
               onApplyProposalRequested: function(envelope, parentId) {
                 compose.beginProposal(envelope, parentId)
-                Qt.callLater(function() { root.composeAgent.open() })
+                // Keep the conversation alongside the draft, with typing in the editor.
+                Qt.callLater(function() {
+                  focusScope.applyContextFocus()
+                  root.composeAgent.open(false)
+                })
               }
               onOpenedChanged: if (opened) root.composeAgent.close()
               objectName: "agent-prompt"
@@ -2810,6 +2829,17 @@ Item {
         onSubmitted: function(kind, subject, text) { root.labelNamed(kind, subject, text, namePrompt.accountId) }
       }
 
+      RowDrag {
+        id: rowDrag
+        service: root.service
+        checkedIds: root.checkedIds
+        textColor: root.foreground
+        accentColor: root.accent
+        popupBackgroundColor: root.popupBackground
+        panelFontFamily: root.fontFamily
+        act: root.actFromRow
+      }
+
       LabelMovePicker {
         id: labelMovePicker
         objectName: "label-move-picker"
@@ -2851,6 +2881,9 @@ Item {
         panelFontFamily: root.fontFamily
         labels: root.service ? root.service.labels : []
         currentLabelId: root.service ? String(root.service.rawLabelId || "") : ""
+        folders: root.service
+          ? !Provider.can(root.service.providerId, "labels") && Provider.can(root.service.providerId, "move")
+          : false
         onLabelChosen: function(labelId) {
           root.actOnCursor("label:" + labelId, root.labelPickerOnlyCursor)
         }

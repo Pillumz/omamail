@@ -20,7 +20,6 @@ Column {
 
   required property var service
   required property var calendarController
-  required property var carddavController
   required property color textColor
   required property color dimColor
   required property color accentColor
@@ -1423,7 +1422,7 @@ Column {
     id: contactsSection
     width: parent.width
     service: root.service
-    controller: root.carddavController
+    controller: (root.service && root.service.carddavController) || null
     textColor: root.textColor
     dimColor: root.dimColor
     accentColor: root.accentColor

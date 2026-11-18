@@ -26,16 +26,19 @@ Rectangle {
   property string conferenceRequestId: ""
   property string originalGuestText: ""
   property bool advancedOptionsOpen: false
+  readonly property bool descriptionFocused: notesField.activeFocus
+  signal keyPressed(var event)
   readonly property var contactService: controller && controller.service ? controller.service : null
   // Guests complete from the calendar account's own book, so a directory
   // linked to another mailbox stays out of this event.
   readonly property var contactBook: {
     if (!contactService) return []
-    var accountId = chosenSource && chosenSource.accountId
-      ? String(chosenSource.accountId) : String(contactService.activeAccountId || "")
     var carddav = contactService.carddavController
-    if (carddav && typeof carddav.mergedForAccount === "function")
+    if (carddav && typeof carddav.mergedForAccount === "function") {
+      var accountId = chosenSource && chosenSource.accountId
+        ? String(chosenSource.accountId) : String(contactService.activeAccountId || "")
       return carddav.mergedForAccount(accountId)
+    }
     return Array.isArray(contactService.recipientContacts) ? contactService.recipientContacts : []
   }
   property bool guestSuggestionsDismissed: false
@@ -61,12 +64,14 @@ Rectangle {
     ? controller.findSource(selectedSourceId) : null
   property string recurrenceFrequency: "WEEKLY"
   // Set while an existing event is being changed rather than a new one made.
-  // Calendar changes select a transfer destination; they are committed on Save.
+  // Calendar changes are committed immediately, independently of field edits.
   property var editingEvent: null
   property bool loadingSeries: false
   property bool transferring: false
   property bool transferNeedsRefresh: false
   property int editGeneration: 0
+  property string pendingCalendarId: ""
+  onEditGenerationChanged: moveSeriesDialog.close()
   // Google's options travel only through the API 6 backend; an older one
   // would save the event without them, so the controls are not offered.
   readonly property bool googleWrites: !!chosenSource && chosenSource.kind === "google"
@@ -126,10 +131,42 @@ Rectangle {
       composerFlick.contentY = Math.max(0, Math.min(top, bottom - composerFlick.height))
   }
 
+  function revealDescriptionCursor() {
+    if (!notesField.activeFocus) return
+    var cursor = notesField.cursorRectangle
+    var top = notesField.mapToItem(composerFlick.contentItem, cursor.x, cursor.y).y
+    var margin = Style.space(10)
+    if (top - margin < composerFlick.contentY)
+      composerFlick.contentY = Math.max(0, top - margin)
+    else if (top + cursor.height + margin > composerFlick.contentY + composerFlick.height)
+      composerFlick.contentY = top + cursor.height + margin - composerFlick.height
+  }
+
   component EditorField: TextField {
     id: input
     font.pixelSize: Style.font.bodySmall
     onActiveFocusChanged: if (activeFocus) Qt.callLater(root.revealField, input)
+  }
+
+  component StartField: EditorField {
+    id: input
+    // Keep the duration from before typing, including while the input is
+    // incomplete. Programmatic prefills never emit textEdited.
+    property real durationMs: 0
+    onActiveFocusChanged: {
+      if (!activeFocus) return
+      durationMs = !root.allDay && root.dateRange.ok
+        ? root.dateRange.endMs - root.dateRange.startMs : 0
+      Qt.callLater(root.revealField, input)
+    }
+    onTextEdited: {
+      if (root.allDay || durationMs <= 0) return
+      var start = Calendar.editorDateTime(dateField.text, startField.text)
+      if (!start) return
+      var end = new Date(start.getTime() + durationMs)
+      endDateField.text = root.localDate(end)
+      endField.text = root.localTime(end)
+    }
   }
 
   component EventOption: QQC.ComboBox {
@@ -411,6 +448,7 @@ Rectangle {
   }
 
   function close() {
+    moveSeriesDialog.close()
     opened = false
     editingEvent = null
     editingSourceId = ""
@@ -451,14 +489,44 @@ Rectangle {
   }
 
   function chooseCalendar(sourceId) {
-    if (transferring || transferNeedsRefresh || writePending || sourceId === selectedSourceId) return
+    if (loadingSeries || transferring || transferNeedsRefresh || writePending || sourceId === selectedSourceId) return
     if (!editing) { selectedSourceId = sourceId; return }
+    if (editingEvent.recurringEventId) {
+      pendingCalendarId = sourceId
+      moveSeriesDialog.open()
+      return
+    }
+    moveToCalendar(sourceId, editingEvent, false)
+  }
+
+  function moveEntireSeries() {
+    var destination = pendingCalendarId
+    moveSeriesDialog.close()
+    if (!destination || !opened || !editingEvent || !editingEvent.recurringEventId
+        || loadingSeries || transferring || writePending || transferNeedsRefresh) return
+    var generation = editGeneration
+    var source = chosenSource
+    loadingSeries = true
+    resultText.text = "Loading series"
+    controller.nativeRequest(source, "get", {eventId: editingEvent.recurringEventId}, function(result, error) {
+      if (generation !== root.editGeneration || !root.opened) return
+      root.loadingSeries = false
+      if (error) { resultText.text = error; return }
+      var payload = null
+      try { payload = JSON.parse(result.body) } catch (e) {}
+      var events = payload ? Calendar.eventsFromGoogle({items: [payload]}, source.id) : []
+      if (events.length !== 1) { resultText.text = "The series is no longer available"; return }
+      root.moveToCalendar(destination, events[0], true)
+    })
+  }
+
+  function moveToCalendar(sourceId, eventToMove, entireSeries) {
     var original = editingSourceId
     var generation = editGeneration
     selectedSourceId = sourceId
     transferring = true
     resultText.text = "Moving event"
-    controller.transferEvent(original, sourceId, editingEvent, function(event, error, moved) {
+    controller.transferEvent(original, sourceId, eventToMove, function(event, error, moved) {
       if (generation !== root.editGeneration || !root.opened) return
       root.transferring = false
       if (error) {
@@ -467,9 +535,10 @@ Rectangle {
         resultText.text = error
         return
       }
+      if (entireSeries) root.beginEdit(sourceId, event)
       root.editingEvent = event
       root.editingSourceId = sourceId
-      resultText.text = "Calendar changed"
+      resultText.text = entireSeries ? "Entire series moved" : "Calendar changed"
     })
   }
 
@@ -569,16 +638,22 @@ Rectangle {
         objectName: "event-calendar-selector"
         width: parent.width
         implicitHeight: Style.spacing.controlHeight
-        enabled: count > 0 && !root.writePending && !root.transferring && !root.transferNeedsRefresh
+        enabled: count > 0 && !root.writePending && !root.loadingSeries && !root.transferring && !root.transferNeedsRefresh
         model: Calendar.calendarChoiceRows(root.controller ? root.controller.writableSourceGroups : [],
           root.editing && root.controller && typeof root.controller.findSource === "function"
             ? root.controller.findSource(root.editingSourceId) : null, root.editingEvent)
-        currentIndex: {
+        function selectedIndex() {
           for (var i = 0; i < model.length; i++)
             if (String(model[i].source.id) === root.selectedSourceId) return i
           return -1
         }
-        onActivated: function(index) { root.chooseCalendar(String(model[index].source.id)) }
+        currentIndex: selectedIndex()
+        onActivated: function(index) {
+          root.chooseCalendar(String(model[index].source.id))
+          // ComboBox selects before activation; a pending confirmation must
+          // continue to display the event's actual calendar.
+          currentIndex = Qt.binding(function() { return calendarSelector.selectedIndex() })
+        }
         readonly property var choice: currentIndex >= 0 && currentIndex < model.length ? model[currentIndex] : null
         Accessible.name: "Calendar"
         leftPadding: Style.space(30)
@@ -718,15 +793,39 @@ Rectangle {
         width: parent.width
         spacing: Style.space(6)
         FieldLabel { text: "Description" }
-        EditorField {
+        QQC.TextArea {
           id: notesField
           objectName: "event-description-field"
           width: parent.width
-          foreground: root.textColor
-          accent: root.accentColor
+          // Grow with the document; the form owns scrolling, including keeping
+          // the caret visible in descriptions taller than the window.
+          height: Math.max(Style.space(96), contentHeight + topPadding + bottomPadding)
+          textFormat: TextEdit.PlainText
+          wrapMode: TextEdit.Wrap
+          selectByMouse: true
+          KeyNavigation.priority: KeyNavigation.BeforeItem
+          KeyNavigation.tab: dateField
+          KeyNavigation.backtab: titleField
+          color: root.textColor
+          selectionColor: root.accentColor
+          selectedTextColor: root.backgroundColor
+          placeholderTextColor: root.dimColor
           font.family: root.panelFontFamily
+          font.pixelSize: Style.font.bodySmall
+          padding: Style.space(10)
           placeholderText: "Add event details"
           Accessible.name: "Description"
+          Keys.onPressed: function(event) { root.keyPressed(event) }
+          onActiveFocusChanged: if (activeFocus) Qt.callLater(root.revealDescriptionCursor)
+          onCursorRectangleChanged: Qt.callLater(root.revealDescriptionCursor)
+          onHeightChanged: Qt.callLater(root.revealDescriptionCursor)
+          background: Rectangle {
+            color: Style.normalFillFor(root.textColor, root.accentColor)
+            border.width: Style.normalBorderWidth
+            border.color: notesField.activeFocus ? root.accentColor
+              : Style.normalBorderFor(root.textColor, root.accentColor)
+            radius: Style.cornerRadius
+          }
         }
       }
 
@@ -755,7 +854,7 @@ Rectangle {
       Row {
         width: parent.width
         spacing: Style.space(8)
-        EditorField {
+        StartField {
           id: dateField
           objectName: "event-start-date-field"
           width: parent.width - (startField.visible ? startField.width + parent.spacing : 0)
@@ -764,7 +863,7 @@ Rectangle {
           placeholderText: root.editingAllDay ? "First day (YYYY-MM-DD)" : "YYYY-MM-DD"
         }
 
-        EditorField {
+        StartField {
           id: startField
           objectName: "event-start-time-field"
           visible: !root.editingAllDay
@@ -1119,6 +1218,89 @@ Rectangle {
         foreground: root.dimColor
         fontFamily: root.panelFontFamily
         onClicked: root.close()
+      }
+    }
+  }
+
+  QQC.Popup {
+    id: moveSeriesDialog
+    objectName: "event-move-series-dialog"
+    anchors.centerIn: parent
+    width: Math.min(Style.space(420), parent.width - Style.space(32))
+    padding: Style.space(18)
+    modal: true
+    focus: true
+    closePolicy: QQC.Popup.CloseOnEscape
+    onOpened: moveSeriesCancel.forceActiveFocus()
+    onClosed: {
+      root.pendingCalendarId = ""
+      if (root.opened) calendarSelector.forceActiveFocus()
+    }
+    background: Rectangle {
+      radius: Style.cornerRadius
+      color: root.backgroundColor
+      border.width: 1
+      border.color: root.dimColor
+    }
+    contentItem: Column {
+      spacing: Style.space(14)
+      Keys.onPressed: function(event) {
+        if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return
+        event.accepted = true
+        if (moveSeriesConfirm.activeFocus) root.moveEntireSeries()
+        else moveSeriesDialog.close()
+      }
+      Text {
+        width: parent.width
+        text: "Move the entire series?"
+        textFormat: Text.PlainText
+        color: root.textColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.heading
+        font.bold: true
+        wrapMode: Text.Wrap
+      }
+      Text {
+        width: parent.width
+        text: {
+          var destination = root.controller ? root.controller.findSource(root.pendingCalendarId) : null
+          return "Google Calendar can only move the entire recurring series to "
+            + String(destination ? destination.name : "another calendar")
+            + ", not just this occurrence. The editor will open the entire series; unsaved changes to this occurrence will be discarded."
+        }
+        textFormat: Text.PlainText
+        color: root.dimColor
+        font.family: root.panelFontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.Wrap
+      }
+      Flow {
+        width: parent.width
+        spacing: Style.space(8)
+        Button {
+          id: moveSeriesCancel
+          objectName: "event-move-series-cancel"
+          text: "Cancel"
+          foreground: root.textColor
+          fontFamily: root.panelFontFamily
+          focusable: true
+          activeFocusOnTab: true
+          KeyNavigation.tab: moveSeriesConfirm
+          KeyNavigation.backtab: moveSeriesConfirm
+          onClicked: moveSeriesDialog.close()
+        }
+        Button {
+          id: moveSeriesConfirm
+          objectName: "event-move-series-confirm"
+          text: "Move entire series"
+          foreground: root.accentColor
+          fontFamily: root.panelFontFamily
+          focusable: true
+          activeFocusOnTab: true
+          KeyNavigation.tab: moveSeriesCancel
+          KeyNavigation.backtab: moveSeriesCancel
+          onClicked: root.moveEntireSeries()
+        }
       }
     }
   }

@@ -58,6 +58,36 @@ Item {
       backend.connected = false
       compare(service.backendCanNameSender, false)
     }
+    function test_remote_contact_requirements_are_fixed_at_api_10() {
+      var service = createTemporaryObject(factory, parent)
+      verify(service !== null)
+      var backend = service.backend
+      backend.launchEnabled = true
+      backend.connected = true
+      backend.protocolInfo = ({ apiVersion: 9 })
+      compare(service.backendCanSuggestGoogleContacts, false)
+      compare(service.backendCanCarddav, false, "published API 9 has no CardDAV")
+      backend.protocolInfo = ({ apiVersion: 10 })
+      compare(service.backendCanSuggestGoogleContacts, true)
+      compare(service.backendCanCarddav, true)
+      backend.latestApiVersion = 11
+      compare(service.backendCanSuggestGoogleContacts, true,
+        "a later API must not disable Google Contacts suggestions")
+      backend.connected = false
+      compare(service.backendCanSuggestGoogleContacts, false)
+    }
+    function test_contacts_loading_resets_when_the_backend_drops() {
+      var service = createTemporaryObject(factory, parent)
+      verify(service !== null)
+      var backend = service.backend
+      backend.launchEnabled = true
+      backend.connected = true
+      backend.protocolInfo = ({ apiVersion: 9 })
+      service.refreshRecipientContacts()
+      compare(service.contactsLoading, true)
+      backend.connected = false
+      compare(service.contactsLoading, false, "a dropped backend must not leave contacts loading")
+    }
     function test_calendar_requests_obey_the_connected_api() {
       var service = createTemporaryObject(factory, parent)
       verify(service !== null)

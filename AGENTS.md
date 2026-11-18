@@ -15,12 +15,15 @@ Read the relevant document before changing its area; these contain constraints t
 | Message HTML, images, direction and outgoing MIME | [docs/MESSAGE-RENDERING.md](docs/MESSAGE-RENDERING.md) |
 | Network requests, credentials, subprocesses and security reviews | [docs/SECURITY-BOUNDARIES.md](docs/SECURITY-BOUNDARIES.md) |
 | Backend APIs, binary pins and releases | [docs/BACKEND-RUNTIME.md](docs/BACKEND-RUNTIME.md) |
+| Adding, changing or reviewing tests | [docs/TESTING.md](docs/TESTING.md) |
+| Writing issue reports, PR descriptions, reviews or discussion comments | [CONTRIBUTING.md — Write for people](CONTRIBUTING.md#write-for-people) |
+| Before making a commit or creating, updating, reviewing or requesting review of a pull request, including review follow-ups | [CONTRIBUTING.md](CONTRIBUTING.md) — mandatory; the single source of truth for commit/PR guidelines and evidence requirements |
 
 ## Structure and boundaries
 
 - Group by module, not file type. Rust lives in `src/`, CLI handling in `src/cli/`, and dispatch in `src/backend/`. QML and its JavaScript live together under `ui/`. Rust unit tests live with their modules; UI tests live in `ui/tests/`; integration tests live in `tests/`.
 - Rust owns mail business logic and durable agent jobs. QML owns presentation and interaction state, communicating with the persistent backend over stdin/stdout rather than invoking CLI commands. See `docs/BACKEND.md` and `docs/ARCHITECTURE.md`.
-- QML JavaScript libraries start with `.pragma library` and use `var` and `function`, not `const`, `let`, arrows or template literals. Put testable presentation rules there. Tests load module paths, e.g. `load("cache/Cache.js")`; `ui/tests/load.js` resolves QML `.import` chains.
+- QML JavaScript libraries start with `.pragma library` and use `var` and `function`, not `const`, `let`, arrows or template literals. Put testable presentation rules there. Tests load module paths, e.g. `load("compose/Senders.js")`; `ui/tests/load.js` resolves QML `.import` chains.
 - A list or object received through a `var` signal argument (on Qt 6.12) or a delegate's `modelData` is a sequence or reference object, not a JavaScript array or object: `Array.isArray` says no and its keys come back sorted. A receiver that judges such a value, keeps it or writes to it takes `Plain.plain` (`ui/backend/Plain.js`) of it first; `ui/tests/qml/tst_signal_lists.qml` shows the pattern.
 - List new QML files in the Makefile's lint inputs and import other modules explicitly.
 - `Service.qml` is shell-constructed and must declare no required properties. The shell injects only `shell`, `manifest`, `pluginRegistry`, and `barWidgetRegistry`; settings arrive through the bar widget's `applySettings`.
@@ -48,21 +51,12 @@ Read the relevant document before changing its area; these contain constraints t
 
 ## Review priorities
 
-- PR review primarily decides whether a new or adjusted capability belongs in Omamail and whether its product and interaction design is appropriate. Begin each PR report by explaining what changes, the problem it aims to solve, and who benefits.
-- Assess necessity, fit with project goals, overlap with existing workflows, simpler alternatives, and interface and maintenance costs. Give a clear recommendation to introduce, defer, or leave out the change, with reasons; the maintainer owns the product decision.
-- Evaluate design independently of implementation quality: workflow, discoverability, defaults, information hierarchy, keyboard and focus behavior, consistency, and loading, empty, error and cancellation states. State when screenshots or hands-on evidence are missing rather than treating tests as design evidence.
-- Functional correctness, tests, performance and security support this product and design assessment and remain approval gates. Passing technical checks alone does not justify adding a capability. Explain the change and purpose for every PR, including passing and skipped PRs.
-
-## Repository and pull requests
-
-- Keep runtime assets, source, tests and maintained documentation in the tree. Tracked files must stay under 128 KiB. Keep planning notes and captures outside the tree. Screenshots and recordings are optional for all PRs in this fork; use synthetic or redacted data for any GitHub attachments.
-- Commit/PR titles name the concrete machinery and action. Use `Fix ` for bugs, `Add ` for features, otherwise an accurate imperative. Prefix AI changes with `ai: `, repository documentation with `docs: `, website work with `website: `, and build/CI/release/tooling maintenance with `chore: `. Choose one prefix from the primary outcome.
-- Reconcile the title and description with the complete final diff whenever scope changes. Describe shipped behavior, architectural reasons and verification actually performed. User-visible PRs include concise bullets under `## Release Notes`.
-- Markdown prose uses one source line per paragraph.
+Start with [CONTRIBUTING.md — Review](CONTRIBUTING.md#review) for scope decisions, review priorities and comment style. Use this file's task index to read only the domain guidance relevant to the change. Product, design and verification requirements belong in their source documents rather than being repeated in reviewer prompts.
 
 ## Releasing and verification
 
 - `make publish VERSION=X.Y.Z` prepares one versioned release PR from clean, synchronized main; without VERSION it increments the patch. Never push main directly. Release CI publishes and verifies immutable assets before updating the binary pin and folding API metadata on that same branch. Tags alone do not publish. Follow `docs/BACKEND-RUNTIME.md` for release and recovery details.
 - Preserve `scripts/release-notes.sh` aggregation of PR release-note sections; GitHub-generated notes are not a substitute.
+- Screenshots and recordings are optional for all PRs in this fork; use synthetic or redacted data if attaching captures. See [the contributor guide](CONTRIBUTING.md#if-you-touched-the-interface).
 - On this fork, run checks suited to the changed workflows and report what passed, failed, or was skipped. `make validate` is an optional broad local check. Failures already present on the base and unavailable local checks are reported and assessed separately from regressions. Required CI, security and backend release gates still apply.
 - QML tests and `qmllint` are local gates using the installed Qt; release CI uses `make test-js test-shell`. Unresolved `qs.Ui` / `qs.Commons` lint warnings are expected; the exit code is the gate.

@@ -23,7 +23,6 @@ Item {
 
     function call(method, params, callback) {
       mailService.backendCalls.push({ method: method, params: params })
-      if (method === "contacts.suggest") { callback(mailService.localResult, null); return }
       if (method === "carddav.discover") {
         if (mockBackend.holdDiscovers) { mockBackend.discoverReleases.push(callback); return }
         callback(mailService.discoverResult, mailService.discoverError)
@@ -61,7 +60,6 @@ Item {
     property var refreshResult: null
     property var refreshError: null
     property var snapshotResult: null
-    property var localResult: []
     property bool failConfigWrites: false
     property bool holdConfigWrites: false
     property var configWriteReleases: []
@@ -126,7 +124,6 @@ Item {
       mailService.refreshResult = null
       mailService.refreshError = null
       mailService.snapshotResult = null
-      mailService.localResult = []
       mailService.failConfigWrites = false
       mailService.holdConfigWrites = false
       mailService.configWriteReleases = []
@@ -141,7 +138,7 @@ Item {
       controller.cycleGeneration = 0
       controller.busy = false
       controller.busySourceId = ""
-      controller.localBook = []
+      controller.baseContacts = []
       removedSpy.clear()
       controller.loaded = true
       controller.startupStarted = true
@@ -401,23 +398,22 @@ Item {
         "the contacts are in use for this session either way")
     }
 
-    function test_the_local_book_merges_without_a_backend_feature_gate() {
-      mailService.localResult = [{ name: "Local", email: "local@example.org" }]
+    function test_older_backend_still_offers_base_contacts() {
+      controller.baseContacts = [{ name: "Local", email: "local@example.org" }]
       mailService.backendCanCarddav = false
       controller.start()
-      var calls = mailService.backendCalls.map(function(call) { return call.method })
-      compare(JSON.stringify(calls), JSON.stringify(["contacts.suggest"]),
-        "an old backend is asked only what it knows")
       var merged = controller.mergedForAccount("imap:work@example.com")
       compare(merged.length, 1)
       compare(merged[0].name, "Local")
       verify(!controller.connect(draft, "secret-1"),
         "connecting needs the CardDAV API")
+      compare(mailService.backendCalls.length, 0)
+      compare(mailService.credentialCalls.length, 0)
     }
 
     function test_local_and_remote_merge_for_compose() {
       connectWork()
-      controller.localBook = [{ name: "", email: "ivan@example.org" },
+      controller.baseContacts = [{ name: "", email: "ivan@example.org" },
         { name: "Nearby", email: "near@example.org" }]
       var merged = controller.mergedForAccount("imap:work@example.com")
       compare(merged.length, 2)
@@ -467,38 +463,6 @@ Item {
       compare(mailService.backendCalls.length, 0,
         "an absent-file answer after startup runs nothing")
       compare(controller.loaded, true)
-    }
-
-    function test_the_initial_config_answer_starts_the_pipeline_once() {
-      var view = configFileView()
-      verify(!!view)
-      mailService.localResult = [{ name: "Local", email: "local@example.org" }]
-      // Nothing has answered yet: the file's first answer — loaded or
-      // failed — is what starts the local book and the pipeline.
-      controller.store = CarddavSources.emptyStore()
-      controller.loaded = false
-      controller.startupStarted = false
-      view.loaded()
-      compare(controller.loaded, true)
-      compare(JSON.stringify(mailService.backendCalls.map(function(call) { return call.method })),
-        JSON.stringify(["contacts.suggest"]),
-        "the initial answer starts the one startup cycle")
-      // The answer that follows must not start another.
-      mailService.backendCalls = []
-      view.loaded()
-      view.loadFailed()
-      compare(mailService.backendCalls.length, 0)
-      // A first start whose file cannot be read still starts: the failed
-      // answer marks the store known and begins the same flow.
-      controller.loaded = false
-      controller.startupStarted = false
-      mailService.backendCalls = []
-      view.loadFailed()
-      compare(controller.loaded, true)
-      compare(JSON.stringify(mailService.backendCalls.map(function(call) { return call.method })),
-        JSON.stringify(["contacts.suggest"]),
-        "an absent config still permits the local/start flow")
-      compare(controller.mergedForAccount("imap:work@example.com").length, 1)
     }
 
     function test_ready_starts_one_cycle_and_refuses_a_second_trigger() {

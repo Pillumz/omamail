@@ -12,20 +12,8 @@ Item {
 
   required property var service
 
-  // The device's own book (Thunderbird/Betterbird profiles, the mail cache,
-  // local JSON/vCard files), read by the backend without modifying them.
-  // Nothing is copied into Omamail's settings or cache.
-  property var localBook: []
-  property bool contactsLoading: false
-
-  function refreshLocalContacts() {
-    if (contactsLoading || !service || !service.backend || !service.backend.ready) return
-    contactsLoading = true
-    service.backend.call("contacts.suggest", {}, function(result, error) {
-      root.contactsLoading = false
-      if (!error && Array.isArray(result)) root.localBook = result
-    })
-  }
+  // The service's local and Google suggestions are the base for this mailbox's CardDAV books.
+  property var baseContacts: []
 
   readonly property bool available: !!service && service.backendCanCarddav === true
   readonly property string configPath: service && typeof service.configPath === "function"
@@ -70,9 +58,7 @@ Item {
   }
 
   function mergedForAccount(accountId) {
-    var token = root.contactsRevision
-    var local = Array.isArray(root.localBook) ? root.localBook : []
-    return CarddavSources.mergeContacts(local, contactsForAccount(accountId))
+    return CarddavSources.mergeContacts(root.baseContacts, contactsForAccount(accountId))
   }
 
   function accountLabel(source) {
@@ -419,15 +405,14 @@ Item {
     })
   }
 
-  // Startup: the local book, every stored snapshot without network, then a
-  // refresh of the enabled sources one at a time. Nothing runs on a timer,
+  // Startup: every stored snapshot without network, then a refresh of the
+  // enabled sources one at a time. Nothing runs on a timer,
   // and one cycle is in flight at a time. `start()` is the single entry,
   // called by the first config answer and by a ready backend, whichever
   // comes last.
   function start() {
     if (!root.service || !root.service.backend || !root.service.backend.ready) return
     if (root.cycleRunning) return
-    if (root.loaded) root.refreshLocalContacts()
     if (!root.available || !root.loaded) return
     root.cycleRunning = true
     root.cyclePhase = "snapshots"
@@ -548,7 +533,6 @@ Item {
       root.cycleRunning = false
       root.cyclePhase = ""
       root.pendingQueue = []
-      root.contactsLoading = false
     }
   }
 }

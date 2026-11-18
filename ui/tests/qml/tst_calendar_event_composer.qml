@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtTest 1.3
 import "../../components" as Omamail
+import "../../keys/Keymap.js" as Keymap
 
 Item {
   width: 900
@@ -10,6 +11,7 @@ Item {
     id: contacts
     property var recipientContacts: []
     property var carddavController: null
+    property string activeAccountId: "other@example.test"
     property bool backendCanGoogleCalendars: true
     property int refreshCalls: 0
     function refreshRecipientContacts() { refreshCalls++ }
@@ -23,6 +25,13 @@ Item {
     property int updateCalls: 0
     property var createdFields: null
     property var transferCallback: null
+    property var seriesCallback: null
+    property var transferredEvent: null
+    property string requestedSeries: ""
+    function nativeRequest(source, operation, fields, callback) {
+      requestedSeries = fields.eventId
+      seriesCallback = callback
+    }
     function findSource(id) {
       for (var i=0;i<writableSourceGroups.length;i++)
         for (var j=0;j<writableSourceGroups[i].calendars.length;j++)
@@ -30,6 +39,7 @@ Item {
       return null
     }
     function transferEvent(sourceId, destinationId, event, callback) {
+      transferredEvent = event
       eventWriting = true
       transferCallback = callback
       return true
@@ -60,6 +70,7 @@ Item {
     function updateEvent(_sourceId, _event, _fields) {
       if (creatingEvent || eventWriting) return false
       updateCalls++
+      createdFields = _fields
       eventWriting = true
       return true
     }
@@ -75,17 +86,25 @@ Item {
     urgentColor: Qt.rgba(1, 0.2, 0.2, 1)
     dimColor: Qt.rgba(0.67, 0.67, 0.67, 1)
     panelFontFamily: "monospace"
+    onKeyPressed: function(event) { router.routeKeyEvent(event) }
   }
+
+  TextEdit { id: clipboardSource; visible: false; textFormat: TextEdit.PlainText }
 
   TestCase {
     Omamail.KeyRouter {
-      context: composer.opened ? (composer.guestSuggestionsOpen ? "eventGuests" : "eventCompose") : ""
+      id: router
+      context: Keymap.contextFor({eventComposing:composer.opened,
+        guestSuggestions:composer.guestSuggestionsOpen,eventDescriptionFocused:composer.descriptionFocused})
       onTriggered: function(id) {
         if (id === "saveEvent") composer.submit("all")
         if (id === "guestNext") composer.moveGuestSuggestion(1)
         if (id === "guestPrevious") composer.moveGuestSuggestion(-1)
         if (id === "guestChoose") composer.chooseGuestSuggestion()
-        if (id === "back") composer.dismissGuestSuggestions()
+        if (id === "back") {
+          if (composer.guestSuggestionsOpen) composer.dismissGuestSuggestions()
+          else composer.close()
+        }
       }
     }
     name: "CalendarEventComposer"
@@ -99,31 +118,14 @@ Item {
       eventController.updateCalls = 0
       eventController.writableSourceGroups = JSON.parse(JSON.stringify(initialGroups))
       eventController.transferCallback = null
+      eventController.seriesCallback = null
+      eventController.transferredEvent = null
+      eventController.requestedSeries = ""
       composer.close()
       composer.writePending = false
       contacts.recipientContacts = []
-      contacts.refreshCalls = 0
-    }
-
-    function test_guest_suggestions_follow_the_calendar_accounts_book() {
-      var asked = []
-      contacts.carddavController = ({
-        mergedForAccount: function(accountId) {
-          asked.push(String(accountId))
-          return [{ name: "Ivan Petrov", email: "ivan@example.org" }]
-        }
-      })
-      eventController.writableSourceGroups = [{
-        id: "account:imap:bob@example.com", providerLabel: "CalDAV", accountLabel: "bob@example.com",
-        calendars: [{ id: "caldav:bob-home", name: "Home", colorKey: "accent", accountId: "imap:bob@example.com" }]
-      }]
-      composer.begin()
-      compare(composer.contactBook.length, 1)
-      compare(composer.contactBook[0].email, "ivan@example.org")
-      verify(asked.indexOf("imap:bob@example.com") !== -1,
-        "guests complete from the calendar account's book: " + asked.join(","))
       contacts.carddavController = null
-      eventController.writableSourceGroups = JSON.parse(JSON.stringify(initialGroups))
+      contacts.refreshCalls = 0
     }
 
     function test_microsoft_creation_keeps_basic_fields_without_repetition() {
@@ -140,10 +142,16 @@ Item {
       compare(eventController.createdFields.recurrence.enabled, false)
     }
 
-    function test_guest_suggestions_reuse_mail_contacts_without_submitting() {
+    function test_guest_suggestions_use_the_calendar_accounts_contacts_without_submitting() {
       var groups = JSON.parse(JSON.stringify(initialGroups))
       groups[0].calendars[0].kind = "google"
+      groups[0].calendars[0].accountId = "me@example.com"
       eventController.writableSourceGroups = groups
+      contacts.carddavController = ({
+        mergedForAccount: function(accountId) {
+          return accountId === "me@example.com" ? contacts.recipientContacts : []
+        }
+      })
       composer.begin()
       compare(contacts.refreshCalls, 1)
       wait(0)
@@ -204,6 +212,74 @@ Item {
       compare(composer.opened,false)
     }
 
+    function test_description_paste_newlines_save_and_reopen() {
+      composer.begin()
+      wait(0)
+      var notes = findChild(composer, "event-description-field")
+      var description = "Agenda\n\n- Review the proposal\n- Bring café notes\n<b>Literal text</b>"
+      clipboardSource.text = description
+      clipboardSource.selectAll()
+      clipboardSource.copy()
+      notes.forceActiveFocus()
+      keyClick(Qt.Key_V, Qt.ControlModifier)
+      compare(composer.notesText(), description)
+      keyClick(Qt.Key_Return)
+      keyClick(Qt.Key_Enter)
+      keyClick(Qt.Key_Return, Qt.ShiftModifier)
+      compare(composer.notesText(), description + "\n\n\n")
+      compare(eventController.createCalls, 0, "line breaks must not submit the event")
+      verify(notes.height > findChild(composer, "event-title-field").height * 2)
+      keyClick(Qt.Key_Return, Qt.ControlModifier)
+      compare(eventController.createCalls, 1)
+      compare(eventController.createdFields.description, description + "\n\n\n")
+      eventController.creatingEvent = false
+      eventController.eventCreated(true, "")
+      composer.beginEdit("google:me@example.com", {summary:"Saved paragraphs",
+        description:eventController.createdFields.description,
+        start:{ms:Date.now()},end:{ms:Date.now()+3600000}})
+      wait(0)
+      compare(composer.notesText(), description + "\n\n\n")
+      notes.forceActiveFocus()
+      notes.cursorPosition = notes.length
+      keyClick(Qt.Key_X)
+      keyClick(Qt.Key_Enter, Qt.ControlModifier)
+      compare(eventController.updateCalls, 1)
+      compare(eventController.createdFields.description, description + "\n\n\nx")
+    }
+
+    function test_long_description_grows_and_keeps_caret_and_save_reachable() {
+      composer.begin()
+      wait(0)
+      var notes = findChild(composer, "event-description-field")
+      var scroll = findChild(composer, "event-composer-scroll")
+      var save = findChild(composer, "event-save-button")
+      var initialHeight = notes.height
+      clipboardSource.text = Array(45).join("A long paragraph that wraps while editing the event details. ")
+        + "\n\n" + Array(40).join("Another line\n")
+      clipboardSource.selectAll()
+      clipboardSource.copy()
+      notes.forceActiveFocus()
+      keyClick(Qt.Key_V, Qt.ControlModifier)
+      tryVerify(function() { return notes.height > initialHeight * 4 })
+      function caretVisible() {
+        var y = notes.mapToItem(scroll, 0, notes.cursorRectangle.y).y
+        return y >= 0 && y + notes.cursorRectangle.height <= scroll.height
+      }
+      tryVerify(caretVisible)
+      keyClick(Qt.Key_Home, Qt.ControlModifier)
+      tryVerify(caretVisible)
+      keyClick(Qt.Key_End, Qt.ControlModifier)
+      tryVerify(caretVisible)
+      verify(save.mapToItem(composer, 0, save.height).y <= composer.height)
+      compare(eventController.createCalls, 0)
+      keyClick(Qt.Key_Tab)
+      verify(!notes.activeFocus, "Tab navigates out of the description")
+      notes.forceActiveFocus()
+      keyClick(Qt.Key_Escape)
+      compare(composer.opened, false)
+      compare(eventController.createCalls, 0)
+    }
+
     function test_save_failure_stays_visible_without_scrolling() {
       composer.begin()
       findChild(composer, "event-title-field").text = "Error visibility"
@@ -262,6 +338,58 @@ Item {
       compare(save.enabled,true)
     }
 
+    function typeField(name, text) {
+      var field = findChild(composer, name)
+      field.forceActiveFocus()
+      field.selectAll()
+      for (var i = 0; i < text.length; i++) keyClick(text[i])
+    }
+
+    function test_start_edit_keeps_duration_through_incomplete_input_and_save() {
+      composer.beginEdit("google:me@example.com", {summary:"Half hour",
+        start:{ms:new Date(2026,9,28,15,0).getTime()},end:{ms:new Date(2026,9,28,15,30).getTime()}})
+      wait(0)
+      typeField("event-start-time-field", "1")
+      compare(findChild(composer,"event-end-time-field").text, "15:30")
+      verify(!composer.dateRange.ok)
+      for (var i = 0; i < "6:00".length; i++) keyClick("6:00"[i])
+      compare(findChild(composer,"event-end-time-field").text, "16:30")
+      keyClick(Qt.Key_Return)
+      compare(eventController.updateCalls, 1)
+      compare(eventController.createdFields.startMs, new Date(2026,9,28,16,0).getTime())
+      compare(eventController.createdFields.endMs, new Date(2026,9,28,16,30).getTime())
+    }
+
+    function test_start_edit_rolls_end_date_and_uses_manually_changed_duration() {
+      composer.beginAt(new Date(2026,9,28,15,0).getTime())
+      wait(0)
+      typeField("event-end-time-field", "15:45")
+      compare(findChild(composer,"event-start-time-field").text, "15:00")
+      typeField("event-start-time-field", "23:45")
+      compare(findChild(composer,"event-end-time-field").text, "00:30")
+      compare(findChild(composer,"event-end-date-field").text, "2026-10-29")
+      typeField("event-start-date-field", "2026-10-30")
+      compare(findChild(composer,"event-end-date-field").text, "2026-10-31")
+      compare(composer.dateRange.endMs - composer.dateRange.startMs, 45 * 60000)
+      typeField("event-start-time-field", "10:00")
+      compare(findChild(composer,"event-end-time-field").text, "10:45")
+      compare(findChild(composer,"event-end-date-field").text, "2026-10-30")
+    }
+
+    function test_start_edit_does_not_shift_all_day_or_invalid_ranges() {
+      composer.beginWith({startMs:new Date(2026,9,28).getTime(),endMs:new Date(2026,9,30).getTime(),allDay:true})
+      wait(0)
+      typeField("event-start-date-field", "2026-10-27")
+      compare(findChild(composer,"event-end-date-field").text, "2026-10-29")
+      composer.close()
+      composer.beginAt(new Date(2026,9,28,15,0).getTime())
+      wait(0)
+      typeField("event-end-time-field", "14:00")
+      typeField("event-start-time-field", "13:00")
+      compare(findChild(composer,"event-end-time-field").text, "14:00")
+      verify(composer.dateRange.ok)
+    }
+
     // A suggestion from a message opens the form filled in, on the
     // calendar the reading mailbox prefers, with nothing written yet.
     function test_all_day_prefill_uses_inclusive_last_day_without_writing() {
@@ -305,6 +433,73 @@ Item {
       compare(composer.editingSourceId,"destination")
       compare(composer.editingEvent.etag,"new")
       compare(composer.titleText(),"Unsaved title")
+      compare(eventController.updateCalls,0)
+    }
+
+    function test_recurring_calendar_choice_confirms_series_and_recovers_from_failure() {
+      eventController.writableSourceGroups=[{providerLabel:"Google",accountLabel:"me@example.test",calendars:[
+        {id:"original",name:"Personal",kind:"google",accountId:"me@example.test"},
+        {id:"destination",name:"Family",kind:"google",accountId:"me@example.test"}]}]
+      var occurrence={googleId:"series_sunday",recurringEventId:"series",sourceId:"original",
+        summary:"Weekly meeting",eventType:"default",organizer:{self:true},etag:"instance-etag",
+        start:{ms:Date.now()},end:{ms:Date.now()+3600000}}
+      composer.beginEdit("original",occurrence)
+      wait(0)
+      var selector=findChild(composer,"event-calendar-selector")
+      compare(selector.count,2, "Family must be offered for a recurring occurrence")
+      verify(waitForRendering(selector))
+      findChild(composer,"event-title-field").text="Unsaved occurrence title"
+      selector.forceActiveFocus()
+      keyClick(Qt.Key_Space)
+      tryCompare(selector.popup,"opened",true)
+      keyClick(Qt.Key_Down)
+      tryCompare(selector,"highlightedIndex",1)
+      keyClick(Qt.Key_Return)
+      var dialog=findChild(composer,"event-move-series-dialog")
+      tryCompare(dialog,"opened",true)
+      compare(eventController.seriesCallback,null)
+      compare(eventController.transferredEvent,null)
+      keyClick(Qt.Key_Escape)
+      tryCompare(dialog,"opened",false)
+      compare(composer.opened,true)
+      compare(composer.selectedSourceId,"original")
+      compare(composer.titleText(),"Unsaved occurrence title")
+      compare(selector.currentIndex,0)
+      composer.chooseCalendar("destination")
+      tryCompare(dialog,"opened",true)
+      keyClick(Qt.Key_Tab)
+      keyClick(Qt.Key_Return)
+      compare(eventController.requestedSeries,"series")
+      compare(eventController.transferredEvent,null)
+      eventController.seriesCallback(null,"Could not load series")
+      compare(composer.loadingSeries,false)
+      compare(selector.currentIndex,0)
+      compare(composer.titleText(),"Unsaved occurrence title")
+      composer.chooseCalendar("destination")
+      tryCompare(dialog,"opened",true)
+      var confirm=findChild(composer,"event-move-series-confirm")
+      mouseClick(confirm,confirm.width/2,confirm.height/2)
+      var series={id:"series",summary:"Weekly meeting",eventType:"default",organizer:{self:true},etag:"series-etag",
+        recurrence:["RRULE:FREQ=WEEKLY"],start:{dateTime:"2026-11-01T12:00:00Z"},end:{dateTime:"2026-11-01T13:00:00Z"}}
+      eventController.seriesCallback({body:JSON.stringify(series)},"")
+      compare(eventController.transferredEvent.googleId,"series")
+      compare(eventController.transferredEvent.etag,"series-etag")
+      eventController.eventWriting=false
+      eventController.transferCallback(null,"Move failed")
+      compare(composer.selectedSourceId,"original")
+      compare(composer.editingEvent.googleId,"series_sunday")
+      compare(composer.titleText(),"Unsaved occurrence title")
+      composer.chooseCalendar("destination")
+      tryCompare(dialog,"opened",true)
+      mouseClick(confirm,confirm.width/2,confirm.height/2)
+      eventController.seriesCallback({body:JSON.stringify(series)},"")
+      var moved=JSON.parse(JSON.stringify(eventController.transferredEvent))
+      moved.sourceId="destination"; moved.etag="moved-etag"
+      eventController.eventWriting=false
+      eventController.transferCallback(moved,"")
+      compare(composer.editingSourceId,"destination")
+      compare(composer.editingEvent.googleId,"series")
+      compare(composer.editingEvent.etag,"moved-etag")
       compare(eventController.updateCalls,0)
     }
 
