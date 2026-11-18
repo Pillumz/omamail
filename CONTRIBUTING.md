@@ -69,7 +69,7 @@ make validate    # node tests, source regressions, QML tests, qmllint, manifest
 
 `make app-build` needs Rust, CMake 3.21 or newer, and Qt 6.5 or newer. On Linux, the Qt DBus development component is also required. It builds the backend with `--no-default-features --features standalone`, so the resulting process has no AI worker surface. `make app-run` sets only the development resource and bundled-backend overrides needed to run that build.
 
-`make validate` needs `node`, `python3`, Qt 6 QML test tooling (`qt6-declarative` on Arch, `qt6-declarative-dev-tools` and `qml6-module-qttest` on Debian and Ubuntu) and the `omarchy` CLI. It has to be green before you open the pull request, and green on your machine — nothing in CI runs it for you. Standalone changes must also pass `make test-app-qml` and the native platform gates described in [Backend runtime](docs/BACKEND-RUNTIME.md).
+Use the Makefile targets that exercise the changed behavior. `make validate` is available for broader local checks; an all-green result from it is optional for every PR in this fork. It needs `node`, `python3`, Qt 6 QML test tooling and the `omarchy` CLI. For standalone and release changes, see the required gates in [Backend runtime](docs/BACKEND-RUNTIME.md).
 
 ## How the change gets made
 
@@ -77,11 +77,7 @@ In this order, and none of the steps fold into each other:
 
 1. **Implement it.** One change, finished — not a sketch with the hard half
    left for review to find.
-2. **Test it, then test it again.** Run `make validate` until it is green, run
-   the new test against the unfixed code and watch it fail, and exercise the
-   real path by hand. A suite that passed once on a machine that has since
-   changed is not evidence; run it again before you open the pull request, and
-   again after every round of review.
+2. **Check the change.** Run targeted checks on the revision you send. Where practical, exercise the affected workflow or verify a bug against the unfixed version. Report gaps, skipped checks, and failures with enough context to distinguish existing problems from regressions.
 3. **Have a fresh agent review it.** Open a *new* agent — an empty context,
    nothing of the conversation that wrote the code — hand it the diff and
    `AGENTS.md`, and ask it to find what is wrong. The agent that wrote a patch
@@ -115,10 +111,8 @@ code once and watch it fail, and say so in the pull request.
   that the change did not require. `AGENTS.md`'s *Colors*, *UI labels* and
   *Popups* sections are the same rules where they are specific to this
   codebase, and `tests/test_source.sh` enforces the part of them that grep can.
-- **Test it on a screen, by hand. This is required and nothing substitutes for it.** For the plugin, register your development checkout with the Omarchy shell and follow [the development runtime instructions](docs/BACKEND-RUNTIME.md); click the envelope in the bar and drive the change with the mouse and keyboard in a light theme and a dark one, at both window sizes. For the standalone host, run `make app-run` on each affected platform and repeat the applicable mail, calendar, notification, and window checks. The offscreen QML tests prove focus and routing; they cannot see that a control hangs four pixels out of its row.
-- **Every UI change requires clear, detailed visual evidence.** Attach labeled before-and-after screenshots of every changed view and relevant state, captured at matching window dimensions, theme, and scale. Explain what changed and identify the platforms, themes, and sizes tested. Screenshots must be legible enough to evaluate the actual layout, labels, and states; update them whenever the UI changes.
-- **Complex features and workflows also require a detailed screen recording.** Show the complete path from entry to result, including the relevant keyboard and mouse interactions and loading, empty, error, cancellation, or recovery states. Explain the steps and expected behavior so Jason can understand and assess the change without installing or running the app. Screenshots alone are not sufficient for these changes.
-- Use synthetic or redacted data in screenshots and recordings. Upload the evidence as PR attachments rather than committing it to the repository. Visual evidence complements the required hands-on testing and regression tests; it does not replace them.
+- Describe what changes for the user and check relevant interactions. Use an isolated app session when layout or visual behavior matters; see [the development runtime instructions](docs/BACKEND-RUNTIME.md). Report what you actually exercised.
+- Screenshots and recordings are optional for every PR in this fork. Share them when they help explain the change. Use synthetic or redacted data and attach the files to the PR.
 
 ## The pull request
 
@@ -149,25 +143,14 @@ Then:
 ````markdown
 ## Verification
 
-`make validate` green. `tests/test_message.js` covers the 8-bit body with an
-accent in it, and fails with the change reverted. Live: a Fastmail mailbox
-whose French subjects rendered as mojibake before and read correctly after.
+`node tests/test_message.js` passed. The accented-subject case failed with the change reverted. A synthetic message also displayed correctly in the reader.
 
 ## Release Notes
 
 - Accented characters in message bodies no longer render as mojibake.
 ````
 
-`## Verification` names the commands you ran and what they said. Measured, not
-inferred: "should work" is not verification, and neither is a test you did not
-watch fail. Four things belong in it, and a reviewer will ask for any that is
-missing:
-
-- `make validate`, and that it was green on the commit you are sending.
-- The new test, and that you saw it fail against the unfixed code.
-- What you drove by hand — for an interface change, the platforms, themes, and sizes, with the required before-and-after screenshots and, for complex features or workflows, a detailed recording.
-- That a fresh agent reviewed the diff, and what it found. "Nothing" is an
-  answer; not having asked is not.
+`## Verification` records the checks and workflows actually exercised, their results, and material gaps. Say which failures also occur on the base. Include the bug reproduction or regression check where applicable, and record the independent review and what it found.
 
 `## Release Notes` is lifted verbatim by `scripts/release-notes.sh` into the
 GitHub release for the version that ships it — the heading is matched exactly,
@@ -182,14 +165,11 @@ Draft pull requests are not reviewed or approved. The failing-test-only draft de
 
 Review existing-functionality bug fixes, small fixes, wording corrections, and performance improvements first. A reviewer may approve a reasonable, focused, low-risk change that preserves product intent once the current diff and discussion have been checked, the relevant tests and required checks pass on the latest revision, and the affected security boundaries satisfy [AGENTS.md](AGENTS.md). Missing verification must be reported, not inferred from an earlier green commit.
 
-UI, shortcuts, layout, and interaction changes need a separate product and design judgment. An objectively demonstrable correction to an established product convention, such as restoring the product's established Vim navigation conventions, may be approved after verifying the convention, checking for conflicts and regressions, and reviewing the required tests and visual evidence. Explain the evidence and recommendation. This exception does not cover new product choices: context-menu details or new menu actions, feature placement, subjective taste, and changes with multiple reasonable design tradeoffs require Jason's explicit confirmation before approval. Large features, product-direction changes, and substantial architectural changes also require deep review and product confirmation. When the distinction is unclear, ask rather than treating passing tests as a product decision.
+UI, shortcuts, layout, and interaction changes need a separate product and design judgment. An objectively demonstrable correction to an established product convention, such as restoring the product's established Vim navigation conventions, may be approved after verifying the convention, checking for conflicts and regressions, and reviewing the relevant tests and any available visual evidence. Explain the evidence and recommendation. This exception does not cover new product choices: context-menu details or new menu actions, feature placement, subjective taste, and changes with multiple reasonable design tradeoffs require Jason's explicit confirmation before approval. Large features, product-direction changes, and substantial architectural changes also require deep review and product confirmation. When the distinction is unclear, ask rather than treating passing tests as a product decision.
 
-An approval is not permission to merge: Jason makes the final merge decision, and automated reviewers must never merge.
+The fork owner makes the final merge decision. An agent may merge a particular PR through GitHub after the owner explicitly authorizes it.
 
-Answer a review comment by changing the code or by saying why the change would
-be wrong, and re-run `make validate` after every round — a fix made under
-review is a change like any other. Both answers are useful; silence and a
-force-push are not.
+Answer a review comment by changing the code or explaining why the change would be wrong. Re-run the affected checks after fixes.
 
 If an agent wrote the patch, you are still its author: read the diff before you
 send it, and be able to explain any line in it.

@@ -55,8 +55,7 @@ Read the relevant document before changing its area; these contain constraints t
 
 ## Repository and pull requests
 
-- Keep runtime assets, source, tests and maintained documentation in the tree. Keep planning notes and screenshots outside it. Upload PR screenshots to GitHub attachments; tracked files must stay under 128 KiB.
-- UI PRs require labeled before/after screenshots of every changed view/state at matching dimensions, theme and scale, using synthetic or redacted data. Update them when the UI changes and explain the visible differences.
+- Keep runtime assets, source, tests and maintained documentation in the tree. Tracked files must stay under 128 KiB. Keep planning notes and captures outside the tree. Screenshots and recordings are optional for all PRs in this fork; use synthetic or redacted data for any GitHub attachments.
 - Commit/PR titles name the concrete machinery and action. Use `Fix ` for bugs, `Add ` for features, otherwise an accurate imperative. Prefix AI changes with `ai: `, repository documentation with `docs: `, website work with `website: `, and build/CI/release/tooling maintenance with `chore: `. Choose one prefix from the primary outcome.
 - Reconcile the title and description with the complete final diff whenever scope changes. Describe shipped behavior, architectural reasons and verification actually performed. User-visible PRs include concise bullets under `## Release Notes`.
 - Markdown prose uses one source line per paragraph.
@@ -65,5 +64,5 @@ Read the relevant document before changing its area; these contain constraints t
 
 - `make publish VERSION=X.Y.Z` prepares one versioned release PR from clean, synchronized main; without VERSION it increments the patch. Never push main directly. Release CI publishes and verifies immutable assets before updating the binary pin and folding API metadata on that same branch. Tags alone do not publish. Follow `docs/BACKEND-RUNTIME.md` for release and recovery details.
 - Preserve `scripts/release-notes.sh` aggregation of PR release-note sections; GitHub-generated notes are not a substitute.
-- Run `make validate` after QML or behavior changes. `make test` includes Rust, JavaScript, source regressions and QML tests. Inspect the Makefile for the current targets.
+- On this fork, run checks suited to the changed workflows and report what passed, failed, or was skipped. `make validate` is an optional broad local check. Failures already present on the base and unavailable local checks are reported and assessed separately from regressions. Required CI, security and backend release gates still apply.
 - QML tests and `qmllint` are local gates using the installed Qt; release CI uses `make test-js test-shell`. Unresolved `qs.Ui` / `qs.Commons` lint warnings are expected; the exit code is the gate.
